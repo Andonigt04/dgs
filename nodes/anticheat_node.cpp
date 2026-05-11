@@ -10,7 +10,6 @@
 #include <iostream>
 
 static constexpr float SCALE       = 1000.0f;
-static constexpr float LATENCY_COM = 0.2f;
 
 struct LastKnown
 {
@@ -29,12 +28,15 @@ static uint64_t nowMs()
 static bool validate(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
 {
     float dt = (nowMs() - last.timestamp_ms) / 1000.0f;
+    if (dt <= 0 || dt > 2.f) return true;
+
     float dx = (e.chunkX * csX + e.pos[0]) - last.gx;
     float dy = (e.chunkY * csY + e.pos[1]) - last.gy;
     float dz = (e.chunkZ * csZ + e.pos[2]) - last.gz;
-    float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
-    float radio = (last.maxSpeed * dt) + SCALE + (LATENCY_COM * last.maxSpeed);
-    return d <= radio;
+    float distSq = dx*dx + dy*dy + dz*dz;
+
+    float maxDist = (last.maxSpeed * dt) + (SCALE / 1000.0f); 
+    return distSq <= (maxDist * maxDist);
 }
 
 int main()
@@ -56,7 +58,6 @@ int main()
     if (!headServer.connect(headHost, headPort))  { std::cerr << "[AntiCheat] Error conectando HeadServer" << std::endl; return 1; }
     if (!persistence.connect(persHost, persPort)) { std::cerr << "[AntiCheat] Error conectando Persistence" << std::endl; return 1; }
 
-    // Recibir Command inicial del HeadServer con los chunk sizes
     uint8_t cmdBuf[512];
     int cmdBytes = headServer.receive(headServer.getSocketFD(), cmdBuf, sizeof(cmdBuf));
     if (cmdBytes <= 0) { std::cerr << "[AntiCheat] No se recibio Command inicial" << std::endl; return 1; }

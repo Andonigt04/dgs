@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/build/persistance_node /usr/local/bin/persistance_node
 COPY --from=builder /usr/local/lib/libmongocxx.so* /usr/local/lib/
 COPY --from=builder /usr/local/lib/libbsoncxx.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libmongoc-1.0.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libbson-1.0.so* /usr/local/lib/
 RUN ldconfig
 
 ENV MONGO_URI=mongodb://mongodb:27017
