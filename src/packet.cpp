@@ -112,5 +112,42 @@ namespace DGS
         return data;
     }
 
-    
+    void Packet::pack(const ZoneQuery& data)
+    {
+        clear();
+        write<PacketType>(PKT_ZONE_QUERY);
+        write<uint32_t>(data.uuid);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
+    }
+
+    ZoneQuery Packet::unpackZoneQuery()
+    {
+        readPos = 1;
+        ZoneQuery data;
+        data.uuid   = read<uint32_t>();
+        data.chunkX = read<int32_t>();
+        data.chunkY = read<int32_t>();
+        data.chunkZ = read<int32_t>();
+        return data;
+    }
+
+    void Packet::pack(const ZoneResponse& data)
+    {
+        clear();
+        write<PacketType>(PKT_ZONE_RESPONSE);
+        writeString(std::string(data.addr));
+        write<int>(data.port);
+    }
+
+    ZoneResponse Packet::unpackZoneResponse()
+    {
+        readPos = 1;
+        ZoneResponse data{};
+        std::string addr = readString();
+        std::strncpy(data.addr, addr.c_str(), sizeof(data.addr) - 1);
+        data.port = read<int>();
+        return data;
+    }
 };

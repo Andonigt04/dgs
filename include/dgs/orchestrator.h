@@ -6,6 +6,7 @@
 
 #include <vector>
 #include <iostream>
+#include <cstring>
 
 namespace DGS
 {
@@ -45,6 +46,23 @@ namespace DGS
                     }
                 }
                 return -1;
+            }
+
+            ZoneResponse findZoneResponse(int32_t chunkX, int32_t chunkY, int32_t chunkZ)
+            {
+                for (const auto& zone : activeZones)
+                {
+                    if (chunkX >= zone.chunkXMin && chunkX <= zone.chunkXMax &&
+                        chunkY >= zone.chunkYMin && chunkY <= zone.chunkYMax &&
+                        chunkZ >= zone.chunkZMin && chunkZ <= zone.chunkZMax)
+                    {
+                        ZoneResponse r{};
+                        std::strncpy(r.addr, zone.addr, sizeof(r.addr) - 1);
+                        r.port = zone.port;
+                        return r;
+                    }
+                }
+                return ZoneResponse{};
             }
 
             void evaluateServer(const ServerMetrics& m, int nodeFD)

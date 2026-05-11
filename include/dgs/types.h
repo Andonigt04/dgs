@@ -12,6 +12,8 @@ namespace DGS
         PKT_COMMAND         = 2,
         PKT_ENTITY_TRANSFER = 3,
         PKT_CHAT            = 4,
+        PKT_ZONE_QUERY      = 5,
+        PKT_ZONE_RESPONSE   = 6,
         PKT_DISCONNECT      = 255
     };
     
@@ -83,6 +85,8 @@ namespace DGS
         int32_t chunkXMin, chunkXMax;
         int32_t chunkYMin, chunkYMax;
         int32_t chunkZMin, chunkZMax;
+        char    addr[16];
+        int     port;
     };
 
     struct ServerMetrics
@@ -90,6 +94,18 @@ namespace DGS
         ZoneInfo node;
         float    ramUsage;
         float    performance;
+    };
+
+    struct ZoneQuery
+    {
+        uint32_t uuid;
+        int32_t  chunkX, chunkY, chunkZ;
+    };
+
+    struct ZoneResponse
+    {
+        char addr[16];
+        int  port;
     };
 
     struct LogEntry

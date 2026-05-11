@@ -1,19 +1,30 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
 #include "include/dgs/orchestrator.h"
+#include "include/dgs/logger.h"
 
 #include <map>
 #include <sys/epoll.h>
 #include <algorithm>
+#include <ctime>
 
 int main()
 {
     DGS::TCPSocket serverSocket;
     DGS::Orchestrator orchestrator(serverSocket);
     DGS::PacketDispatcher dispatcher;
+    DGS::Logger logger("headserver_log.csv");
     std::vector<int> nodeClients;
 
     
+    dispatcher.registerHandler(DGS::PKT_ZONE_QUERY, [&](int fd, DGS::Packet& p) {
+        auto q = p.unpackZoneQuery();
+        DGS::ZoneResponse r = orchestrator.findZoneResponse(q.chunkX, q.chunkY, q.chunkZ);
+        DGS::Packet resp;
+        resp.pack(r);
+        serverSocket.send(fd, resp.getRawData(), resp.getSize());
+    });
+
     dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p) {
         auto m = p.unpackServerMetrics();
         orchestrator.updateNodeTopology(fd, m);

@@ -73,10 +73,14 @@ namespace DGS
         void pack(const EntityTransfer& data);
         void pack(const Command& data);
         void pack(const ServerMetrics& data);
+        void pack(const ZoneQuery& data);
+        void pack(const ZoneResponse& data);
 
         EntityTransfer unpackEntityTransfer();
         Command unpackCommand();
         ServerMetrics unpackServerMetrics();
+        ZoneQuery unpackZoneQuery();
+        ZoneResponse unpackZoneResponse();
         
         PacketType getType() const { return buffer.empty() ? static_cast<PacketType>(0) : static_cast<PacketType>(buffer[0]); }
         
