@@ -58,47 +58,50 @@ namespace DGS
     // EntityTransfer struct to hold object relevant information for anti-cheat purposes and transfering data through servers
     struct EntityTransfer
     {
-        EntityType type;
-        uint32_t uuid;
-        int32_t chunkX, chunkY, chunkZ;
-        float pos[3];
-        uint16_t angle;
-        uint16_t dataSize;
-        uint8_t data[4096];
+        EntityType  type;
+        uint32_t    uuid;
+        int32_t     chunkX, chunkY, chunkZ;
+        float       pos[3];
+        uint16_t    angle;
+        uint16_t    dataSize;
+        uint8_t     data[4096];
         EntityState state;
+        Stats       stats;
     };
 
     struct Command
     {
         HeadPurpose purpose;
-        int32_t chunkX, chunkY;
-        char addr[16];
-        int port;
+        int32_t     chunkX, chunkY;
+        char        addr[16];
+        int         port;
+        float       chunkSizeX, chunkSizeY, chunkSizeZ;
     };
 
     struct ZoneInfo {
-        int fd;
+        int     fd;
         int32_t chunkXMin, chunkXMax;
         int32_t chunkYMin, chunkYMax;
+        int32_t chunkZMin, chunkZMax;
     };
 
     struct ServerMetrics
     {
         ZoneInfo node;
-        float ramUsage;
-        float performance;
+        float    ramUsage;
+        float    performance;
     };
 
     struct LogEntry
     {
-        uint64_t time_stamp;
-        LogType type;
+        uint64_t   time_stamp;
+        LogType    type;
         EntityType entityType;
-        uint32_t uuid;
-        int32_t fd;
-        uint32_t bytes;
-        float ramUsage;
-        float performance;
+        uint32_t   uuid;
+        int32_t    fd;
+        uint32_t   bytes;
+        float      ramUsage;
+        float      performance;
     };
 };
 

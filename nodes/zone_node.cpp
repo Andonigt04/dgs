@@ -21,13 +21,13 @@ float getRAM()
     return (float)total_bytes / limit;
 }
 
-void checkAndTransfer(DGS::TCPSocket& tcp_node, std::vector<DGS::EntityTransfer>& entities, int32_t chunkXMin, int32_t chunkXMax, int32_t chunkYMin, int32_t chunkYMax)
+void checkAndTransfer(DGS::TCPSocket& tcp_node, std::vector<DGS::EntityTransfer>& entities, int32_t chunkXMin, int32_t chunkXMax, int32_t chunkYMin, int32_t chunkYMax, int32_t chunkZMin, int32_t chunkZMax)
 {
     DGS::Packet p;
 
     for (auto it = entities.begin(); it != entities.end();)
     {
-        bool outOfBounds = (it->chunkX < chunkXMin || it->chunkX > chunkXMax || it->chunkY < chunkYMin || it->chunkY > chunkYMax);
+        bool outOfBounds = (it->chunkX < chunkXMin || it->chunkX > chunkXMax || it->chunkY < chunkYMin || it->chunkY > chunkYMax || it->chunkZ < chunkZMin || it->chunkZ > chunkZMax);
 
         if (outOfBounds)
         {
@@ -70,15 +70,19 @@ int main()
         int32_t chunkXMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "100");
         int32_t chunkYMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "0");
         int32_t chunkYMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "100");
+        int32_t chunkZMin = std::atoi(std::getenv("CHUNK_Z_MIN") ? std::getenv("CHUNK_Z_MIN") : "0");
+        int32_t chunkZMax = std::atoi(std::getenv("CHUNK_Z_MAX") ? std::getenv("CHUNK_Z_MAX") : "100");
 
-        checkAndTransfer(tcp_zone_node, entities, chunkXMin, chunkXMax, chunkYMin, chunkYMax);
+        checkAndTransfer(tcp_zone_node, entities, chunkXMin, chunkXMax, chunkYMin, chunkYMax, chunkZMin, chunkZMax);
 
         DGS::ServerMetrics metrics;
-        metrics.ramUsage          = getRAM();
+        metrics.ramUsage       = getRAM();
         metrics.node.chunkXMin = chunkXMin;
         metrics.node.chunkXMax = chunkXMax;
         metrics.node.chunkYMin = chunkYMin;
         metrics.node.chunkYMax = chunkYMax;
+        metrics.node.chunkZMin = chunkZMin;
+        metrics.node.chunkZMax = chunkZMax;
         
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float, std::milli> duration = end - start;

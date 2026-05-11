@@ -25,7 +25,7 @@ int main()
         std::cout << "[HeadServer] Entidad recibida uuid=" << e.uuid
                   << " chunk=(" << e.chunkX << "," << e.chunkY << ") desde fd=" << fd << std::endl;
 
-        int targetFD = orchestrator.findTargetNode(e.chunkX, e.chunkY);
+        int targetFD = orchestrator.findTargetNode(e.chunkX, e.chunkY, e.chunkZ);
         std::cout << "[HeadServer] Zonas activas: " << orchestrator.activeZones.size()
                   << " targetFD=" << targetFD << std::endl;
 
@@ -70,7 +70,8 @@ int main()
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
                 nodeClients.push_back(newFD);
                 std::cout << "[HeadServer] Nueva zona conectada! FD: " << newFD << std::endl;
-            } else
+            }
+            else
             {
                 uint8_t buffer[8192];
                 int bytesRead = serverSocket.receive(fd, buffer, 8192);
@@ -80,7 +81,8 @@ int main()
                     epoll_ctl(epollFD, EPOLL_CTL_DEL, fd, nullptr);
                     serverSocket.closeClient(fd);
                     nodeClients.erase(std::find(nodeClients.begin(), nodeClients.end(), fd));
-                } else
+                }
+                else
                 {
                     DGS::Packet p;
                     p.setBuffer(buffer, bytesRead);

@@ -17,6 +17,8 @@ namespace DGS
 
             bool send(const std::string& address, int port, const uint8_t* data, size_t size);
             int receive(uint8_t* buffer, size_t size, std::string& outAddress, int& outPort);
+
+            int getSocketFD() { return socketFD; }
         private:
             int socketFD;
     };
