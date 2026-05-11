@@ -72,12 +72,21 @@ namespace DGS
             {
                 if (m.ramUsage > .80f && m.performance < .36f)
                 {
+                    int32_t width = m.node.chunkXMax - m.node.chunkXMin;
+                    if (width < 1)
+                    {
+                        std::cout << "[Orchestrator] Zona demasiado pequena para dividir (width=" << width << ")" << std::endl;
+                        return;
+                    }
+
                     std::cout << "[Orchestrator] Umbral alcanzado. Escalando sistema..." << std::endl;
 
-                    int32_t midX = (m.node.chunkXMin + m.node.chunkXMax) / 2;
+                    int32_t midLow  =  (m.node.chunkXMin + m.node.chunkXMax)      / 2;
+                    int32_t midHigh = ((m.node.chunkXMin + m.node.chunkXMax) + 1) / 2;
 
+                    spawnNewNode(midHigh, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax, m.node.chunkZMin, m.node.chunkZMax);
                     scaleZoneDeployment(currentReplicas + 1);
-                    sendResizeCommand(nodeFD, midX);
+                    sendResizeCommand(nodeFD, midLow);
                 }
             }
 
