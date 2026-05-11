@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <stdexcept>
 
 #include "include/dgs/types.h"
 
@@ -36,6 +37,18 @@ namespace DGS
             readPos += sizeof(T);
 
             return data;
+        }
+
+        void writeRaw(const uint8_t* data, size_t size)
+        {
+            buffer.insert(buffer.end(), data, data + size);
+        }
+
+        void readRaw(uint8_t* dest, size_t size)
+        {
+            if (readPos + size > buffer.size()) throw std::runtime_error("Packet read overflow (Raw)");
+            std::memcpy(dest, &buffer[readPos], size);
+            readPos += size;
         }
 
         void writeString(const std::string& str)

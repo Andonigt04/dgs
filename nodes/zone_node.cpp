@@ -21,6 +21,27 @@ float getRAM()
     return (float)total_bytes / limit;
 }
 
+void checkAndTransfer(DGS::TCPSocket& tcp_node, std::vector<DGS::EntityTransfer>& entities, double xMin, double xMax, double yMin, double yMax)
+{
+    DGS::Packet p;
+    
+    for (auto it = entities.begin(); it != entities.end();)
+    {
+        bool outOfBounds = (it->pos[0] < xMin || it->pos[0] > xMax || it->pos[1] < yMin || it->pos[1] > yMax);
+
+        if (outOfBounds)
+        {
+            std::cout << "[ZoneNode] Entidad " << it->uuid << " fuera de limites. Transferenciendo..." << std::endl;
+
+            p.pack(*it);
+
+            tcp_node.send(tcp_node.getSocketFD(), p.getRawData(), p.getSize());
+
+            it = entities.erase(it);
+        } else ++it;
+    }
+}
+
 int main()
 {
     DGS::UDPSocket udp_zone_node; DGS::TCPSocket tcp_zone_node;
@@ -31,8 +52,8 @@ int main()
 
     while (true)
     {
-        uint8_t recvBuffer[1024];
-        int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), recvBuffer, 1024);
+        uint8_t recvBuffer[8192];
+        int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), recvBuffer, 8192);
         if (bytes > 0) {
             DGS::Packet pRecv;
             pRecv.setBuffer(recvBuffer, bytes);
@@ -71,25 +92,4 @@ int main()
     }
 
     return 0;
-}
-
-void checkAndTransfer(DGS::TCPSocket tcp_node, std::vector<DGS::EntityTransfer>& entities, double xMin, double xMax, double yMin, double yMax)
-{
-    DGS::Packet p;
-    
-    for (auto it = entities.begin(); it != entities.end();)
-    {
-        bool outOfBounds = (it->pos[0] < xMin || it->pos[0] > xMax || it->pos[1] < yMin || it->pos[1] > yMax);
-
-        if (outOfBounds)
-        {
-            std::cout << "[ZoneNode] Entidad " << it->uuid << " fuera de limites. Transferenciendo..." << std::endl;
-
-            p.pack(*it);
-
-            tcp_node.send(tcp_node.getSocketFD(), p.getRawData(), p.getSize());
-
-            it = entities.erase(it);
-        } else ++it;
-    }
 }

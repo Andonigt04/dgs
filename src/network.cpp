@@ -80,7 +80,6 @@ namespace DGS
     {
         int opt = 1;
         if (setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) std::perror("Error en setsockopt SO_REUSEADDR");
-        if (setsockopt(socketFD, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) std::perror("Error en setsockopt SO_REUSEADDR");
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -108,7 +107,7 @@ namespace DGS
         socklen_t addrLen = sizeof(clientAddr);
 
         int clientFD = ::accept(socketFD, (struct sockaddr*)&clientAddr, &addrLen);
-
+        if (clientFD < 0) std::perror("[TCPSocket] accept falló");
         return clientFD;
     }
 
@@ -124,13 +123,32 @@ namespace DGS
 
     bool TCPSocket::send(int fd, const uint8_t* data, size_t size)
     {
+        uint32_t len = htonl((uint32_t)size);
+        if (::send(fd, &len, 4, 0) != 4) return false;
         ssize_t sent = ::send(fd, data, size, 0);
         return sent == (ssize_t)size;
     }
 
+    static ssize_t recvAll(int fd, void* buf, size_t n)
+    {
+        size_t got = 0;
+        while (got < n)
+        {
+            ssize_t r = ::recv(fd, static_cast<char*>(buf) + got, n - got, 0);
+            if (r <= 0) return r;
+            got += r;
+        }
+        return (ssize_t)got;
+    }
+
     int TCPSocket::receive(int fd, uint8_t* buffer, size_t size)
     {
-        return ::recv(fd, buffer, size, 0);
+        uint32_t netLen;
+        if (recvAll(fd, &netLen, 4) != 4) return -1;
+        uint32_t len = ntohl(netLen);
+        if (len > size) return -1;
+        ssize_t r = recvAll(fd, buffer, len);
+        return (int)r;
     }
 
     void TCPSocket::closeClient(int fd)

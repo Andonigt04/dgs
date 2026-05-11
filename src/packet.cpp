@@ -16,7 +16,8 @@ namespace DGS
         write<float>(data.pos[1]);
         write<float>(data.pos[2]);
         write<uint16_t>(data.angle);
-        write<uint8_t>(data.data);
+        write<uint16_t>(data.dataSize);
+        writeRaw(data.data, data.dataSize);
         write<uint32_t>(data.state);
     }
 
@@ -30,7 +31,8 @@ namespace DGS
         data.pos[1] = read<float>();
         data.pos[2] = read<float>();
         data.angle = read<uint16_t>();
-        data.data = read<uint8_t>();
+        data.dataSize = read<uint16_t>();
+        readRaw(data.data, data.dataSize);
         data.state = read<EntityState>();
         
         return data;

@@ -40,6 +40,13 @@ namespace DGS
         CMD_TRANSFER_SERVER = 1 << 2
     };
 
+    enum LogType : uint8_t
+    {
+        LOG_TRANSFER = 0,
+        LOG_ERROR    = 1,
+        LOG_METRICS  = 2
+    };
+
     struct Stats
     {
         float health;
@@ -55,7 +62,8 @@ namespace DGS
         uint32_t uuid;
         float pos[3];
         uint16_t angle;
-        uint8_t data;
+        uint16_t dataSize;
+        uint8_t data[4096];
         EntityState state;
     };
 
@@ -78,6 +86,18 @@ namespace DGS
         float ramUsage;
         float performance;
         double areaCenter[3];
+    };
+
+    struct LogEntry
+    {
+        uint64_t time_stamp;
+        LogType type;
+        EntityType entityType;
+        uint32_t uuid;
+        int32_t fd;
+        uint32_t bytes;
+        float ramUsage;
+        float performance;
     };
 };
 

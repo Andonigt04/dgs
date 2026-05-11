@@ -2,6 +2,8 @@
 #define DGS_ORCHESTRATOR_H
 
 #include "include/dgs/types.h"
+#include "include/dgs/network.h"
+
 #include <vector>
 #include <iostream>
 
@@ -10,8 +12,9 @@ namespace DGS
     class Orchestrator
     {
         public:
+            Orchestrator(DGS::TCPSocket& s) : socket(s) {}
             std::vector<ZoneInfo> activeZones;
-
+        
             void updateNodeTopology(int fd, const ServerMetrics& m)
             {
                 for (auto& zone : activeZones)
@@ -20,12 +23,12 @@ namespace DGS
                     {
                         zone.xMin = m.node.xMin; zone.xMax = m.node.xMax;
                         zone.yMin = m.node.yMin; zone.yMax = m.node.yMax;
-                        activeZones.push_back(zone);
                         return;
                     }
                 }
+                activeZones.push_back({fd, m.node.xMin, m.node.xMax, m.node.yMin, m.node.yMax});
             }
-
+            
             int findTargetNode(double x, double y)
             {
                 for (const auto& zone : activeZones)
@@ -40,20 +43,18 @@ namespace DGS
 
             void evaluateServer(const ServerMetrics& m, int nodeFD)
             {
-                updateNodeTopology(nodeFD, m);
-
                 if (m.ramUsage > .80f && m.performance < .36f)
                 {
-                    std::cout << "[Orchestrator] Umbral alcanzado. Escalando sistema..." << nodeFD << std::endl;
-
+                    std::cout << "[Orchestrator] Umbral alcanzado. Escalando sistema..." << std::endl;
+                    
                     double midX = (m.node.xMin + m.node.xMax) / 2.0;
 
                     spawnNewNode(midX, m.node.xMax, m.node.yMin, m.node.yMax);
                     sendResizeCommand(nodeFD, midX);
-
+                    
                 }
             }
-
+            
             
         private:
             void spawnNewNode(double midX, double xMax, double yMin, double yMax)
@@ -69,7 +70,7 @@ namespace DGS
                 std::cout << "[Orchestrator] Lanzando nuevo contenedor ZoneNode..." << std::endl;
                 system(cmd.c_str());
             }
-
+            
             void sendResizeCommand(int fd, double newMax)
             {
                 DGS::Command cmd;
@@ -79,9 +80,13 @@ namespace DGS
                 DGS::Packet p;
                 p.pack(cmd);
 
+                socket.send(fd, p.getRawData(), p.getSize());
+
                 std::cout << "[Orchestrator] Actualizando contenedor ZoneNode... " << fd << std::endl;
             }
-    };
+
+            DGS::TCPSocket& socket;
+        };
 };
 
 #endif
