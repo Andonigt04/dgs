@@ -6,7 +6,7 @@ A high-performance distributed game server infrastructure written in C++17, desi
 
 ## Architecture
 
-[Network Haruka](Network%20Haruka.drawio)
+[![alt text](image.png)](Network%20Haruka.drawio)
 
 ---
 
