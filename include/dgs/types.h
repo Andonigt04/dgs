@@ -60,6 +60,7 @@ namespace DGS
     {
         EntityType type;
         uint32_t uuid;
+        int32_t chunkX, chunkY, chunkZ;
         float pos[3];
         uint16_t angle;
         uint16_t dataSize;
@@ -70,14 +71,15 @@ namespace DGS
     struct Command
     {
         HeadPurpose purpose;
-        double pos[3];
+        int32_t chunkX, chunkY;
         char addr[16];
         int port;
     };
 
     struct ZoneInfo {
         int fd;
-        double xMin, xMax, yMin, yMax;
+        int32_t chunkXMin, chunkXMax;
+        int32_t chunkYMin, chunkYMax;
     };
 
     struct ServerMetrics
@@ -85,7 +87,6 @@ namespace DGS
         ZoneInfo node;
         float ramUsage;
         float performance;
-        double areaCenter[3];
     };
 
     struct LogEntry

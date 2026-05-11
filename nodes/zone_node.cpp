@@ -21,13 +21,13 @@ float getRAM()
     return (float)total_bytes / limit;
 }
 
-void checkAndTransfer(DGS::TCPSocket& tcp_node, std::vector<DGS::EntityTransfer>& entities, double xMin, double xMax, double yMin, double yMax)
+void checkAndTransfer(DGS::TCPSocket& tcp_node, std::vector<DGS::EntityTransfer>& entities, int32_t chunkXMin, int32_t chunkXMax, int32_t chunkYMin, int32_t chunkYMax)
 {
     DGS::Packet p;
-    
+
     for (auto it = entities.begin(); it != entities.end();)
     {
-        bool outOfBounds = (it->pos[0] < xMin || it->pos[0] > xMax || it->pos[1] < yMin || it->pos[1] > yMax);
+        bool outOfBounds = (it->chunkX < chunkXMin || it->chunkX > chunkXMax || it->chunkY < chunkYMin || it->chunkY > chunkYMax);
 
         if (outOfBounds)
         {
@@ -66,19 +66,19 @@ int main()
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        double xMin = std::atof(std::getenv("X_MIN") ? std::getenv("X_MIN") : "0");
-        double xMax = std::atof(std::getenv("X_MAX") ? std::getenv("X_MAX") : "100");
-        double yMin = std::atof(std::getenv("Y_MIN") ? std::getenv("Y_MIN") : "0");
-        double yMax = std::atof(std::getenv("Y_MAX") ? std::getenv("Y_MAX") : "100");
-        
-        checkAndTransfer(tcp_zone_node, entities, xMin, xMax, yMin, yMax);
+        int32_t chunkXMin = std::atoi(std::getenv("CHUNK_X_MIN") ? std::getenv("CHUNK_X_MIN") : "0");
+        int32_t chunkXMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "100");
+        int32_t chunkYMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "0");
+        int32_t chunkYMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "100");
+
+        checkAndTransfer(tcp_zone_node, entities, chunkXMin, chunkXMax, chunkYMin, chunkYMax);
 
         DGS::ServerMetrics metrics;
-        metrics.ramUsage    = getRAM();
-        metrics.node.xMin = xMin;
-        metrics.node.xMax = xMax;
-        metrics.node.yMin = yMin;
-        metrics.node.yMax = yMax;
+        metrics.ramUsage          = getRAM();
+        metrics.node.chunkXMin = chunkXMin;
+        metrics.node.chunkXMax = chunkXMax;
+        metrics.node.chunkYMin = chunkYMin;
+        metrics.node.chunkYMax = chunkYMax;
         
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float, std::milli> duration = end - start;

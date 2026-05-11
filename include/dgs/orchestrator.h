@@ -21,19 +21,20 @@ namespace DGS
                 {
                     if (zone.fd == fd)
                     {
-                        zone.xMin = m.node.xMin; zone.xMax = m.node.xMax;
-                        zone.yMin = m.node.yMin; zone.yMax = m.node.yMax;
+                        zone.chunkXMin = m.node.chunkXMin; zone.chunkXMax = m.node.chunkXMax;
+                        zone.chunkYMin = m.node.chunkYMin; zone.chunkYMax = m.node.chunkYMax;
                         return;
                     }
                 }
-                activeZones.push_back({fd, m.node.xMin, m.node.xMax, m.node.yMin, m.node.yMax});
+                activeZones.push_back({fd, m.node.chunkXMin, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax});
             }
-            
-            int findTargetNode(double x, double y)
+
+            int findTargetNode(int32_t chunkX, int32_t chunkY)
             {
                 for (const auto& zone : activeZones)
                 {
-                    if (x >= zone.xMin && x <= zone.xMax && y >= zone.yMin && y <= zone.yMax)
+                    if (chunkX >= zone.chunkXMin && chunkX <= zone.chunkXMax &&
+                        chunkY >= zone.chunkYMin && chunkY <= zone.chunkYMax)
                     {
                         return zone.fd;
                     }
@@ -46,36 +47,34 @@ namespace DGS
                 if (m.ramUsage > .80f && m.performance < .36f)
                 {
                     std::cout << "[Orchestrator] Umbral alcanzado. Escalando sistema..." << std::endl;
-                    
-                    double midX = (m.node.xMin + m.node.xMax) / 2.0;
 
-                    spawnNewNode(midX, m.node.xMax, m.node.yMin, m.node.yMax);
+                    int32_t midX = (m.node.chunkXMin + m.node.chunkXMax) / 2;
+
+                    spawnNewNode(midX, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax);
                     sendResizeCommand(nodeFD, midX);
-                    
                 }
             }
             
             
         private:
-            void spawnNewNode(double midX, double xMax, double yMin, double yMax)
+            void spawnNewNode(int32_t midX, int32_t xMax, int32_t yMin, int32_t yMax)
             {
-                
                 std::string cmd = "docker run "
-                "-e X_MIN=" + std::to_string(midX) + " "
-                "-e X_MAX=" + std::to_string(xMax) + " "
-                "-e Y_MIN=" + std::to_string(yMin) + " "
-                "-e Y_MAX=" + std::to_string(yMax) + " "
+                "-e CHUNK_X_MIN=" + std::to_string(midX) + " "
+                "-e CHUNK_X_MAX=" + std::to_string(xMax) + " "
+                "-e CHUNK_Y_MIN=" + std::to_string(yMin) + " "
+                "-e CHUNK_Y_MAX=" + std::to_string(yMax) + " "
                 "-d dgs_zone_node";
-                
+
                 std::cout << "[Orchestrator] Lanzando nuevo contenedor ZoneNode..." << std::endl;
                 system(cmd.c_str());
             }
-            
-            void sendResizeCommand(int fd, double newMax)
+
+            void sendResizeCommand(int fd, int32_t newChunkMax)
             {
                 DGS::Command cmd;
                 cmd.purpose = DGS::CMD_TRANSFER_SERVER;
-                cmd.pos[0] = newMax;
+                cmd.chunkX  = newChunkMax;
 
                 DGS::Packet p;
                 p.pack(cmd);

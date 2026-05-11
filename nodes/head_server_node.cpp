@@ -23,9 +23,9 @@ int main()
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p) {
         auto e = p.unpackEntityTransfer();
         std::cout << "[HeadServer] Entidad recibida uuid=" << e.uuid
-                  << " pos=(" << e.pos[0] << "," << e.pos[1] << ") desde fd=" << fd << std::endl;
+                  << " chunk=(" << e.chunkX << "," << e.chunkY << ") desde fd=" << fd << std::endl;
 
-        int targetFD = orchestrator.findTargetNode(e.pos[0], e.pos[1]);
+        int targetFD = orchestrator.findTargetNode(e.chunkX, e.chunkY);
         std::cout << "[HeadServer] Zonas activas: " << orchestrator.activeZones.size()
                   << " targetFD=" << targetFD << std::endl;
 

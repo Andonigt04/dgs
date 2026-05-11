@@ -12,6 +12,9 @@ namespace DGS
         write<uint8_t>(PKT_ENTITY_TRANSFER);
         write<uint8_t>(data.type);
         write<uint32_t>(data.uuid);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
         write<float>(data.pos[0]);
         write<float>(data.pos[1]);
         write<float>(data.pos[2]);
@@ -27,6 +30,9 @@ namespace DGS
         EntityTransfer data;
         data.type = read<EntityType>();
         data.uuid = read<uint32_t>();
+        data.chunkX = read<int32_t>();
+        data.chunkY = read<int32_t>();
+        data.chunkZ = read<int32_t>();
         data.pos[0] = read<float>();
         data.pos[1] = read<float>();
         data.pos[2] = read<float>();
@@ -44,9 +50,8 @@ namespace DGS
 
         write<uint8_t>(PKT_COMMAND);
         write<HeadPurpose>(data.purpose);
-        write<double>(data.pos[0]);
-        write<double>(data.pos[1]);
-        write<double>(data.pos[2]);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
         writeString(std::string(data.addr));
         write<int>(data.port);
     }
@@ -56,9 +61,8 @@ namespace DGS
         readPos = 1;
         Command data;
         data.purpose = read<HeadPurpose>();
-        data.pos[0] = read<double>();
-        data.pos[1] = read<double>();
-        data.pos[2] = read<double>();
+        data.chunkX = read<int32_t>();
+        data.chunkY = read<int32_t>();
 
         std::string tempAddr = readString();
         std::strncpy(data.addr, tempAddr.c_str(), sizeof(data.addr) - 1);
@@ -75,10 +79,10 @@ namespace DGS
         write<uint8_t>(PKT_METRICS);
         write<float>(data.ramUsage);
         write<float>(data.performance);
-        write<double>(data.node.xMin);
-        write<double>(data.node.xMax);
-        write<double>(data.node.yMin);
-        write<double>(data.node.yMax);
+        write<int32_t>(data.node.chunkXMin);
+        write<int32_t>(data.node.chunkXMax);
+        write<int32_t>(data.node.chunkYMin);
+        write<int32_t>(data.node.chunkYMax);
     }
 
     ServerMetrics Packet::unpackServerMetrics()
@@ -87,10 +91,10 @@ namespace DGS
         ServerMetrics data;
         data.ramUsage = read<float>();
         data.performance = read<float>();
-        data.node.xMin = read<double>();
-        data.node.xMax = read<double>();
-        data.node.yMin = read<double>();
-        data.node.yMax = read<double>();
+        data.node.chunkXMin = read<int32_t>();
+        data.node.chunkXMax = read<int32_t>();
+        data.node.chunkYMin = read<int32_t>();
+        data.node.chunkYMax = read<int32_t>();
         
         return data;
     }
