@@ -13,7 +13,6 @@ int main()
     const char* headHost = std::getenv("HEAD_SERVER_HOST")  ? std::getenv("HEAD_SERVER_HOST") : "head-server";
     int         headPort = std::atoi(std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424");
 
-    // 1. Login via API HTTP
     std::string scheme  = std::getenv("HTTPS_ENABLE") ? "https://" : "http://";
     std::string apiAddr = scheme + apiHost + ":" + std::to_string(apiPort);
     httplib::Client api(apiAddr);
@@ -29,7 +28,6 @@ int main()
 
     std::cout << "[Client] Login OK. Token: " << res->body << std::endl;
 
-    // 2. Preguntar al HeadServer qué ZoneNode corresponde a la posición inicial
     DGS::TCPSocket headSocket;
     if (!headSocket.connect(headHost, headPort))
     {
@@ -61,7 +59,6 @@ int main()
 
     std::cout << "[Client] ZoneNode asignado: " << zone.addr << ":" << zone.port << std::endl;
 
-    // 3. Conectar al ZoneNode por UDP
     DGS::UDPSocket udpSocket;
 
     DGS::EntityTransfer entity{};
