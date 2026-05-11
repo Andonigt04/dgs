@@ -1,0 +1,25 @@
+FROM ubuntu:22.04 AS dgs-base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libssl-dev \
+    libsasl2-dev \
+    pkg-config \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# mongocxx driver
+RUN curl -L https://github.com/mongodb/mongo-cxx-driver/releases/download/r4.0.0/mongo-cxx-driver-r4.0.0.tar.gz \
+    | tar -xz && \
+    cd mongo-cxx-driver-r4.0.0/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DMONGOCXX_OVERRIDE_DEFAULT_INSTALL_PREFIX=OFF && \
+    cmake --build . --target install -j$(nproc) && \
+    cd ../.. && rm -rf mongo-cxx-driver-r4.0.0
+
+WORKDIR /app
+COPY . .

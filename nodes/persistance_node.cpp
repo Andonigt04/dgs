@@ -33,7 +33,8 @@ void insertEntity(mongocxx::collection& col, const DGS::EntityTransfer& e)
 int main()
 {
     mongocxx::instance instance{};
-    mongocxx::client   client{mongocxx::uri{"mongodb://localhost:27017"}};
+    const char* mongoUri = std::getenv("MONGO_URI") ? std::getenv("MONGO_URI") : "mongodb://mongodb:27017";
+    mongocxx::client   client{mongocxx::uri{mongoUri}};
 
     auto db       = client["dgs_persistance"];
     auto entities = db["entities"];

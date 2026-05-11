@@ -48,7 +48,10 @@ int main()
 
     std::vector<DGS::EntityTransfer> entities;
 
-    int fd = tcp_zone_node.connect("127.0.0.1", 42424);
+    const char* headHost = std::getenv("HEAD_SERVER_HOST") ? std::getenv("HEAD_SERVER_HOST") : "head-server";
+    int         headPort = std::atoi(std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424");
+
+    int fd = tcp_zone_node.connect(headHost, headPort);
 
     while (true)
     {

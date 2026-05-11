@@ -1,0 +1,162 @@
+
+==> Audit <==
+┌────────────┬─────────────────┬──────────┬────────┬─────────┬──────────────────────┬──────────┐
+│  COMMAND   │      ARGS       │ PROFILE  │  USER  │ VERSION │      START TIME      │ END TIME │
+├────────────┼─────────────────┼──────────┼────────┼─────────┼──────────────────────┼──────────┤
+│ start      │ --driver=docker │ minikube │ andoni │ v1.38.1 │ 11 May 26 12:09 CEST │          │
+│ docker-env │                 │ minikube │ andoni │ v1.38.1 │ 11 May 26 12:09 CEST │          │
+│ docker-env │                 │ minikube │ andoni │ v1.38.1 │ 11 May 26 12:09 CEST │          │
+│ start      │                 │ minikube │ andoni │ v1.38.1 │ 11 May 26 12:10 CEST │          │
+│ start      │                 │ minikube │ andoni │ v1.38.1 │ 11 May 26 12:12 CEST │          │
+└────────────┴─────────────────┴──────────┴────────┴─────────┴──────────────────────┴──────────┘
+
+
+==> Last Start <==
+Log file created at: 2026/05/11 12:12:01
+Running on machine: fedora
+Binary: Built with gc go1.25.5 for linux/amd64
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+I0511 12:12:01.204401 1660896 out.go:360] Setting OutFile to fd 1 ...
+I0511 12:12:01.204576 1660896 out.go:413] isatty.IsTerminal(1) = true
+I0511 12:12:01.204578 1660896 out.go:374] Setting ErrFile to fd 2...
+I0511 12:12:01.204580 1660896 out.go:413] isatty.IsTerminal(2) = true
+I0511 12:12:01.204715 1660896 root.go:338] Updating PATH: /home/andoni/.minikube/bin
+W0511 12:12:01.204780 1660896 root.go:314] Error reading config file at /home/andoni/.minikube/config/config.json: open /home/andoni/.minikube/config/config.json: no such file or directory
+I0511 12:12:01.204978 1660896 out.go:368] Setting JSON to false
+I0511 12:12:01.208800 1660896 start.go:134] hostinfo: {"hostname":"fedora","uptime":17135,"bootTime":1778477186,"procs":520,"os":"linux","platform":"fedora","platformFamily":"fedora","platformVersion":"44","kernelVersion":"6.19.14-300.fc44.x86_64","kernelArch":"x86_64","virtualizationSystem":"","virtualizationRole":"","hostId":"509d64bd-af27-41da-b8dc-de6649240282"}
+I0511 12:12:01.208860 1660896 start.go:144] virtualization:  
+I0511 12:12:01.210565 1660896 out.go:179] 😄  minikube v1.38.1 on Fedora 44
+W0511 12:12:01.252947 1660896 preload.go:371] Failed to list preload files: open /home/andoni/.minikube/cache/preloaded-tarball: no such file or directory
+I0511 12:12:01.253008 1660896 notify.go:220] Checking for updates...
+I0511 12:12:01.253098 1660896 driver.go:422] Setting default libvirt URI to qemu:///system
+I0511 12:12:01.253116 1660896 global.go:113] Querying for installed drivers using PATH=/home/andoni/.minikube/bin:/home/andoni/.config/herd-lite/bin:/home/andoni/.config/herd-lite/bin:/home/andoni/.config/herd-lite/bin:/home/andoni/.local/bin:/home/andoni/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/home/andoni/.composer/vendor/bin
+I0511 12:12:01.253130 1660896 global.go:134] ssh default: false priority: 4, state: {Installed:true Healthy:true Running:false NeedsImprovement:false Error:<nil> Reason: Fix: Doc: Version:}
+I0511 12:12:01.286937 1660896 global.go:134] kvm2 default: true priority: 8, state: {Installed:true Healthy:false Running:true NeedsImprovement:false Error:libvirt group membership check failed:
+user is not a member of the appropriate libvirt group Reason:PR_KVM_USER_PERMISSION Fix:Check that libvirtd is properly installed and that you are a member of the appropriate libvirt group (remember to relogin for group changes to take effect!) Doc:https://minikube.sigs.k8s.io/docs/reference/drivers/kvm2/ Version:}
+I0511 12:12:01.287363 1660896 global.go:134] qemu2 default: true priority: 7, state: {Installed:true Healthy:true Running:true NeedsImprovement:false Error:<nil> Reason: Fix: Doc: Version:}
+I0511 12:12:01.335504 1660896 global.go:134] virtualbox default: true priority: 6, state: {Installed:true Healthy:false Running:false NeedsImprovement:false Error:warning from virtualbox WARNING: The vboxdrv kernel module is not loaded. Either there is no module
+         available for the current kernel (6.19.14-300.fc44.x86_64) or it failed to
+         load. Please recompile the kernel module and install it by
+
+           sudo /sbin/vboxconfig
+
+         You will not be able to start VMs until this problem is fixed.
+7.2.8r173730
+ Reason: Fix:Read the docs for resolution Doc:https://minikube.sigs.k8s.io/docs/reference/drivers/virtualbox/ Version:}
+I0511 12:12:01.335773 1660896 global.go:134] vmware default: false priority: 5, state: {Installed:false Healthy:false Running:false NeedsImprovement:false Error:exec: "vmrun": executable file not found in $PATH Reason: Fix:Install vmrun Doc:https://minikube.sigs.k8s.io/docs/reference/drivers/vmware/ Version:}
+W0511 12:12:01.347534 1660896 docker.go:183] docker version returned error: exit status 1
+I0511 12:12:01.347564 1660896 global.go:134] docker default: true priority: 9, state: {Installed:true Healthy:false Running:true NeedsImprovement:false Error:"docker version --format {{.Server.Os}}-{{.Server.Version}}:{{.Server.Platform.Name}}" exit status 1: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock Reason:PROVIDER_DOCKER_NEWGRP Fix:Add your user to the 'docker' group: 'sudo usermod -aG docker $USER && newgrp docker' Doc:https://docs.docker.com/engine/install/linux-postinstall/ Version:}
+I0511 12:12:01.387522 1660896 global.go:134] none default: false priority: 4, state: {Installed:true Healthy:true Running:false NeedsImprovement:false Error:<nil> Reason: Fix: Doc: Version:}
+W0511 12:12:01.396749 1660896 podman.go:139] podman returned error: exit status 1
+I0511 12:12:01.396781 1660896 global.go:134] podman default: true priority: 7, state: {Installed:true Healthy:false Running:false NeedsImprovement:false Error:"sudo -n -k podman version --format {{.Version}}" exit status 1: sudo: a password is required Reason: Fix:Add your user to the 'sudoers' file: 'andoni ALL=(ALL) NOPASSWD: /usr/bin/podman' , or run 'minikube config set rootless true' Doc:https://podman.io Version:}
+I0511 12:12:01.396803 1660896 driver.go:344] not recommending "ssh" due to default: false
+I0511 12:12:01.396808 1660896 driver.go:344] not recommending "none" due to default: false
+I0511 12:12:01.396811 1660896 driver.go:339] not recommending "kvm2" due to health: libvirt group membership check failed:
+user is not a member of the appropriate libvirt group
+I0511 12:12:01.396815 1660896 driver.go:339] not recommending "virtualbox" due to health: warning from virtualbox WARNING: The vboxdrv kernel module is not loaded. Either there is no module
+         available for the current kernel (6.19.14-300.fc44.x86_64) or it failed to
+         load. Please recompile the kernel module and install it by
+
+           sudo /sbin/vboxconfig
+
+         You will not be able to start VMs until this problem is fixed.
+7.2.8r173730
+I0511 12:12:01.396817 1660896 driver.go:339] not recommending "docker" due to health: "docker version --format {{.Server.Os}}-{{.Server.Version}}:{{.Server.Platform.Name}}" exit status 1: permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+I0511 12:12:01.396825 1660896 driver.go:339] not recommending "podman" due to health: "sudo -n -k podman version --format {{.Version}}" exit status 1: sudo: a password is required
+I0511 12:12:01.396851 1660896 driver.go:379] Picked: qemu2
+I0511 12:12:01.396856 1660896 driver.go:380] Alternatives: [ssh none]
+I0511 12:12:01.396860 1660896 driver.go:381] Rejects: [kvm2 virtualbox vmware docker podman]
+I0511 12:12:01.398423 1660896 out.go:179] ✨  Automatically selected the qemu2 driver. Other choices: ssh, none
+I0511 12:12:01.399687 1660896 start.go:310] selected driver: qemu2
+I0511 12:12:01.399692 1660896 start.go:935] validating driver "qemu2" against <nil>
+I0511 12:12:01.399700 1660896 start.go:946] status for qemu2: {Installed:true Healthy:true Running:true NeedsImprovement:false Error:<nil> Reason: Fix: Doc: Version:}
+W0511 12:12:01.400269 1660896 out.go:285] ❗  Starting v1.39.0, minikube will default to "containerd" container runtime. See #21973 for more info.
+I0511 12:12:01.400280 1660896 start_flags.go:332] no existing cluster config was found, will generate one from the flags 
+I0511 12:12:01.402885 1660896 out.go:179] 🌐  Automatically selected the builtin network
+W0511 12:12:01.404066 1660896 out.go:285] ❗  You are using the QEMU driver without a dedicated network, which doesn't support `minikube service` & `minikube tunnel` commands.
+I0511 12:12:01.405069 1660896 start_flags.go:416] Using suggested 6144MB memory alloc based on sys=32005MB, container=0MB
+I0511 12:12:01.405233 1660896 start_flags.go:1000] Wait components to verify : map[apiserver:true system_pods:true]
+I0511 12:12:01.405248 1660896 cni.go:83] Creating CNI manager for ""
+I0511 12:12:01.405281 1660896 cni.go:157] "qemu2" driver + "docker" container runtime found on kubernetes v1.24+, recommending bridge
+I0511 12:12:01.405284 1660896 start_flags.go:341] Found "bridge CNI" CNI - setting NetworkPlugin=cni
+I0511 12:12:01.405320 1660896 start.go:358] cluster config:
+{Name:minikube KeepContext:false EmbedCerts:false MinikubeISO: KicBaseImage:gcr.io/k8s-minikube/kicbase:v0.0.50@sha256:eb4fec00e8ad70adf8e6436f195cc429825ffb85f95afcdb5d8d9deb576f3e93 Memory:6144 CPUs:2 DiskSize:20000 Driver:qemu2 HyperkitVpnKitSock: HyperkitVSockPorts:[] DockerEnv:[] ContainerVolumeMounts:[] InsecureRegistry:[] RegistryMirror:[] HostOnlyCIDR:192.168.59.1/24 HypervVirtualSwitch: HypervUseExternalSwitch:false HypervExternalAdapter: KVMNetwork:default KVMQemuURI:qemu:///system KVMGPU:false KVMHidden:false KVMNUMACount:1 APIServerPort:8443 DockerOpt:[] DisableDriverMounts:false NFSShare:[] NFSSharesRoot:/nfsshares UUID: NoVTXCheck:false DNSProxy:false HostDNSResolver:true HostOnlyNicType:virtio NatNicType:virtio SSHIPAddress: SSHUser:root SSHKey: SSHPort:22 KubernetesConfig:{KubernetesVersion:v1.35.1 ClusterName:minikube Namespace:default APIServerHAVIP: APIServerName:minikubeCA APIServerNames:[] APIServerIPs:[] DNSDomain:cluster.local ContainerRuntime:docker CRISocket: NetworkPlugin:cni FeatureGates: ServiceCIDR:10.96.0.0/12 ImageRepository: LoadBalancerStartIP: LoadBalancerEndIP: CustomIngressCert: RegistryAliases: ExtraOptions:[] ShouldLoadCachedImages:true EnableDefaultCNI:false CNI:} Nodes:[{Name: IP: Port:8443 KubernetesVersion:v1.35.1 ContainerRuntime:docker ControlPlane:true Worker:true}] Addons:map[] CustomAddonImages:map[] CustomAddonRegistries:map[] VerifyComponents:map[apiserver:true system_pods:true] StartHostTimeout:6m0s ScheduledStop:<nil> ExposedPorts:[] ListenAddress: Network:builtin Subnet: MultiNodeRequested:false ExtraDisks:0 CertExpiration:26280h0m0s MountString: Mount9PVersion:9p2000.L MountGID:docker MountIP: MountMSize:262144 MountOptions:[] MountPort:0 MountType:9p MountUID:docker BinaryMirror: DisableOptimizations:false DisableMetrics:false DisableCoreDNSLog:false CustomQemuFirmwarePath: SocketVMnetClientPath: SocketVMnetPath: StaticIP: SSHAuthSock: SSHAgentPID:0 GPUs: AutoPauseInterval:1m0s Rosetta:false}
+I0511 12:12:01.405467 1660896 iso.go:125] acquiring lock: {Name:mk051b938d10c8f847c1102802d04f7ac1385b6f Timeout:10m0s Delay:500ms}
+I0511 12:12:01.407915 1660896 out.go:179] 💿  Downloading VM boot image ...
+I0511 12:12:01.409127 1660896 download.go:113] Downloading: https://storage.googleapis.com/minikube/iso/minikube-v1.38.0-amd64.iso?checksum=file:https://storage.googleapis.com/minikube/iso/minikube-v1.38.0-amd64.iso.sha256 -> /home/andoni/.minikube/cache/iso/amd64/minikube-v1.38.0-amd64.iso
+I0511 12:12:46.828592 1660896 out.go:179] 👍  Starting "minikube" primary control-plane node in "minikube" cluster
+I0511 12:12:46.840211 1660896 preload.go:187] Checking if preload exists for k8s version v1.35.1 and runtime docker
+I0511 12:12:46.954401 1660896 preload.go:147] Found remote preload: https://storage.googleapis.com/minikube-preloaded-volume-tarballs/v18/v1.35.1/preloaded-images-k8s-v18-v1.35.1-docker-overlay2-amd64.tar.lz4
+I0511 12:12:46.954413 1660896 cache.go:66] Caching tarball of preloaded images
+I0511 12:12:46.954632 1660896 preload.go:187] Checking if preload exists for k8s version v1.35.1 and runtime docker
+I0511 12:12:46.964741 1660896 out.go:179] 💾  Downloading Kubernetes v1.35.1 preload ...
+I0511 12:12:46.965946 1660896 preload.go:268] Downloading preload from https://storage.googleapis.com/minikube-preloaded-volume-tarballs/v18/v1.35.1/preloaded-images-k8s-v18-v1.35.1-docker-overlay2-amd64.tar.lz4
+I0511 12:12:46.965950 1660896 preload.go:335] getting checksum for preloaded-images-k8s-v18-v1.35.1-docker-overlay2-amd64.tar.lz4 from gcs api...
+I0511 12:12:47.160315 1660896 preload.go:312] Got checksum from GCS API "0196e6e2824ad229ae3d9d11863129d8"
+I0511 12:12:47.160479 1660896 download.go:113] Downloading: https://storage.googleapis.com/minikube-preloaded-volume-tarballs/v18/v1.35.1/preloaded-images-k8s-v18-v1.35.1-docker-overlay2-amd64.tar.lz4?checksum=md5:0196e6e2824ad229ae3d9d11863129d8 -> /home/andoni/.minikube/cache/preloaded-tarball/preloaded-images-k8s-v18-v1.35.1-docker-overlay2-amd64.tar.lz4
+I0511 12:13:20.457384 1660896 cache.go:69] Finished verifying existence of preloaded tar for v1.35.1 on docker
+I0511 12:13:20.457737 1660896 profile.go:143] Saving config to /home/andoni/.minikube/profiles/minikube/config.json ...
+I0511 12:13:20.457771 1660896 lock.go:61] WriteFile acquiring /home/andoni/.minikube/profiles/minikube/config.json: {Name:mkfd5be3462ed0e9178f1ed9328c561f64aad39a Timeout:1m0s Delay:500ms}
+I0511 12:13:20.457972 1660896 start.go:359] acquireMachinesLock for minikube: {Name:mkd8765aa477760933726d3c5b352ab2d56f3f67 Timeout:13m0s Delay:500ms}
+I0511 12:13:20.457999 1660896 start.go:363] duration metric: took 22.031µs to acquireMachinesLock for "minikube"
+I0511 12:13:20.458013 1660896 start.go:92] Provisioning new machine with config: &{Name:minikube KeepContext:false EmbedCerts:false MinikubeISO:https://storage.googleapis.com/minikube/iso/minikube-v1.38.0-amd64.iso KicBaseImage:gcr.io/k8s-minikube/kicbase:v0.0.50@sha256:eb4fec00e8ad70adf8e6436f195cc429825ffb85f95afcdb5d8d9deb576f3e93 Memory:6144 CPUs:2 DiskSize:20000 Driver:qemu2 HyperkitVpnKitSock: HyperkitVSockPorts:[] DockerEnv:[] ContainerVolumeMounts:[] InsecureRegistry:[] RegistryMirror:[] HostOnlyCIDR:192.168.59.1/24 HypervVirtualSwitch: HypervUseExternalSwitch:false HypervExternalAdapter: KVMNetwork:default KVMQemuURI:qemu:///system KVMGPU:false KVMHidden:false KVMNUMACount:1 APIServerPort:8443 DockerOpt:[] DisableDriverMounts:false NFSShare:[] NFSSharesRoot:/nfsshares UUID: NoVTXCheck:false DNSProxy:false HostDNSResolver:true HostOnlyNicType:virtio NatNicType:virtio SSHIPAddress: SSHUser:root SSHKey: SSHPort:22 KubernetesConfig:{KubernetesVersion:v1.35.1 ClusterName:minikube Namespace:default APIServerHAVIP: APIServerName:minikubeCA APIServerNames:[] APIServerIPs:[] DNSDomain:cluster.local ContainerRuntime:docker CRISocket: NetworkPlugin:cni FeatureGates: ServiceCIDR:10.96.0.0/12 ImageRepository: LoadBalancerStartIP: LoadBalancerEndIP: CustomIngressCert: RegistryAliases: ExtraOptions:[] ShouldLoadCachedImages:true EnableDefaultCNI:false CNI:} Nodes:[{Name: IP: Port:8443 KubernetesVersion:v1.35.1 ContainerRuntime:docker ControlPlane:true Worker:true}] Addons:map[] CustomAddonImages:map[] CustomAddonRegistries:map[] VerifyComponents:map[apiserver:true system_pods:true] StartHostTimeout:6m0s ScheduledStop:<nil> ExposedPorts:[] ListenAddress: Network:builtin Subnet: MultiNodeRequested:false ExtraDisks:0 CertExpiration:26280h0m0s MountString: Mount9PVersion:9p2000.L MountGID:docker MountIP: MountMSize:262144 MountOptions:[] MountPort:0 MountType:9p MountUID:docker BinaryMirror: DisableOptimizations:false DisableMetrics:false DisableCoreDNSLog:false CustomQemuFirmwarePath: SocketVMnetClientPath: SocketVMnetPath: StaticIP: SSHAuthSock: SSHAgentPID:0 GPUs: AutoPauseInterval:1m0s Rosetta:false} &{Name: IP: Port:8443 KubernetesVersion:v1.35.1 ContainerRuntime:docker ControlPlane:true Worker:true}
+I0511 12:13:20.458064 1660896 start.go:124] createHost starting for "" (driver="qemu2")
+I0511 12:13:20.470180 1660896 out.go:252] 🔥  Creating qemu2 VM (CPUs=2, Memory=6144MB, Disk=20000MB) ...
+I0511 12:13:20.470448 1660896 start.go:158] libmachine.API.Create for "minikube" (driver="qemu2")
+I0511 12:13:20.470461 1660896 client.go:173] LocalClient.Create starting
+I0511 12:13:20.470586 1660896 main.go:144] libmachine: Creating CA: /home/andoni/.minikube/certs/ca.pem
+I0511 12:13:20.490678 1660896 main.go:144] libmachine: Creating client certificate: /home/andoni/.minikube/certs/cert.pem
+I0511 12:13:20.532721 1660896 main.go:144] libmachine: port range: 0 -> 65535
+I0511 12:13:20.533010 1660896 main.go:144] libmachine: Downloading /home/andoni/.minikube/cache/boot2docker.iso from file:///home/andoni/.minikube/cache/iso/amd64/minikube-v1.38.0-amd64.iso...
+I0511 12:13:20.534803 1660896 main.go:144] libmachine: Creating SSH key...
+I0511 12:13:20.556203 1660896 main.go:144] libmachine: Creating Disk image...
+I0511 12:13:20.556210 1660896 main.go:144] libmachine: Creating 20000 MB hard disk image...
+I0511 12:13:20.556491 1660896 main.go:144] libmachine: executing: qemu-img convert -f raw -O qcow2 /home/andoni/.minikube/machines/minikube/disk.qcow2.raw /home/andoni/.minikube/machines/minikube/disk.qcow2
+I0511 12:13:20.556494 1660896 main.go:144] libmachine: STDOUT: 
+I0511 12:13:20.556496 1660896 main.go:144] libmachine: STDERR: 
+I0511 12:13:20.556518 1660896 client.go:176] duration metric: took 86.052658ms to LocalClient.Create
+I0511 12:13:22.557561 1660896 start.go:127] duration metric: took 2.099486037s to createHost
+I0511 12:13:22.557568 1660896 start.go:82] releasing machines lock for "minikube", held for 2.099565435s
+W0511 12:13:22.557585 1660896 start.go:726] error starting host: creating host: create: creating: : exec: "qemu-img": executable file not found in $PATH
+I0511 12:13:22.569302 1660896 out.go:179] 🔥  Deleting "minikube" in qemu2 ...
+W0511 12:13:22.598954 1660896 out.go:285] 🤦  StartHost failed, but will try again: creating host: create: creating: : exec: "qemu-img": executable file not found in $PATH
+I0511 12:13:22.598969 1660896 start.go:742] Will try again in 5 seconds ...
+I0511 12:13:27.600090 1660896 start.go:359] acquireMachinesLock for minikube: {Name:mkd8765aa477760933726d3c5b352ab2d56f3f67 Timeout:13m0s Delay:500ms}
+I0511 12:13:27.600142 1660896 start.go:363] duration metric: took 40.115µs to acquireMachinesLock for "minikube"
+I0511 12:13:27.600162 1660896 start.go:92] Provisioning new machine with config: &{Name:minikube KeepContext:false EmbedCerts:false MinikubeISO:https://storage.googleapis.com/minikube/iso/minikube-v1.38.0-amd64.iso KicBaseImage:gcr.io/k8s-minikube/kicbase:v0.0.50@sha256:eb4fec00e8ad70adf8e6436f195cc429825ffb85f95afcdb5d8d9deb576f3e93 Memory:6144 CPUs:2 DiskSize:20000 Driver:qemu2 HyperkitVpnKitSock: HyperkitVSockPorts:[] DockerEnv:[] ContainerVolumeMounts:[] InsecureRegistry:[] RegistryMirror:[] HostOnlyCIDR:192.168.59.1/24 HypervVirtualSwitch: HypervUseExternalSwitch:false HypervExternalAdapter: KVMNetwork:default KVMQemuURI:qemu:///system KVMGPU:false KVMHidden:false KVMNUMACount:1 APIServerPort:8443 DockerOpt:[] DisableDriverMounts:false NFSShare:[] NFSSharesRoot:/nfsshares UUID: NoVTXCheck:false DNSProxy:false HostDNSResolver:true HostOnlyNicType:virtio NatNicType:virtio SSHIPAddress: SSHUser:root SSHKey: SSHPort:22 KubernetesConfig:{KubernetesVersion:v1.35.1 ClusterName:minikube Namespace:default APIServerHAVIP: APIServerName:minikubeCA APIServerNames:[] APIServerIPs:[] DNSDomain:cluster.local ContainerRuntime:docker CRISocket: NetworkPlugin:cni FeatureGates: ServiceCIDR:10.96.0.0/12 ImageRepository: LoadBalancerStartIP: LoadBalancerEndIP: CustomIngressCert: RegistryAliases: ExtraOptions:[] ShouldLoadCachedImages:true EnableDefaultCNI:false CNI:} Nodes:[{Name: IP: Port:8443 KubernetesVersion:v1.35.1 ContainerRuntime:docker ControlPlane:true Worker:true}] Addons:map[] CustomAddonImages:map[] CustomAddonRegistries:map[] VerifyComponents:map[apiserver:true system_pods:true] StartHostTimeout:6m0s ScheduledStop:<nil> ExposedPorts:[] ListenAddress: Network:builtin Subnet: MultiNodeRequested:false ExtraDisks:0 CertExpiration:26280h0m0s MountString: Mount9PVersion:9p2000.L MountGID:docker MountIP: MountMSize:262144 MountOptions:[] MountPort:0 MountType:9p MountUID:docker BinaryMirror: DisableOptimizations:false DisableMetrics:false DisableCoreDNSLog:false CustomQemuFirmwarePath: SocketVMnetClientPath: SocketVMnetPath: StaticIP: SSHAuthSock: SSHAgentPID:0 GPUs: AutoPauseInterval:1m0s Rosetta:false} &{Name: IP: Port:8443 KubernetesVersion:v1.35.1 ContainerRuntime:docker ControlPlane:true Worker:true}
+I0511 12:13:27.600212 1660896 start.go:124] createHost starting for "" (driver="qemu2")
+I0511 12:13:27.611361 1660896 out.go:252] 🔥  Creating qemu2 VM (CPUs=2, Memory=6144MB, Disk=20000MB) ...
+I0511 12:13:27.611425 1660896 start.go:158] libmachine.API.Create for "minikube" (driver="qemu2")
+I0511 12:13:27.611438 1660896 client.go:173] LocalClient.Create starting
+I0511 12:13:27.611470 1660896 main.go:144] libmachine: Reading certificate data from /home/andoni/.minikube/certs/ca.pem
+I0511 12:13:27.611488 1660896 main.go:144] libmachine: Decoding PEM data...
+I0511 12:13:27.611496 1660896 main.go:144] libmachine: Parsing certificate...
+I0511 12:13:27.611525 1660896 main.go:144] libmachine: Reading certificate data from /home/andoni/.minikube/certs/cert.pem
+I0511 12:13:27.611540 1660896 main.go:144] libmachine: Decoding PEM data...
+I0511 12:13:27.611546 1660896 main.go:144] libmachine: Parsing certificate...
+I0511 12:13:27.611665 1660896 main.go:144] libmachine: port range: 0 -> 65535
+I0511 12:13:27.611777 1660896 main.go:144] libmachine: Downloading /home/andoni/.minikube/cache/boot2docker.iso from file:///home/andoni/.minikube/cache/iso/amd64/minikube-v1.38.0-amd64.iso...
+I0511 12:13:27.613595 1660896 main.go:144] libmachine: Creating SSH key...
+I0511 12:13:27.623909 1660896 main.go:144] libmachine: Creating Disk image...
+I0511 12:13:27.623917 1660896 main.go:144] libmachine: Creating 20000 MB hard disk image...
+I0511 12:13:27.624027 1660896 main.go:144] libmachine: executing: qemu-img convert -f raw -O qcow2 /home/andoni/.minikube/machines/minikube/disk.qcow2.raw /home/andoni/.minikube/machines/minikube/disk.qcow2
+I0511 12:13:27.624030 1660896 main.go:144] libmachine: STDOUT: 
+I0511 12:13:27.624031 1660896 main.go:144] libmachine: STDERR: 
+I0511 12:13:27.624061 1660896 client.go:176] duration metric: took 12.619438ms to LocalClient.Create
+I0511 12:13:29.624525 1660896 start.go:127] duration metric: took 2.024302875s to createHost
+I0511 12:13:29.624533 1660896 start.go:82] releasing machines lock for "minikube", held for 2.024386632s
+W0511 12:13:29.624597 1660896 out.go:285] 😿  Failed to start qemu2 VM. Running "minikube delete" may fix it: creating host: create: creating: : exec: "qemu-img": executable file not found in $PATH
+I0511 12:13:29.634642 1660896 out.go:203] 
+W0511 12:13:29.635969 1660896 out.go:285] ❌  Exiting due to GUEST_PROVISION: error provisioning guest: Failed to start host: creating host: create: creating: : exec: "qemu-img": executable file not found in $PATH
+W0511 12:13:29.635979 1660896 out.go:285] 
+W0511 12:13:29.636164 1660896 out.go:308] [31m╭───────────────────────────────────────────────────────────────────────────────────────────╮[0m
+[31m│[0m                                                                                           [31m│[0m
+[31m│[0m    😿  If the above advice does not help, please let us know:                             [31m│[0m
+[31m│[0m    👉  https://github.com/kubernetes/minikube/issues/new/choose                           [31m│[0m
+[31m│[0m                                                                                           [31m│[0m
+[31m│[0m    Please run `minikube logs --file=logs.txt` and attach logs.txt to the GitHub issue.    [31m│[0m
+[31m│[0m                                                                                           [31m│[0m
+[31m╰───────────────────────────────────────────────────────────────────────────────────────────╯[0m
+I0511 12:13:29.637266 1660896 out.go:203] 
+
+

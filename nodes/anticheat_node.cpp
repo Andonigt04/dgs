@@ -44,10 +44,17 @@ int main()
     DGS::TCPSocket headServer;
     DGS::TCPSocket persistence;
 
-    if (!udpSocket.bind(42427))       { std::cerr << "[AntiCheat] Error UDP:42427"           << std::endl; return 1; }
-    if (!tcpSocket.listen(42428))     { std::cerr << "[AntiCheat] Error TCP listen:42428"     << std::endl; return 1; }
-    if (!headServer.connect("127.0.0.1", 42424)) { std::cerr << "[AntiCheat] Error conectando HeadServer" << std::endl; return 1; }
-    if (!persistence.connect("127.0.0.1", 42429)) { std::cerr << "[AntiCheat] Error conectando Persistence:42429" << std::endl; return 1; }
+    int         udpPort      = std::atoi(std::getenv("ANTICHEAT_UDP_PORT")  ? std::getenv("ANTICHEAT_UDP_PORT")  : "42427");
+    int         tcpPort      = std::atoi(std::getenv("ANTICHEAT_TCP_PORT")  ? std::getenv("ANTICHEAT_TCP_PORT")  : "42428");
+    const char* headHost     = std::getenv("HEAD_SERVER_HOST")               ? std::getenv("HEAD_SERVER_HOST")               : "head-server";
+    int         headPort     = std::atoi(std::getenv("HEAD_SERVER_PORT")     ? std::getenv("HEAD_SERVER_PORT")     : "42424");
+    const char* persHost     = std::getenv("PERSISTENCE_HOST")               ? std::getenv("PERSISTENCE_HOST")               : "persistence";
+    int         persPort     = std::atoi(std::getenv("PERSISTENCE_PORT")     ? std::getenv("PERSISTENCE_PORT")     : "42429");
+
+    if (!udpSocket.bind(udpPort))           { std::cerr << "[AntiCheat] Error UDP:"  << udpPort  << std::endl; return 1; }
+    if (!tcpSocket.listen(tcpPort))         { std::cerr << "[AntiCheat] Error TCP:"  << tcpPort  << std::endl; return 1; }
+    if (!headServer.connect(headHost, headPort))  { std::cerr << "[AntiCheat] Error conectando HeadServer" << std::endl; return 1; }
+    if (!persistence.connect(persHost, persPort)) { std::cerr << "[AntiCheat] Error conectando Persistence" << std::endl; return 1; }
 
     // Recibir Command inicial del HeadServer con los chunk sizes
     uint8_t cmdBuf[512];

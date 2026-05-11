@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persistence
+  namespace: dgs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: persistence
+  template:
+    metadata:
+      labels:
+        app: persistence
+    spec:
+      containers:
+        - name: persistence
+          image: dgs-persistence-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: MONGO_URI
+              value: "mongodb://mongodb:27017"
+          ports:
+            - containerPort: 42429
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"

@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anticheat
+  namespace: dgs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anticheat
+  template:
+    metadata:
+      labels:
+        app: anticheat
+    spec:
+      containers:
+        - name: anticheat
+          image: dgs-anticheat-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: HEAD_SERVER_HOST
+              value: "head-server"
+            - name: HEAD_SERVER_PORT
+              value: "42424"
+            - name: PERSISTENCE_HOST
+              value: "persistence"
+            - name: PERSISTENCE_PORT
+              value: "42429"
+            - name: ANTICHEAT_UDP_PORT
+              value: "42427"
+            - name: ANTICHEAT_TCP_PORT
+              value: "42428"
+          ports:
+            - containerPort: 42427
+              protocol: UDP
+            - containerPort: 42428
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"

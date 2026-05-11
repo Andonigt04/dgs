@@ -29,8 +29,16 @@ int main()
         auto m = p.unpackServerMetrics();
         orchestrator.updateNodeTopology(fd, m);
         orchestrator.evaluateServer(m, fd);
+
+        DGS::LogEntry entry{};
+        entry.time_stamp  = (uint64_t)std::time(nullptr);
+        entry.type        = DGS::LOG_METRICS;
+        entry.fd          = fd;
+        entry.ramUsage    = m.ramUsage;
+        entry.performance = m.performance;
+        logger.log(entry);
     });
-    
+
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p) {
         auto e = p.unpackEntityTransfer();
         std::cout << "[HeadServer] Entidad recibida uuid=" << e.uuid
@@ -44,6 +52,15 @@ int main()
         {
             bool ok = serverSocket.send(targetFD, p.getRawData(), p.getSize());
             std::cout << "[HeadServer] Echo enviado a fd=" << targetFD << " ok=" << ok << std::endl;
+
+            DGS::LogEntry entry{};
+            entry.time_stamp = (uint64_t)std::time(nullptr);
+            entry.type       = DGS::LOG_TRANSFER;
+            entry.entityType = e.type;
+            entry.uuid       = e.uuid;
+            entry.fd         = fd;
+            entry.bytes      = (uint32_t)p.getSize();
+            logger.log(entry);
         }
         else
             std::cout << "[HeadServer] No se encontro destino valido para la entidad" << std::endl;

@@ -4,8 +4,11 @@
 #include "include/dgs/types.h"
 #include "include/dgs/network.h"
 
+#include <httplib.h>
+
 #include <vector>
 #include <iostream>
+#include <fstream>
 #include <cstring>
 
 namespace DGS
@@ -13,9 +16,9 @@ namespace DGS
     class Orchestrator
     {
         public:
-            Orchestrator(DGS::TCPSocket& s) : socket(s) {}
+            Orchestrator(DGS::TCPSocket& s) : socket(s), currentReplicas(1) {}
             std::vector<ZoneInfo> activeZones;
-        
+
             void updateNodeTopology(int fd, const ServerMetrics& m)
             {
                 for (auto& zone : activeZones)
@@ -73,26 +76,47 @@ namespace DGS
 
                     int32_t midX = (m.node.chunkXMin + m.node.chunkXMax) / 2;
 
-                    spawnNewNode(midX, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax, m.node.chunkZMin, m.node.chunkZMax);
+                    scaleZoneDeployment(currentReplicas + 1);
                     sendResizeCommand(nodeFD, midX);
                 }
             }
-            
-            
-        private:
-            void spawnNewNode(int32_t midX, int32_t xMax, int32_t yMin, int32_t yMax, int32_t zMin, int32_t zMax)
-            {
-                std::string cmd = "docker run "
-                "-e CHUNK_X_MIN=" + std::to_string(midX) + " "
-                "-e CHUNK_X_MAX=" + std::to_string(xMax) + " "
-                "-e CHUNK_Y_MIN=" + std::to_string(yMin) + " "
-                "-e CHUNK_Y_MAX=" + std::to_string(yMax) + " "
-                "-e CHUNK_Z_MIN=" + std::to_string(zMin) + " "
-                "-e CHUNK_Z_MAX=" + std::to_string(zMax) + " "
-                "-d dgs_zone_node";
 
-                std::cout << "[Orchestrator] Lanzando nuevo contenedor ZoneNode..." << std::endl;
-                system(cmd.c_str());
+        private:
+            int currentReplicas;
+
+            static std::string readFile(const std::string& path)
+            {
+                std::ifstream f(path);
+                return std::string(std::istreambuf_iterator<char>(f),
+                                   std::istreambuf_iterator<char>());
+            }
+
+            void scaleZoneDeployment(int replicas)
+            {
+                const std::string tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+                const std::string caPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+                const std::string ns        = "dgs";
+                const std::string deploy    = "zone-node";
+
+                std::string token = readFile(tokenPath);
+                if (token.empty()) { std::cerr << "[Orchestrator] No token de ServiceAccount" << std::endl; return; }
+
+                httplib::SSLClient k8s("kubernetes.default.svc", 443);
+                k8s.set_ca_cert_path(caPath.c_str());
+                k8s.set_default_headers({{"Authorization", "Bearer " + token}});
+
+                std::string path = "/apis/apps/v1/namespaces/" + ns + "/deployments/" + deploy + "/scale";
+                std::string body = R"({"spec":{"replicas":)" + std::to_string(replicas) + "}}";
+
+                auto res = k8s.Patch(path, body, "application/strategic-merge-patch+json");
+
+                if (res && res->status == 200)
+                {
+                    currentReplicas = replicas;
+                    std::cout << "[Orchestrator] ZoneNode escalado a " << replicas << " replicas" << std::endl;
+                }
+                else
+                    std::cerr << "[Orchestrator] Error al escalar: " << (res ? res->status : -1) << std::endl;
             }
 
             void sendResizeCommand(int fd, int32_t newChunkMax)

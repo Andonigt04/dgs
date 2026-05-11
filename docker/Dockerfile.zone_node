@@ -1,0 +1,23 @@
+FROM dgs-base AS builder
+
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --target zone_node -j$(nproc)
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    libssl3 libsasl2-2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/build/zone_node /usr/local/bin/zone_node
+
+ENV HEAD_SERVER_HOST=head-server
+ENV HEAD_SERVER_PORT=42424
+ENV CHUNK_X_MIN=0
+ENV CHUNK_X_MAX=100
+ENV CHUNK_Y_MIN=0
+ENV CHUNK_Y_MAX=100
+ENV CHUNK_Z_MIN=0
+ENV CHUNK_Z_MAX=100
+
+CMD ["zone_node"]

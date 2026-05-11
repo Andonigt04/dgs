@@ -8,8 +8,15 @@
 
 int main()
 {
+    const char* apiHost  = std::getenv("API_HOST")         ? std::getenv("API_HOST")         : "api";
+    int         apiPort  = std::atoi(std::getenv("API_PORT") ? std::getenv("API_PORT") : "8080");
+    const char* headHost = std::getenv("HEAD_SERVER_HOST")  ? std::getenv("HEAD_SERVER_HOST") : "head-server";
+    int         headPort = std::atoi(std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424");
+
     // 1. Login via API HTTP
-    httplib::Client api("http://127.0.0.1:8080");
+    std::string scheme  = std::getenv("HTTPS_ENABLE") ? "https://" : "http://";
+    std::string apiAddr = scheme + apiHost + ":" + std::to_string(apiPort);
+    httplib::Client api(apiAddr);
 
     std::string body = R"({"username":"player1","password":"secret"})";
     auto res = api.Post("/login", body, "application/json");
@@ -24,7 +31,7 @@ int main()
 
     // 2. Preguntar al HeadServer qué ZoneNode corresponde a la posición inicial
     DGS::TCPSocket headSocket;
-    if (!headSocket.connect("127.0.0.1", 42424))
+    if (!headSocket.connect(headHost, headPort))
     {
         std::cerr << "[Client] Error conectando HeadServer" << std::endl;
         return 1;

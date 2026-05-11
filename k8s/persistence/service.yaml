@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: persistence
+  namespace: dgs
+spec:
+  selector:
+    app: persistence
+  ports:
+    - port: 42429
+      targetPort: 42429

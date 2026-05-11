@@ -1,3 +1,3 @@
-Logger conectado al HeadServer para eventos reales
-Client node
 Kubernetes
+IPv6 implementation
+.....

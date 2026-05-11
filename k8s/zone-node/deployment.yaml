@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zone-node
+  namespace: dgs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zone-node
+  template:
+    metadata:
+      labels:
+        app: zone-node
+    spec:
+      containers:
+        - name: zone-node
+          image: dgs-zone-node:latest
+          imagePullPolicy: Never
+          env:
+            - name: HEAD_SERVER_HOST
+              value: "head-server"
+            - name: HEAD_SERVER_PORT
+              value: "42424"
+            - name: CHUNK_X_MIN
+              value: "0"
+            - name: CHUNK_X_MAX
+              value: "100"
+            - name: CHUNK_Y_MIN
+              value: "0"
+            - name: CHUNK_Y_MAX
+              value: "100"
+            - name: CHUNK_Z_MIN
+              value: "0"
+            - name: CHUNK_Z_MAX
+              value: "100"
+          ports:
+            - containerPort: 42420
+              protocol: UDP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"

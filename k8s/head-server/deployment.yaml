@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: head-server
+  namespace: dgs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: head-server
+  template:
+    metadata:
+      labels:
+        app: head-server
+    spec:
+      serviceAccountName: head-server-sa
+      containers:
+        - name: head-server
+          image: dgs-head-server:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 42424
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
