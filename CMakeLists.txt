@@ -5,13 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(FetchContent)
-FetchContent_Declare(
-    httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG        v0.18.5
-)
-FetchContent_MakeAvailable(httplib)
+find_package(OpenSSL REQUIRED)
+add_library(httplib INTERFACE)
+target_include_directories(httplib INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_definitions(httplib INTERFACE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(httplib INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+add_library(httplib::httplib ALIAS httplib)
 
 include_directories(.)
 
@@ -41,3 +40,9 @@ target_link_libraries(persistance_node
 add_executable(ping_pong_test tests/ping_pong.cpp ${COMMON_SRCS})
 add_executable(thread_pool_test tests/thread_pool_test.cpp ${COMMON_SRCS})
 add_executable(logger_test tests/logger_test.cpp ${COMMON_SRCS})
+
+find_package(SFML 2.5 COMPONENTS graphics window system)
+if(SFML_FOUND)
+    add_executable(visual_client_test tests/visual_client_test.cpp ${COMMON_SRCS})
+    target_link_libraries(visual_client_test sfml-graphics sfml-window sfml-system)
+endif()

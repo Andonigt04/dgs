@@ -84,7 +84,6 @@ namespace DGS
                     int32_t midLow  =  (m.node.chunkXMin + m.node.chunkXMax)      / 2;
                     int32_t midHigh = ((m.node.chunkXMin + m.node.chunkXMax) + 1) / 2;
 
-                    spawnNewNode(midHigh, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax, m.node.chunkZMin, m.node.chunkZMax);
                     scaleZoneDeployment(currentReplicas + 1);
                     sendResizeCommand(nodeFD, midLow);
                 }

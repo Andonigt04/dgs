@@ -1,5 +1,6 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+
 #include <SFML/Graphics.hpp>
 #include <iostream>
 

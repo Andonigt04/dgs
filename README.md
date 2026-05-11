@@ -80,10 +80,12 @@ dgs/
 │   ├── anticheat/
 │   ├── persistence/
 │   └── deploy.sh
-└── tests/
-    ├── ping_pong.cpp
-    ├── thread_pool_test.cpp
-    └── logger_test.cpp
+├── tests/
+│   ├── ping_pong.cpp
+│   ├── thread_pool_test.cpp
+│   └── logger_test.cpp
+└── third_party/
+
 ```
 
 ---

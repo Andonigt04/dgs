@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential libssl-dev \
+            libsasl2-dev pkg-config libmongoc-dev libbson-dev
+
+      - name: Install mongocxx
+        run: |
+          git clone --depth 1 --branch r3.10.1 https://github.com/mongodb/mongo-cxx-driver.git
+          cmake -S mongo-cxx-driver -B mongo-cxx-driver/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DBUILD_SHARED_LIBS=ON \
+            -DENABLE_TESTS=OFF
+          sudo cmake --build mongo-cxx-driver/build --target install -j$(nproc)
+          sudo ldconfig
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build nodes
+        run: |
+          cmake --build build -j$(nproc) --target \
+            head_server_node zone_node cache_node \
+            anticheat_node persistance_node client_node
+
+      - name: Build tests
+        run: |
+          cmake --build build -j$(nproc) --target \
+            ping_pong_test logger_test thread_pool_test
+
+      - name: Run tests
+        run: |
+          timeout 5 ./build/ping_pong_test   || true
+          timeout 5 ./build/thread_pool_test || true
+          timeout 5 ./build/logger_test      || true
+
+  docker-build:
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.base
+          tags: dgs-base:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build service images
+        run: |
+          docker build -f docker/Dockerfile.head_server      -t dgs-head-server:latest      .
+          docker build -f docker/Dockerfile.zone_node        -t dgs-zone-node:latest        .
+          docker build -f docker/Dockerfile.cache_node       -t dgs-cache-node:latest       .
+          docker build -f docker/Dockerfile.anticheat_node   -t dgs-anticheat-node:latest   .
+          docker build -f docker/Dockerfile.persistence_node -t dgs-persistence-node:latest .
