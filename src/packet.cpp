@@ -78,6 +78,7 @@ namespace DGS
         data.chunkSizeX = read<float>();
         data.chunkSizeY = read<float>();
         data.chunkSizeZ = read<float>();
+
         return data;
     }
 
@@ -115,6 +116,7 @@ namespace DGS
     void Packet::pack(const ZoneQuery& data)
     {
         clear();
+
         write<PacketType>(PKT_ZONE_QUERY);
         write<uint32_t>(data.uuid);
         write<int32_t>(data.chunkX);
@@ -130,6 +132,7 @@ namespace DGS
         data.chunkX = read<int32_t>();
         data.chunkY = read<int32_t>();
         data.chunkZ = read<int32_t>();
+
         return data;
     }
 
@@ -148,6 +151,28 @@ namespace DGS
         std::string addr = readString();
         std::strncpy(data.addr, addr.c_str(), sizeof(data.addr) - 1);
         data.port = read<int>();
+
+        return data;
+    }
+
+    void Packet::pack(const ZoneListResponse& data)
+    {
+        clear();
+
+        write<PacketType>(PKT_ZONE_LIST);
+        write(data.count);
+        for (int i = 0; i < data.count; i++)
+            write(data.zones[i]);
+    } 
+
+    ZoneListResponse Packet::unpackZoneListResponse()
+    {
+        readPos = 1;
+        ZoneListResponse data{};
+        data.count = read<uint8_t>();
+        for (int i = 0; i < data.count; i++)
+            data.zones[i] = read<ZoneInfoPublic>();
+        
         return data;
     }
 };

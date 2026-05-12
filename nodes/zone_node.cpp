@@ -5,6 +5,7 @@
 #include <fstream>
 #include <unistd.h>
 #include <chrono>
+#include <sys/socket.h>
 
 float getRAM()
 {
@@ -51,7 +52,15 @@ int main()
     const char* headHost = std::getenv("HEAD_SERVER_HOST") ? std::getenv("HEAD_SERVER_HOST") : "head-server";
     int         headPort = std::atoi(std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424");
 
-    int fd = tcp_zone_node.connect(headHost, headPort);
+    if (!tcp_zone_node.connect(headHost, headPort))
+    {
+        std::cerr << "[ZoneNode] Error conectando HeadServer" << std::endl;
+        return 1;
+    }
+    std::cout << "[ZoneNode] Conectado a HeadServer" << std::endl;
+
+    struct timeval tv { 0, 100000 };
+    setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     while (true)
     {

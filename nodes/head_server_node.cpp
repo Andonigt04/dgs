@@ -16,6 +16,28 @@ int main()
     DGS::Logger logger("headserver_log.csv");
     std::vector<int> nodeClients;
 
+    dispatcher.registerHandler(DGS::PKT_ZONE_LIST, [&](int fd, DGS::Packet& p)
+    {
+        auto l = p.unpackZoneListResponse();
+        DGS::ZoneListResponse r;
+        for (int i = 0; i < orchestrator.activeZones.size(); i++)
+        {
+            r.zones[i].chunkXMin = orchestrator.activeZones[i].chunkXMin;
+            r.zones[i].chunkXMax = orchestrator.activeZones[i].chunkXMax;
+            r.zones[i].chunkYMin = orchestrator.activeZones[i].chunkYMin;
+            r.zones[i].chunkYMax = orchestrator.activeZones[i].chunkYMax;
+            r.zones[i].chunkZMin = orchestrator.activeZones[i].chunkZMin;
+            r.zones[i].chunkZMax = orchestrator.activeZones[i].chunkZMax;
+            
+            std::strncpy(r.zones[i].addr, orchestrator.activeZones[i].addr, sizeof(r.zones[i].addr));
+            r.zones[i].port = orchestrator.activeZones[i].port;
+
+        }
+        r.count = orchestrator.activeZones.size();
+        DGS::Packet resp;
+        resp.pack(r);
+        serverSocket.send(fd, resp.getRawData(), resp.getSize());
+    });
     
     dispatcher.registerHandler(DGS::PKT_ZONE_QUERY, [&](int fd, DGS::Packet& p) {
         auto q = p.unpackZoneQuery();

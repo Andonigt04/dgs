@@ -15,7 +15,8 @@ int main() {
 
     // 1. Conexión inicial al HeadServer
     DGS::TCPSocket head;
-    if(!head.connect("127.0.0.1", 42424)) return -1;
+    bool connected = head.connect("127.0.0.1", 42424);
+    if (!connected) std::cerr << "[VisualTest] Sin conexion a HeadServer, modo offline" << std::endl;
 
     // 2. Simulación de bucle
     sf::Clock deltaClock;
@@ -55,8 +56,8 @@ int main() {
         DGS::Packet pkg;
         pkg.pack(entity);
         
-        // Enviamos al AntiCheat (asumiendo que tienes el port-forward)
-        // head.send(head.getSocketFD(), pkg.getRawData(), pkg.getSize());
+        if (connected)
+            head.send(head.getSocketFD(), pkg.getRawData(), pkg.getSize());
 
         window.clear();
         window.draw(visualPlayer);

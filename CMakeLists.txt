@@ -36,6 +36,12 @@ target_link_libraries(persistance_node
     mongo::bsoncxx_shared
 )
 
+find_package(raylib)
+if(RAYLIB_FOUND)
+    add_executable(dgs_viewer views/dgs_viewer.cpp ${COMMON_SRCS})
+    target_link_libraries(dgs_viewer raylib)
+endif()
+
 # TESTS
 add_executable(ping_pong_test tests/ping_pong.cpp ${COMMON_SRCS})
 add_executable(thread_pool_test tests/thread_pool_test.cpp ${COMMON_SRCS})

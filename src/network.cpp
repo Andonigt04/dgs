@@ -2,6 +2,7 @@
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <iostream>
 
@@ -113,12 +114,20 @@ namespace DGS
 
     bool TCPSocket::connect(const std::string& address, int port)
     {
-        sockaddr_in servAddr;
-        servAddr.sin_family = AF_INET;
-        servAddr.sin_port = htons(port);
-        inet_pton(AF_INET, address.c_str(), &servAddr.sin_addr);
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
 
-        return ::connect(socketFD, (struct sockaddr*)&servAddr, sizeof(servAddr)) == 0;
+        if (getaddrinfo(address.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)
+        {
+            std::cerr << "[TCPSocket] No se pudo resolver: " << address << std::endl;
+            return false;
+        }
+
+        bool ok = ::connect(socketFD, res->ai_addr, res->ai_addrlen) == 0;
+        if (!ok) perror("[TCPSocket] connect");
+        freeaddrinfo(res);
+        return ok;
     }
 
     bool TCPSocket::send(int fd, const uint8_t* data, size_t size)

@@ -5,6 +5,8 @@
 
 namespace DGS
 {
+    static constexpr uint8_t MAX_ZONES = 16;
+
     enum PacketType : uint8_t
     {
         PKT_NONE            = 0,
@@ -14,6 +16,7 @@ namespace DGS
         PKT_CHAT            = 4,
         PKT_ZONE_QUERY      = 5,
         PKT_ZONE_RESPONSE   = 6,
+        PKT_ZONE_LIST       = 7,
         PKT_DISCONNECT      = 255
     };
     
@@ -89,6 +92,14 @@ namespace DGS
         int     port;
     };
 
+    struct ZoneInfoPublic {
+        int32_t chunkXMin, chunkXMax;
+        int32_t chunkYMin, chunkYMax;
+        int32_t chunkZMin, chunkZMax;
+        char    addr[16];
+        int     port;
+    };
+
     struct ServerMetrics
     {
         ZoneInfo node;
@@ -100,6 +111,12 @@ namespace DGS
     {
         uint32_t uuid;
         int32_t  chunkX, chunkY, chunkZ;
+    };
+
+
+    struct ZoneListResponse {
+        uint8_t        count;
+        ZoneInfoPublic zones[MAX_ZONES];
     };
 
     struct ZoneResponse
