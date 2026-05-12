@@ -13,6 +13,10 @@ spec:
       labels:
         app: anticheat
     spec:
+      initContainers:
+        - name: wait-head-server
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z head-server 42424; do echo waiting for head-server; sleep 2; done']
       containers:
         - name: anticheat
           image: dgs-anticheat-node:latest
