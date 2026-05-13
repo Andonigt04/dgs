@@ -34,8 +34,14 @@ spec:
               value: "0"
             - name: CHUNK_Z_MAX
               value: "100"
+            - name: ZONE_UDP_PORT
+              value: "42425"
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
-            - containerPort: 42420
+            - containerPort: 42425
               protocol: UDP
           resources:
             requests:

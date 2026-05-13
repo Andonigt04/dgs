@@ -9,7 +9,7 @@ spec:
     app: zone-node
   ports:
     - name: udp
-      port: 42420
-      targetPort: 42420
+      port: 42425
+      targetPort: 42425
       protocol: UDP
-      nodePort: 30420
+      nodePort: 30425

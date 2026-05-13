@@ -95,6 +95,8 @@ namespace DGS
         write<int32_t>(data.node.chunkYMax);
         write<int32_t>(data.node.chunkZMin);
         write<int32_t>(data.node.chunkZMax);
+        writeString(std::string(data.node.addr));
+        write<int>(data.node.port);
     }
 
     ServerMetrics Packet::unpackServerMetrics()
@@ -109,7 +111,10 @@ namespace DGS
         data.node.chunkYMax = read<int32_t>();
         data.node.chunkZMin = read<int32_t>();
         data.node.chunkZMax = read<int32_t>();
-        
+        std::string addr = readString();
+        std::strncpy(data.node.addr, addr.c_str(), sizeof(data.node.addr) - 1);
+        data.node.port = read<int>();
+
         return data;
     }
 

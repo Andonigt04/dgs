@@ -32,7 +32,6 @@ bool isNearBorder(const DGS::EntityTransfer& e,
            e.chunkZ <= zMin + threshold || e.chunkZ >= zMax - threshold;
 }
 
-// Convierte ángulo uint16 (0-65535 = 0-360°) a quaternion yaw
 static void angleToQuat(uint16_t angle, float rot[4])
 {
     float yaw     = angle * (3.14159265f / 32767.5f);
@@ -87,7 +86,6 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
         auto it = lastSnapshot.find(e.uuid);
         bool isNew = it == lastSnapshot.end();
 
-        // DIRTY_TRANSFORM: posición o ángulo cambiaron más del umbral
         if (isNew ||
             std::fabsf(e.pos[0] - it->second.pos[0]) > 0.1f ||
             std::fabsf(e.pos[1] - it->second.pos[1]) > 0.1f ||
@@ -101,7 +99,6 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
             angleToQuat(e.angle, delta.rot);
         }
 
-        // DIRTY_STATS: algún campo de Stats cambió
         if (isNew || std::memcmp(&e.stats, &it->second.stats, sizeof(DGS::Stats)) != 0)
         {
             delta.dirtyMask |= DGS::DIRTY_STATS;
@@ -113,11 +110,9 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
         DGS::Packet p;
         p.pack(delta);
         tcp.send(tcp.getSocketFD(), p.getRawData(), p.getSize());
-
         lastSnapshot[e.uuid] = e;
     }
 
-    // Limpiar snapshots de entidades que ya no existen
     for (auto it = lastSnapshot.begin(); it != lastSnapshot.end();)
     {
         bool exists = false;
@@ -127,18 +122,52 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
     }
 }
 
+// Envía todas las entidades y ghosts a un cliente
+void broadcastToClient(DGS::UDPSocket& udp,
+                       const std::string& addr, int port,
+                       const std::vector<DGS::EntityTransfer>& entities,
+                       const std::map<uint32_t, DGS::GhostDelta>& ghosts)
+{
+    for (const auto& e : entities)
+    {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&e);
+        udp.send(addr, port, raw, sizeof(DGS::EntityTransfer));
+    }
+
+    for (const auto& [uuid, ghost] : ghosts)
+    {
+        DGS::Packet p;
+        p.pack(ghost);
+        udp.send(addr, port, p.getRawData(), p.getSize());
+    }
+}
+
 int main()
 {
     DGS::UDPSocket udp_zone_node;
     DGS::TCPSocket tcp_zone_node;
 
     std::vector<DGS::EntityTransfer>          entities;
-    std::map<uint32_t, DGS::EntityTransfer>   lastSnapshot;   // para dirty flags
-    std::map<uint32_t, DGS::GhostDelta>       ghostEntities;  // recibidas de vecinos
+    std::map<uint32_t, DGS::EntityTransfer>   lastSnapshot;
+    std::map<uint32_t, DGS::GhostDelta>       ghostEntities;
+    std::map<uint32_t, std::pair<std::string, int>> clientMap; // uuid → {addr, port}
 
-    const char* headHost  = std::getenv("HEAD_SERVER_HOST")  ? std::getenv("HEAD_SERVER_HOST")  : "head-server";
+    const char* headHost  = std::getenv("HEAD_SERVER_HOST") ? std::getenv("HEAD_SERVER_HOST") : "head-server";
     int         headPort  = std::atoi(std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424");
+    const char* zoneAddr  = std::getenv("MY_POD_IP")        ? std::getenv("MY_POD_IP")        : "127.0.0.1";
+    int         udpPort   = std::atoi(std::getenv("ZONE_UDP_PORT")    ? std::getenv("ZONE_UDP_PORT")    : "42425");
     int32_t     threshold = std::atoi(std::getenv("GHOST_THRESHOLD")  ? std::getenv("GHOST_THRESHOLD")  : "1");
+
+    if (!udp_zone_node.bind(udpPort))
+    {
+        std::cerr << "[ZoneNode] Error al hacer bind UDP en puerto " << udpPort << std::endl;
+        return 1;
+    }
+    std::cout << "[ZoneNode] UDP escuchando en :" << udpPort << std::endl;
+
+    // SO_RCVTIMEO en UDP para no bloquear el tick
+    struct timeval tvUDP { 0, 10000 }; // 10ms
+    setsockopt(udp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvUDP, sizeof(tvUDP));
 
     if (!tcp_zone_node.connect(headHost, headPort))
     {
@@ -147,34 +176,60 @@ int main()
     }
     std::cout << "[ZoneNode] Conectado a HeadServer" << std::endl;
 
-    struct timeval tv { 0, 100000 };
-    setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timeval tvTCP { 0, 100000 }; // 100ms
+    setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvTCP, sizeof(tvTCP));
 
     while (true)
     {
-        uint8_t recvBuffer[8192];
-        int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), recvBuffer, sizeof(recvBuffer));
-        if (bytes > 0)
+        // Recibir UDP de clientes
         {
-            DGS::Packet pRecv;
-            pRecv.setBuffer(recvBuffer, bytes);
+            uint8_t udpBuf[sizeof(DGS::EntityTransfer)];
+            std::string clientAddr;
+            int clientPort = 0;
+            int udpBytes = udp_zone_node.receive(udpBuf, sizeof(udpBuf), clientAddr, clientPort);
 
-            switch (pRecv.getType())
+            if (udpBytes == sizeof(DGS::EntityTransfer))
             {
-                case DGS::PKT_ENTITY_TRANSFER:
+                DGS::EntityTransfer e;
+                std::memcpy(&e, udpBuf, sizeof(e));
+                clientMap[e.uuid] = { clientAddr, clientPort };
+
+                // Actualizar o añadir entidad
+                bool found = false;
+                for (auto& existing : entities)
                 {
-                    auto e = pRecv.unpackEntityTransfer();
-                    entities.push_back(e);
-                    std::cout << "[ZoneNode] Nueva entidad recibida uuid=" << e.uuid << std::endl;
-                    break;
+                    if (existing.uuid == e.uuid) { existing = e; found = true; break; }
                 }
-                case DGS::PKT_GHOST_DELTA:
+                if (!found) entities.push_back(e);
+            }
+        }
+
+        // Recibir TCP del HeadServer
+        {
+            uint8_t tcpBuf[8192];
+            int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), tcpBuf, sizeof(tcpBuf));
+            if (bytes > 0)
+            {
+                DGS::Packet pRecv;
+                pRecv.setBuffer(tcpBuf, bytes);
+
+                switch (pRecv.getType())
                 {
-                    auto ghost = pRecv.unpackGhostDelta();
-                    ghostEntities[ghost.uuid] = ghost;
-                    break;
+                    case DGS::PKT_ENTITY_TRANSFER:
+                    {
+                        auto e = pRecv.unpackEntityTransfer();
+                        entities.push_back(e);
+                        std::cout << "[ZoneNode] Nueva entidad recibida uuid=" << e.uuid << std::endl;
+                        break;
+                    }
+                    case DGS::PKT_GHOST_DELTA:
+                    {
+                        auto ghost = pRecv.unpackGhostDelta();
+                        ghostEntities[ghost.uuid] = ghost;
+                        break;
+                    }
+                    default: break;
                 }
-                default: break;
             }
         }
 
@@ -190,11 +245,17 @@ int main()
         checkAndTransfer(tcp_zone_node, entities, xMin, xMax, yMin, yMax, zMin, zMax);
         emitGhostDeltas(tcp_zone_node, entities, lastSnapshot, xMin, xMax, yMin, yMax, zMin, zMax, threshold);
 
+        // Broadcast a todos los clientes conectados
+        for (const auto& [uuid, endpoint] : clientMap)
+            broadcastToClient(udp_zone_node, endpoint.first, endpoint.second, entities, ghostEntities);
+
         DGS::ServerMetrics metrics;
         metrics.ramUsage       = getRAM();
         metrics.node.chunkXMin = xMin; metrics.node.chunkXMax = xMax;
         metrics.node.chunkYMin = yMin; metrics.node.chunkYMax = yMax;
         metrics.node.chunkZMin = zMin; metrics.node.chunkZMax = zMax;
+        std::strncpy(metrics.node.addr, zoneAddr, sizeof(metrics.node.addr) - 1);
+        metrics.node.port = udpPort;
 
         auto end = std::chrono::high_resolution_clock::now();
         metrics.performance = std::chrono::duration<float, std::milli>(end - start).count();
