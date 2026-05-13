@@ -37,9 +37,9 @@ static void angleToQuat(uint16_t angle, float rot[4])
     float yaw     = angle * (3.14159265f / 32767.5f);
     float halfYaw = yaw * 0.5f;
     rot[0] = 0.0f;
-    rot[1] = std::sinf(halfYaw);
+    rot[1] = sinf(halfYaw);
     rot[2] = 0.0f;
-    rot[3] = std::cosf(halfYaw);
+    rot[3] = cosf(halfYaw);
 }
 
 void checkAndTransfer(DGS::TCPSocket& tcp, std::vector<DGS::EntityTransfer>& entities,
@@ -87,9 +87,9 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
         bool isNew = it == lastSnapshot.end();
 
         if (isNew ||
-            std::fabsf(e.pos[0] - it->second.pos[0]) > 0.1f ||
-            std::fabsf(e.pos[1] - it->second.pos[1]) > 0.1f ||
-            std::fabsf(e.pos[2] - it->second.pos[2]) > 0.1f ||
+            fabsf(e.pos[0] - it->second.pos[0]) > 0.1f ||
+            fabsf(e.pos[1] - it->second.pos[1]) > 0.1f ||
+            fabsf(e.pos[2] - it->second.pos[2]) > 0.1f ||
             e.angle != it->second.angle)
         {
             delta.dirtyMask |= DGS::DIRTY_TRANSFORM;
