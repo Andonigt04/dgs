@@ -18,8 +18,8 @@ int main()
 
     dispatcher.registerHandler(DGS::PKT_ZONE_LIST, [&](int fd, DGS::Packet& p)
     {
-        auto l = p.unpackZoneListResponse();
         DGS::ZoneListResponse r;
+
         for (int i = 0; i < orchestrator.activeZones.size(); i++)
         {
             r.zones[i].chunkXMin = orchestrator.activeZones[i].chunkXMin;
@@ -33,13 +33,17 @@ int main()
             r.zones[i].port = orchestrator.activeZones[i].port;
 
         }
+
         r.count = orchestrator.activeZones.size();
         DGS::Packet resp;
         resp.pack(r);
+
+        std::cout << resp.getRawData() << ":" << resp.getSize() << std::endl;
         serverSocket.send(fd, resp.getRawData(), resp.getSize());
     });
     
-    dispatcher.registerHandler(DGS::PKT_ZONE_QUERY, [&](int fd, DGS::Packet& p) {
+    dispatcher.registerHandler(DGS::PKT_ZONE_QUERY, [&](int fd, DGS::Packet& p)
+    {
         auto q = p.unpackZoneQuery();
         DGS::ZoneResponse r = orchestrator.findZoneResponse(q.chunkX, q.chunkY, q.chunkZ);
         DGS::Packet resp;
@@ -47,7 +51,8 @@ int main()
         serverSocket.send(fd, resp.getRawData(), resp.getSize());
     });
 
-    dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p) {
+    dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p)
+    {
         auto m = p.unpackServerMetrics();
         std::cout << "[HeadServer] PKT_METRICS fd=" << fd << " zonas=" << orchestrator.activeZones.size() << std::endl;
         orchestrator.updateNodeTopology(fd, m);
@@ -59,10 +64,12 @@ int main()
         entry.fd          = fd;
         entry.ramUsage    = m.ramUsage;
         entry.performance = m.performance;
+
         logger.log(entry);
     });
 
-    dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p) {
+    dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p)
+    {
         auto e = p.unpackEntityTransfer();
         std::cout << "[HeadServer] Entidad recibida uuid=" << e.uuid
                   << " chunk=(" << e.chunkX << "," << e.chunkY << ") desde fd=" << fd << std::endl;
