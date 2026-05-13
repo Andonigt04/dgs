@@ -4,6 +4,7 @@
 
 #include <raylib.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -97,6 +98,9 @@ int main(int argc, char* argv[])
     int         headPort = argc > 2 ? std::atoi(argv[2]) : 42424;
 
     if (!tcpSocket.connect(headHost, headPort)) { std::perror("CAN NOT CONNECT TO HEAD"); return 1; }
+
+    struct timeval tv { 3, 0 };
+    setsockopt(tcpSocket.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
     std::thread netThread([&]()
     {
@@ -105,21 +109,31 @@ int main(int argc, char* argv[])
 
         while (true)
         {
-            tcpSocket.send(tcpSocket.getSocketFD(), req.getRawData(), req.getSize());
-            
-            uint8_t buf[4096];
-            int bytes = tcpSocket.receive(tcpSocket.getSocketFD(), buf, sizeof(buf));
-            DGS::Packet resp;
-            resp.setBuffer(buf, bytes);
-            auto r = resp.unpackZoneListResponse();
+            try
+            {
+                tcpSocket.send(tcpSocket.getSocketFD(), req.getRawData(), req.getSize());
 
-            std::lock_guard<std::mutex> lock(mtx);
-            zones.assign(r.zones, r.zones + r.count);
+                uint8_t buf[4096];
+                int bytes = tcpSocket.receive(tcpSocket.getSocketFD(), buf, sizeof(buf));
+                if (bytes <= 0) { std::cerr << "[Viewer] receive timeout/error bytes=" << bytes << " errno=" << errno << std::endl; std::this_thread::sleep_for(std::chrono::seconds(1)); continue; }
+
+                DGS::Packet resp;
+                resp.setBuffer(buf, bytes);
+                auto r = resp.unpackZoneListResponse();
+                std::cout << "[Viewer] Zonas recibidas: " << (int)r.count << std::endl;
+
+                std::lock_guard<std::mutex> lock(mtx);
+                zones.assign(r.zones, r.zones + r.count);
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "[Viewer] Error en netThread: " << e.what() << std::endl;
+            }
 
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     });
-
+    netThread.detach();
 
     InitWindow(1280, 720, "DGS Viewer");
 
@@ -129,23 +143,23 @@ int main(int argc, char* argv[])
         { std::lock_guard<std::mutex> lock(mtx); snap = zones;}
 
         float dist = snap.empty() ? 100.0f : worldSize(snap);
-
+        
         views[0] = { setupCamera({0, dist, 0},  {0,0,0}, {0,0,-1}, 45), getViewport(0,0,3,2), "Top"    };
         views[1] = { setupCamera({0,-dist, 0},  {0,0,0}, {0,0, 1}, 45), getViewport(1,0,3,2), "Bottom" };
         views[2] = { setupCamera({0,0, dist},   {0,0,0}, {0,1, 0}, 45), getViewport(2,0,3,2), "Front"  };
         views[3] = { setupCamera({0,0,-dist},   {0,0,0}, {0,1, 0}, 45), getViewport(0,1,3,2), "Back"   };
         views[4] = { setupCamera({dist,0, 0},   {0,0,0}, {0,1, 0}, 45), getViewport(1,1,3,2), "Right"  };
         views[5] = { setupCamera({-dist,0, 0},  {0,0,0}, {0,1, 0}, 45), getViewport(2,1,3,2), "Left"   };
-
+        
         BeginDrawing();
         ClearBackground(BLACK);
-
+        
         for (auto& v : views)
         {
             BeginScissorMode(v.viewport.x, v.viewport.y, v.viewport.width, v.viewport.height);
             BeginMode3D(v.cam);
-                for (int i = 0; i < (int)snap.size(); i++)
-                    drawZoneCube(snap[i], i, snap.size());
+            for (int i = 0; i < (int)snap.size(); i++)
+                drawZoneCube(snap[i], i, snap.size());
             EndMode3D();
 
             for (auto& z : snap)

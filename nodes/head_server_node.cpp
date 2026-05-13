@@ -49,6 +49,7 @@ int main()
 
     dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p) {
         auto m = p.unpackServerMetrics();
+        std::cout << "[HeadServer] PKT_METRICS fd=" << fd << " zonas=" << orchestrator.activeZones.size() << std::endl;
         orchestrator.updateNodeTopology(fd, m);
         orchestrator.evaluateServer(m, fd);
 
