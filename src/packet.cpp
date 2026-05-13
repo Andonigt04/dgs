@@ -172,7 +172,71 @@ namespace DGS
         data.count = read<uint8_t>();
         for (int i = 0; i < data.count; i++)
             data.zones[i] = read<ZoneInfoPublic>();
-        
+
+        return data;
+    }
+
+    void Packet::pack(const GhostDelta& data)
+    {
+        clear();
+        write<PacketType>(PKT_GHOST_DELTA);
+        write<uint64_t>(data.uuid);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
+        write<uint32_t>(data.dirtyMask);
+
+        if (data.dirtyMask & DIRTY_TRANSFORM)
+        {
+            write<float>(data.pos[0]);
+            write<float>(data.pos[1]);
+            write<float>(data.pos[2]);
+            write<float>(data.rot[0]);
+            write<float>(data.rot[1]);
+            write<float>(data.rot[2]);
+            write<float>(data.rot[3]);
+        }
+
+        if (data.dirtyMask & DIRTY_STATS)
+            write<Stats>(data.stats);
+
+        if (data.dirtyMask & DIRTY_INVENTORY)
+        {
+            write<uint16_t>(data.dataSize);
+            writeRaw(data.data, data.dataSize);
+        }
+    }
+
+    GhostDelta Packet::unpackGhostDelta()
+    {
+        readPos = 1;
+        GhostDelta data{};
+        data.uuid      = read<uint64_t>();
+        data.chunkX    = read<int32_t>();
+        data.chunkY    = read<int32_t>();
+        data.chunkZ    = read<int32_t>();
+        data.dirtyMask = read<uint32_t>();
+
+        if (data.dirtyMask & DIRTY_TRANSFORM)
+        {
+            data.pos[0] = read<float>();
+            data.pos[1] = read<float>();
+            data.pos[2] = read<float>();
+            data.rot[0] = read<float>();
+            data.rot[1] = read<float>();
+            data.rot[2] = read<float>();
+            data.rot[3] = read<float>();
+        }
+
+        if (data.dirtyMask & DIRTY_STATS)
+            data.stats = read<Stats>();
+
+        if (data.dirtyMask & DIRTY_INVENTORY)
+        {
+            data.dataSize = read<uint16_t>();
+            readRaw(data.data, data.dataSize);
+        }
+
         return data;
     }
 };

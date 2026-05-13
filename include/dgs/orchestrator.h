@@ -31,10 +31,8 @@ namespace DGS
                         return;
                     }
                 }
-                activeZones.push_back({fd,
-                    m.node.chunkXMin, m.node.chunkXMax,
-                    m.node.chunkYMin, m.node.chunkYMax,
-                    m.node.chunkZMin, m.node.chunkZMax});
+
+                activeZones.push_back({fd, m.node.chunkXMin, m.node.chunkXMax, m.node.chunkYMin, m.node.chunkYMax, m.node.chunkZMin, m.node.chunkZMax});
             }
 
             int findTargetNode(int32_t chunkX, int32_t chunkY, int32_t chunkZ)
@@ -43,11 +41,9 @@ namespace DGS
                 {
                     if (chunkX >= zone.chunkXMin && chunkX <= zone.chunkXMax &&
                         chunkY >= zone.chunkYMin && chunkY <= zone.chunkYMax &&
-                        chunkZ >= zone.chunkZMin && chunkZ <= zone.chunkZMax)
-                    {
-                        return zone.fd;
-                    }
+                        chunkZ >= zone.chunkZMin && chunkZ <= zone.chunkZMax) return zone.fd;
                 }
+
                 return -1;
             }
 
@@ -66,6 +62,45 @@ namespace DGS
                     }
                 }
                 return ZoneResponse{};
+            }
+
+            
+
+            std::vector<int> findNeighbors(int fd, NeighborMode mode = NeighborMode::FACE)
+            {
+                const ZoneInfo* origin = nullptr;
+                for (const auto& z : activeZones)
+                    if (z.fd == fd) { origin = &z; break; }
+
+                std::vector<int> neighbors;
+                if (!origin) return neighbors;
+
+                for (const auto& z : activeZones)
+                {
+                    if (z.fd == fd) continue;
+
+                    bool adjX = origin->chunkXMin <= z.chunkXMax + 1 && z.chunkXMin <= origin->chunkXMax + 1;
+                    bool adjY = origin->chunkYMin <= z.chunkYMax + 1 && z.chunkYMin <= origin->chunkYMax + 1;
+                    bool adjZ = origin->chunkZMin <= z.chunkZMax + 1 && z.chunkZMin <= origin->chunkZMax + 1;
+
+                    if (!adjX || !adjY || !adjZ) continue;
+
+                    int touching = 0;
+                    if (origin->chunkXMax + 1 == z.chunkXMin || z.chunkXMax + 1 == origin->chunkXMin) touching++;
+                    if (origin->chunkYMax + 1 == z.chunkYMin || z.chunkYMax + 1 == origin->chunkYMin) touching++;
+                    if (origin->chunkZMax + 1 == z.chunkZMin || z.chunkZMax + 1 == origin->chunkZMin) touching++;
+
+                    bool include = false;
+                    switch (mode)
+                    {
+                        case NeighborMode::FACE:             include = touching == 1; break;
+                        case NeighborMode::FACE_EDGE:        include = touching <= 2; break;
+                        case NeighborMode::FACE_EDGE_CORNER: include = touching <= 3; break;
+                    }
+
+                    if (include) neighbors.push_back(z.fd);
+                }
+                return neighbors;
             }
 
             void evaluateServer(const ServerMetrics& m, int nodeFD)

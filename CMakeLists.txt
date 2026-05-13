@@ -25,16 +25,19 @@ target_link_libraries(head_server_node httplib::httplib)
 add_executable(zone_node nodes/zone_node.cpp ${COMMON_SRCS})
 
 add_executable(persistance_node nodes/persistance_node.cpp ${COMMON_SRCS})
-
-add_executable(cache_node nodes/cache_node.cpp ${COMMON_SRCS})
-add_executable(anticheat_node nodes/anticheat_node.cpp ${COMMON_SRCS})
-
-add_executable(client_node nodes/client_node.cpp ${COMMON_SRCS})
-target_link_libraries(client_node httplib::httplib)
 target_link_libraries(persistance_node
     mongo::mongocxx_shared
     mongo::bsoncxx_shared
 )
+
+add_executable(cache_node nodes/cache_node.cpp ${COMMON_SRCS})
+add_executable(anticheat_node nodes/anticheat_node.cpp ${COMMON_SRCS})
+
+add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
+target_link_libraries(dgs_client httplib::httplib)
+
+install(TARGETS dgs_client ARCHIVE DESTINATION external/dgs/sdk)
+install(DIRECTORY include/ DESTINATION external/dgs/include)
 
 find_package(raylib)
 if(RAYLIB_FOUND)

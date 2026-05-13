@@ -68,6 +68,13 @@ int main()
         logger.log(entry);
     });
 
+    dispatcher.registerHandler(DGS::PKT_GHOST_DELTA, [&](int fd, DGS::Packet& p)
+    {
+        auto neighbors = orchestrator.findNeighbors(fd);
+        for (int neighborFD : neighbors)
+            serverSocket.send(neighborFD, p.getRawData(), p.getSize());
+    });
+
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p)
     {
         auto e = p.unpackEntityTransfer();

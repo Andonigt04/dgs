@@ -17,6 +17,7 @@ namespace DGS
         PKT_ZONE_QUERY      = 5,
         PKT_ZONE_RESPONSE   = 6,
         PKT_ZONE_LIST       = 7,
+        PKT_GHOST_DELTA     = 8,
         PKT_DISCONNECT      = 255
     };
     
@@ -50,6 +51,13 @@ namespace DGS
         LOG_TRANSFER = 0,
         LOG_ERROR    = 1,
         LOG_METRICS  = 2
+    };
+
+    enum class NeighborMode
+    {
+        FACE,
+        FACE_EDGE,
+        FACE_EDGE_CORNER
     };
 
     struct Stats
@@ -123,6 +131,27 @@ namespace DGS
     {
         char addr[16];
         int  port;
+    };
+
+    enum DirtyFlag : uint32_t
+    {
+        DIRTY_TRANSFORM = 1 << 0,  // pos + rot
+        DIRTY_STATS     = 1 << 1,
+        DIRTY_INVENTORY = 1 << 2,
+    };
+
+    static constexpr uint16_t MAX_GHOST_DATA = 4096;
+
+    struct GhostDelta
+    {
+        uint64_t uuid;
+        int32_t  chunkX, chunkY, chunkZ;
+        uint32_t dirtyMask;
+        float    pos[3];              // local dentro del chunk, metros
+        float    rot[4];              // quaternion xyzw
+        Stats    stats;
+        uint16_t dataSize;            // bytes válidos en data[]
+        uint8_t  data[MAX_GHOST_DATA]; // payload opaco definido por el engine
     };
 
     struct LogEntry
