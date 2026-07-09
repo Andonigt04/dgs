@@ -35,7 +35,7 @@ static bool validate(const DGS::EntityTransfer& e, const LastKnown& last, float 
     float dz = (e.chunkZ * csZ + e.pos[2]) - last.gz;
     float distSq = dx*dx + dy*dy + dz*dz;
 
-    float maxDist = (last.maxSpeed * dt) + (SCALE / 1000.0f); 
+    float maxDist = (last.maxSpeed * dt) + (SCALE / 1000.0f);
     return distSq <= (maxDist * maxDist);
 }
 

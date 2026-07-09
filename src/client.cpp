@@ -10,8 +10,8 @@ namespace DGS
     bool Client::connect(const std::string& headHost, int headPort, const std::string& username, const std::string& password, const std::string& apiHost,  int apiPort)
     {
         httplib::Client api(apiHost + ":" + std::to_string(apiPort));
-        std::string body = R"({"username":")" + username + R"(","password":")" + password + R"("})";
-        auto res = api.Post("/login", body, "application/json");
+        std::string body = R"({"email":")" + username + R"(","password":")" + password + R"("})";
+        auto res = api.Post("/api/auth/login", body, "application/json");
 
         if (!res || res->status != 200)
         {
@@ -30,6 +30,11 @@ namespace DGS
         setsockopt(m_tcp.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         if (!queryZone(0, 0, 0, 0)) return false;
+
+        // Mark chunk (0,0,0) as known so sendTransform doesn't re-query immediately.
+        m_lastChunkX = 0;
+        m_lastChunkY = 0;
+        m_lastChunkZ = 0;
 
         m_running = true;
         m_recvThread = std::thread(&Client::recvLoop, this);
@@ -149,6 +154,24 @@ namespace DGS
         return std::move(m_incomingGhosts);
     }
 
+    std::vector<ChatMessage> Client::pollChats()
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return std::move(m_incomingChats);
+    }
+
+    void Client::sendChat(uint32_t uuid, const std::string& username, const std::string& text)
+    {
+        ChatMessage msg{};
+        msg.uuid = uuid;
+        std::strncpy(msg.username, username.c_str(), sizeof(msg.username) - 1);
+        std::strncpy(msg.text,     text.c_str(),     sizeof(msg.text)     - 1);
+
+        Packet p;
+        p.pack(msg);
+        m_tcp.send(m_tcp.getSocketFD(), p.getRawData(), p.getSize());
+    }
+
     void Client::recvLoop()
     {
         uint8_t buf[8192];
@@ -170,6 +193,9 @@ namespace DGS
                     break;
                 case PKT_GHOST_DELTA:
                     m_incomingGhosts.push_back(p.unpackGhostDelta());
+                    break;
+                case PKT_CHAT:
+                    m_incomingChats.push_back(p.unpackChatMessage());
                     break;
                 default: break;
             }

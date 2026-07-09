@@ -62,8 +62,8 @@ namespace DGS
 
     struct Stats
     {
-        float health;
         float speed[3];
+        float health;
         float baseDMG;
         float healing;
     };
@@ -71,15 +71,15 @@ namespace DGS
     // EntityTransfer struct to hold object relevant information for anti-cheat purposes and transfering data through servers
     struct EntityTransfer
     {
-        EntityType  type;
         uint32_t    uuid;
-        int32_t     chunkX, chunkY, chunkZ;
         float       pos[3];
+        int32_t     chunkX, chunkY, chunkZ;
         uint16_t    angle;
-        uint16_t    dataSize;
-        uint8_t     data[4096];
+        EntityType  type;
         EntityState state;
         Stats       stats;
+        uint16_t    dataSize;
+        uint8_t     data[4096];
     };
 
     struct Command
@@ -142,7 +142,7 @@ namespace DGS
 
     static constexpr uint16_t MAX_GHOST_DATA = 4096;
 
-    struct GhostDelta
+    alignas(16) struct GhostDelta
     {
         uint64_t uuid;
         int32_t  chunkX, chunkY, chunkZ;
@@ -151,7 +151,14 @@ namespace DGS
         float    rot[4];              // quaternion xyzw
         Stats    stats;
         uint16_t dataSize;            // bytes válidos en data[]
-        uint8_t  data[MAX_GHOST_DATA]; // payload opaco definido por el engine
+        uint8_t  st[MAX_GHOST_DATA]; // payload opaco definido por el engine
+    };
+
+    struct ChatMessage
+    {
+        uint32_t uuid;
+        char     username[32];
+        char     text[256];
     };
 
     struct LogEntry

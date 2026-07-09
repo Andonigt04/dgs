@@ -169,15 +169,23 @@ int main()
     struct timeval tvUDP { 0, 10000 }; // 10ms
     setsockopt(udp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvUDP, sizeof(tvUDP));
 
-    if (!tcp_zone_node.connect(headHost, headPort))
-    {
-        std::cerr << "[ZoneNode] Error conectando HeadServer" << std::endl;
-        return 1;
-    }
-    std::cout << "[ZoneNode] Conectado a HeadServer" << std::endl;
+    auto connectToHead = [&]() -> bool {
+        tcp_zone_node = DGS::TCPSocket();
+        for (int attempt = 1; ; ++attempt)
+        {
+            if (tcp_zone_node.connect(headHost, headPort))
+            {
+                struct timeval tvTCP { 0, 100000 };
+                setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvTCP, sizeof(tvTCP));
+                std::cout << "[ZoneNode] Conectado a HeadServer (intento " << attempt << ")" << std::endl;
+                return true;
+            }
+            std::cerr << "[ZoneNode] Reintentando conexion a HeadServer..." << std::endl;
+            sleep(3);
+        }
+    };
 
-    struct timeval tvTCP { 0, 100000 }; // 100ms
-    setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvTCP, sizeof(tvTCP));
+    connectToHead();
 
     while (true)
     {
@@ -208,6 +216,11 @@ int main()
         {
             uint8_t tcpBuf[8192];
             int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), tcpBuf, sizeof(tcpBuf));
+            if (bytes == 0)
+            {
+                std::cerr << "[ZoneNode] HeadServer cerro la conexion. Reconectando..." << std::endl;
+                connectToHead();
+            }
             if (bytes > 0)
             {
                 DGS::Packet pRecv;
@@ -262,7 +275,11 @@ int main()
 
         DGS::Packet p;
         p.pack(metrics);
-        tcp_zone_node.send(tcp_zone_node.getSocketFD(), p.getRawData(), p.getSize());
+        if (!tcp_zone_node.send(tcp_zone_node.getSocketFD(), p.getRawData(), p.getSize()))
+        {
+            std::cerr << "[ZoneNode] Conexion con HeadServer perdida. Reconectando..." << std::endl;
+            connectToHead();
+        }
 
         usleep(100000);
     }

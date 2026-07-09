@@ -244,4 +244,25 @@ namespace DGS
 
         return data;
     }
+
+    void Packet::pack(const ChatMessage& data)
+    {
+        clear();
+        write<PacketType>(PKT_CHAT);
+        write<uint32_t>(data.uuid);
+        writeString(std::string(data.username));
+        writeString(std::string(data.text));
+    }
+
+    ChatMessage Packet::unpackChatMessage()
+    {
+        readPos = 1;
+        ChatMessage data{};
+        data.uuid = read<uint32_t>();
+        std::string uname = readString();
+        std::strncpy(data.username, uname.c_str(), sizeof(data.username) - 1);
+        std::string text = readString();
+        std::strncpy(data.text, text.c_str(), sizeof(data.text) - 1);
+        return data;
+    }
 };

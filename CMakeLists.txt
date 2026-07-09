@@ -4,6 +4,7 @@ project(DGS)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenSSL REQUIRED)
 add_library(httplib INTERFACE)
@@ -16,6 +17,11 @@ include_directories(.)
 
 find_package(mongocxx REQUIRED)
 find_package(bsoncxx REQUIRED)
+
+option(HARUKA_USE_IPV6 "Activate network support for IPv6" ON)
+if (HARUKA_USE_IPV6)
+    add_compile_definitions(HARUKA_IPV6)
+endif()
 
 set(COMMON_SRCS src/packet.cpp src/network.cpp)
 
@@ -35,6 +41,7 @@ add_executable(anticheat_node nodes/anticheat_node.cpp ${COMMON_SRCS})
 
 add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
 target_link_libraries(dgs_client httplib::httplib)
+set_target_properties(dgs_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 install(TARGETS dgs_client ARCHIVE DESTINATION external/dgs/sdk)
 install(DIRECTORY include/ DESTINATION external/dgs/include)

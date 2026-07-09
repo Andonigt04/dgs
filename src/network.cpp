@@ -8,9 +8,33 @@
 
 namespace DGS
 {
+
+#ifdef HARUKA_IPV6
+    using SocketAddrType = sockaddr_in6;
+    constexpr int AF_FAMILY = AF_INET6;
+#else
+    using SocketAddrType = sockaddr_in;
+    constexpr int AF_FAMILY = AF_INET;
+#endif
+
+    static SocketAddrType newAddress(int port)
+    {
+        SocketAddrType addr{};
+#ifdef HARUKA_IPV6
+        addr.sin6_family = AF_FAMILY;
+        addr.sin6_port   = htons(port);
+        addr.sin6_addr   = in6addr_any; // Constante de Linux para "cualquier IP" en IPv6
+#else
+        addr.sin_family  = AF_FAMILY;
+        addr.sin_port    = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+#endif
+        return addr;
+    }
+
     UDPSocket::UDPSocket()
     {
-        socketFD = socket(AF_INET, SOCK_DGRAM, 0);
+        socketFD = socket(AF_FAMILY, SOCK_DGRAM, 0);
         if (socketFD < 0) std::cerr << "Error al crear el socket" << std::endl;
     }
 
@@ -25,10 +49,7 @@ namespace DGS
         if (setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) std::perror("Error en setsockopt SO_REUSEADDR");
         if (setsockopt(socketFD, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) std::perror("Error en setsockopt SO_REUSEPORT");
         
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
+        SocketAddrType addr = newAddress(port);
 
         if (::bind(socketFD, (struct sockaddr*)&addr, sizeof(addr)) < 0)
         {
@@ -41,10 +62,17 @@ namespace DGS
 
     bool UDPSocket::send(const std::string& address, int port, const uint8_t* data, size_t size)
     {
-        sockaddr_in destAddr{};
-        destAddr.sin_family = AF_INET;
+        SocketAddrType destAddr{};
+
+#ifdef HARUKA_IPV6
+        destAddr.sin_family = AF_FAMILY;
         destAddr.sin_port = htons(port);
-        inet_pton(AF_INET, address.c_str(), &destAddr.sin_addr);
+        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin6_addr);
+#else
+        destAddr.sin_family = AF_FAMILY;
+        destAddr.sin_port = htons(port);
+        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin_addr);
+#endif
 
         ssize_t sent = sendto(socketFD, data, size, 0, (struct sockaddr*)&destAddr, sizeof(destAddr));
         
@@ -53,13 +81,17 @@ namespace DGS
 
     int UDPSocket::receive(uint8_t* buffer, size_t size, std::string& outAddress, int& outPort)
     {
-        sockaddr_in fromAddr{};
+        SocketAddrType fromAddr{};
         socklen_t fromLen = sizeof(fromAddr);
 
         int bytesRecived = recvfrom(socketFD, buffer, size, 0, (struct sockaddr*)&fromAddr, &fromLen);
         if (bytesRecived >= 0)
         {
+#ifdef HARUKA_IPV6
+            outAddress = inet_ntoa(fromAddr.sin6_addr);
+#else
             outAddress = inet_ntoa(fromAddr.sin_addr);
+#endif
             outPort = ntohs(fromAddr.sin_port);
         }
 
@@ -68,7 +100,7 @@ namespace DGS
     
     TCPSocket::TCPSocket()
     {
-        socketFD = socket(AF_INET, SOCK_STREAM, 0);
+        socketFD = socket(AF_FAMILY, SOCK_STREAM, 0);
         if (socketFD < 0) std::cerr << "Error al crear el socket" << std::endl;
     }
 
@@ -82,10 +114,7 @@ namespace DGS
         int opt = 1;
         if (setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) std::perror("Error en setsockopt SO_REUSEADDR");
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
+        SocketAddrType addr = newAddress(port);
 
         if (::bind(socketFD, (struct sockaddr*)&addr, sizeof(addr)) < 0)
         {
@@ -104,7 +133,7 @@ namespace DGS
 
     int TCPSocket::accept()
     {
-        sockaddr_in clientAddr;
+        SocketAddrType clientAddr;
         socklen_t addrLen = sizeof(clientAddr);
 
         int clientFD = ::accept(socketFD, (struct sockaddr*)&clientAddr, &addrLen);
@@ -115,7 +144,7 @@ namespace DGS
     bool TCPSocket::connect(const std::string& address, int port)
     {
         addrinfo hints{}, *res = nullptr;
-        hints.ai_family   = AF_INET;
+        hints.ai_family   = AF_FAMILY;
         hints.ai_socktype = SOCK_STREAM;
 
         if (getaddrinfo(address.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res)

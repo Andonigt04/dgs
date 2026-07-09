@@ -32,8 +32,11 @@ namespace DGS
         // Payload opaco — el engine serializa su inventario aquí
         void sendInventory(uint32_t uuid, const uint8_t* data, uint16_t size);
 
+        void sendChat(uint32_t uuid, const std::string& username, const std::string& text);
+
         std::vector<EntityTransfer> pollEntities();
         std::vector<GhostDelta>     pollGhosts();
+        std::vector<ChatMessage>    pollChats();
 
         bool isConnected() const { return m_running.load(); }
 
@@ -54,6 +57,7 @@ namespace DGS
 
         std::vector<EntityTransfer> m_incomingEntities;
         std::vector<GhostDelta>     m_incomingGhosts;
+        std::vector<ChatMessage>    m_incomingChats;
 
         bool queryZone(uint32_t uuid, int32_t chunkX, int32_t chunkY, int32_t chunkZ);
         void recvLoop();
