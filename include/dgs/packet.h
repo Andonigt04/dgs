@@ -78,6 +78,10 @@ namespace DGS
         void pack(const ZoneListResponse& data);
         void pack(const GhostDelta& data);
         void pack(const ChatMessage& data);
+        // Validación (PLAN_DGS_VALIDADOR §2.2): request/ack + telemetría del validador.
+        void pack(const ValidateRequest& data);
+        void pack(const ValidateAck& data);
+        void pack(const ValidatorStatus& data);
         void pack(const PacketType& t) { clear(); write<PacketType>(t); }
 
         EntityTransfer unpackEntityTransfer();
@@ -88,6 +92,9 @@ namespace DGS
         ZoneListResponse unpackZoneListResponse();
         GhostDelta unpackGhostDelta();
         ChatMessage unpackChatMessage();
+        ValidateRequest unpackValidateRequest();
+        ValidateAck unpackValidateAck();
+        ValidatorStatus unpackValidatorStatus();
         PacketType unpackPacketType() { PacketType data; data = read<PacketType>(); return data; };
         
         PacketType getType() const { return buffer.empty() ? static_cast<PacketType>(0) : static_cast<PacketType>(buffer[0]); }

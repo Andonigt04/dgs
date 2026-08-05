@@ -38,7 +38,7 @@ jobs:
         run: |
           cmake --build build -j$(nproc) --target \
             head_server_node zone_node cache_node \
-            anticheat_node persistance_node client_node
+            anticheat_node persistance_node dgs_client
 
       - name: Build tests
         run: |

@@ -97,6 +97,12 @@ namespace DGS
         write<int32_t>(data.node.chunkZMax);
         writeString(std::string(data.node.addr));
         write<int>(data.node.port);
+        // Campos nuevos del plan (§4): monotónicos desde arranque → distintos de 0 para un nodo sano.
+        write<uint64_t>(data.startTimeS);
+        write<uint64_t>(data.bytesRx);
+        write<uint64_t>(data.bytesTx);
+        write<uint32_t>(data.failedTransfers);
+        write<uint32_t>(data.activeEntities);
     }
 
     ServerMetrics Packet::unpackServerMetrics()
@@ -114,6 +120,11 @@ namespace DGS
         std::string addr = readString();
         std::strncpy(data.node.addr, addr.c_str(), sizeof(data.node.addr) - 1);
         data.node.port = read<int>();
+        data.startTimeS = read<uint64_t>();
+        data.bytesRx = read<uint64_t>();
+        data.bytesTx = read<uint64_t>();
+        data.failedTransfers = read<uint32_t>();
+        data.activeEntities = read<uint32_t>();
 
         return data;
     }
@@ -263,6 +274,72 @@ namespace DGS
         std::strncpy(data.username, uname.c_str(), sizeof(data.username) - 1);
         std::string text = readString();
         std::strncpy(data.text, text.c_str(), sizeof(data.text) - 1);
+        return data;
+    }
+
+    void Packet::pack(const ValidateRequest& data)
+    {
+        clear();
+        write<PacketType>(PKT_VALIDATE_REQ);
+        write<uint32_t>(data.requestId);
+        write<uint64_t>(data.entityUuid);
+        write<uint32_t>(data.ownerZone);
+        write<uint8_t>(data.moduleId);
+        write<uint8_t>(data.kind);
+        // payload opaco (estado predicho por la zona + afirmación del cliente) se añadirá en P2 (§2.2)
+    }
+
+    ValidateRequest Packet::unpackValidateRequest()
+    {
+        readPos = 1;
+        ValidateRequest data{};
+        data.requestId = read<uint32_t>();
+        data.entityUuid = read<uint64_t>();
+        data.ownerZone = read<uint32_t>();
+        data.moduleId = read<uint8_t>();
+        data.kind = read<uint8_t>();
+        return data;
+    }
+
+    void Packet::pack(const ValidateAck& data)
+    {
+        clear();
+        write<PacketType>(PKT_VALIDATE_ACK);
+        write<uint32_t>(data.requestId);
+        write<int8_t>(data.verdict);
+        write<uint16_t>(data.weight);
+    }
+
+    ValidateAck Packet::unpackValidateAck()
+    {
+        readPos = 1;
+        ValidateAck data{};
+        data.requestId = read<uint32_t>();
+        data.verdict = read<int8_t>();
+        data.weight = read<uint16_t>();
+        return data;
+    }
+
+    void Packet::pack(const ValidatorStatus& data)
+    {
+        clear();
+        write<PacketType>(PKT_VALIDATOR_STATUS);
+        write<int8_t>(data.state);
+        write<uint32_t>(data.reqSent);
+        write<uint32_t>(data.reqTimeout);
+        write<uint64_t>(data.bytesRecv);
+        write<uint32_t>(data.failedTransfers);
+    }
+
+    ValidatorStatus Packet::unpackValidatorStatus()
+    {
+        readPos = 1;
+        ValidatorStatus data{};
+        data.state = read<int8_t>();
+        data.reqSent = read<uint32_t>();
+        data.reqTimeout = read<uint32_t>();
+        data.bytesRecv = read<uint64_t>();
+        data.failedTransfers = read<uint32_t>();
         return data;
     }
 };

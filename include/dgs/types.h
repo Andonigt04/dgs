@@ -5,7 +5,12 @@
 
 namespace DGS
 {
-    static constexpr uint8_t MAX_ZONES = 16;
+    static constexpr uint8_t  MAX_ZONES       = 16;
+    // Longitudes máx (véase §4.6 del plan): reemplaza los mágicos 16/4096.
+    static constexpr uint32_t MAX_ADDR_LEN    = 16;    // "255.255.255.255"+null. IPv6 → 46 (ver build HARUKA_USE_IPV6).
+    static constexpr uint32_t MAX_ENTITY_DATA = 4096;  // payload opaco máximo de una entidad.
+    static constexpr uint32_t MAX_PACKET_SIZE = 65536; // cap de datagrama/paquete (véase §4.6 bug 6 y network.h).
+    static constexpr uint64_t DEFAULT_LEASE_MS = 30000; // lease por defecto de una zona (véase §4.6 bug 1).
 
     enum PacketType : uint8_t
     {
@@ -18,6 +23,14 @@ namespace DGS
         PKT_ZONE_RESPONSE   = 6,
         PKT_ZONE_LIST       = 7,
         PKT_GHOST_DELTA     = 8,
+        // Nuevos packets del plan (PLAN_DGS_VALIDADOR): request/ack de validación + telemetría al master.
+        PKT_VALIDATE_REQ    = 9,   // zone_node → validador  (afirmación vs estado predicho, §2.2)
+        PKT_VALIDATE_ACK    = 10,  // validador → zone_node  (veredicto correlacionado, §2.2)
+        PKT_VALIDATOR_STATUS= 11,  // zone_node → head_server (telemetría/lease, §2.2 y §4)
+        PKT_SOCIAL_DELTA    = 12,  // guild/party deltas (§3.7)
+        PKT_ACCOUNT         = 13,  // ban/permisos de cuenta (§3.7)
+        PKT_DRAIN           = 14,  // ciclo de vida: pedir drenado antes de destruir zona (§3.9)
+        PKT_DELETE_ZONE     = 15,  // ciclo de vida: confirmar destrucción de zona (§3.9)
         PKT_DISCONNECT      = 255
     };
     
@@ -79,40 +92,48 @@ namespace DGS
         EntityState state;
         Stats       stats;
         uint16_t    dataSize;
-        uint8_t     data[4096];
+        uint8_t     data[MAX_ENTITY_DATA];
     };
 
     struct Command
     {
         HeadPurpose purpose;
         int32_t     chunkX, chunkY;
-        char        addr[16];
+        char        addr[MAX_ADDR_LEN];
         int         port;
         float       chunkSizeX, chunkSizeY, chunkSizeZ;
-    };
-
-    struct ZoneInfo {
-        int     fd;
-        int32_t chunkXMin, chunkXMax;
-        int32_t chunkYMin, chunkYMax;
-        int32_t chunkZMin, chunkZMax;
-        char    addr[16];
-        int     port;
     };
 
     struct ZoneInfoPublic {
         int32_t chunkXMin, chunkXMax;
         int32_t chunkYMin, chunkYMax;
         int32_t chunkZMin, chunkZMax;
-        char    addr[16];
+        char    addr[MAX_ADDR_LEN];
         int     port;
     };
 
+    // Zona como la ve el ORQUESTADOR (local): es un ZoneInfoPublic (lo que viaja / se consulta) + `fd` del
+    // socket de control con el nodo + estado de vida (véase §3.9). ⚠️ La base se declara ANTES: no se puede
+    // derivar de un tipo incompleto. `fd` NO va al wire (`pack(ServerMetrics)` solo serializa bounds/
+    // addr/port, véase packet.cpp) → este cambio NO afecta al formato de red.
+    struct ZoneInfo : public ZoneInfoPublic
+    {
+        int fd;
+    };
+
+    // Métricas que el nodo reporta al orquestador (§4 del plan). Los campos nuevos van AL FINAL para no
+    // desplazar los existentes. ⚠️ Añadir campos cambia el layout de red → recompilar pack/unpack a la vez
+    // (P0, §4.5). Contadores MONOTÓNICOS desde arranque (§4.1).
     struct ServerMetrics
     {
-        ZoneInfo node;
-        float    ramUsage;
-        float    performance;
+        ZoneInfo node;          // zonas (por bounds + addr:port; `fd` no viaja)
+        float    ramUsage;      // 0..1
+        float    performance;   // 0..1
+        uint64_t startTimeS;    // época de arranque del nodo (distinguir nodo nuevo de sano, §4.6 bug 5)
+        uint64_t bytesRx;       // bytes recibidos desde arranque
+        uint64_t bytesTx;       // bytes enviados desde arranque
+        uint32_t failedTransfers; // transferencias/validaciones fallidas (timeout o error)
+        uint32_t activeEntities;  // entidades servidas (heurística de escalado)
     };
 
     struct ZoneQuery
@@ -129,8 +150,48 @@ namespace DGS
 
     struct ZoneResponse
     {
-        char addr[16];
+        char addr[MAX_ADDR_LEN];
         int  port;
+    };
+
+    // Estado de vida de una zona (véase §3.9 del plan): el orquestador lo gestiona en paralelo al
+    // ZoneInfo. NO va al wire: es bookkeeping local.
+    enum class ZoneState : uint8_t
+    {
+        PROVISIONING = 0,   // spawn en curso, sin primer ServerMetrics
+        READY,              // sirviendo y registrada en activeZones
+        DRAINING,           // en proceso de cesión (scale-down / muerte), §3.9
+        DEAD,               // lease vencido, a reasignar/limpiar
+        DESTROYED           // pod/pod eliminado, entrada a purgar
+    };
+
+    // --- Request/ack de validación (PLAN_DGS_VALIDADOR §2.2) ---------------------------------------------
+    // El validador NO re-simula: compara la afirmación del cliente contra el estado PREDICHO por la zona
+    // dueña (misma regla que §3.6). `requestId` es un seq por remitente → idempotencia + anti-replay (§2.3).
+    struct ValidateRequest
+    {
+        uint32_t requestId;     // seq por remitente (anti-replay)
+        uint64_t entityUuid;    // entidad/op a validar
+        uint32_t ownerZone;     // zona dueña de la simulación (la que predice)
+        uint8_t  moduleId;      // módulo de reglas esperado (GAME_MODULE_SO)
+        uint8_t  kind;          // 0=move, 1=action (verbos críticos → fail-closed)
+        // payload opaco tras el header: estado PREDICHO por la zona + afirmación del cliente
+    };
+
+    struct ValidateAck
+    {
+        uint32_t requestId;
+        int8_t   verdict;       // 1 = plausible, 0 = violación
+        uint16_t weight;        // peso de la violación (0 si veredicto=1)
+    };
+
+    struct ValidatorStatus
+    {
+        int8_t   state;         // 0=UP 1=DEGRADED 2=DOWN/OPEN (circuit breaker §2.3)
+        uint32_t reqSent;       // validaciones pedidas
+        uint32_t reqTimeout;    // timeouts (→ failedTransfers del nodo)
+        uint64_t bytesRecv;     // bytes de validación recibidos
+        uint32_t failedTransfers;
     };
 
     enum DirtyFlag : uint32_t
@@ -142,7 +203,10 @@ namespace DGS
 
     static constexpr uint16_t MAX_GHOST_DATA = 4096;
 
-    alignas(16) struct GhostDelta
+    // ⚠️ `alignas` va DESPUÉS de `struct`: escrito delante, el compilador lo IGNORA (-Wattributes) y la
+    // estructura se quedaba con alineación 8. sizeof ya es múltiplo de 16 (4176) → alinearlo NO cambia el
+    // layout ni el formato de red, solo alinea de verdad.
+    struct alignas(16) GhostDelta
     {
         uint64_t uuid;
         int32_t  chunkX, chunkY, chunkZ;
