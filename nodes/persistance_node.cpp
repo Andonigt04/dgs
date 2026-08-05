@@ -73,7 +73,7 @@ int main()
                 clientFDs.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[Persistence] AntiCheat conectado FD=" << newFD << std::endl;
+                std::cout << "[Persistence] Validador conectado FD=" << newFD << std::endl;
             }
             else if (clientFDs.count(fd))
             {

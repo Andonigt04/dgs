@@ -1,20 +1,20 @@
 FROM dgs-base AS builder
 
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build build --target anticheat_node -j$(nproc)
+    cmake --build build --target validador_node -j$(nproc)
 
 FROM ubuntu:22.04
 
-COPY --from=builder /app/build/anticheat_node /usr/local/bin/anticheat_node
+COPY --from=builder /app/build/validador_node /usr/local/bin/validador_node
 
 ENV HEAD_SERVER_HOST=head-server
 ENV HEAD_SERVER_PORT=42424
 ENV PERSISTENCE_HOST=persistence
 ENV PERSISTENCE_PORT=42429
-ENV ANTICHEAT_UDP_PORT=42427
-ENV ANTICHEAT_TCP_PORT=42428
+ENV VALIDADOR_UDP_PORT=42427
+ENV VALIDADOR_TCP_PORT=42428
 
 EXPOSE 42427/udp
 EXPOSE 42428
 
-CMD ["anticheat_node"]
+CMD ["validador_node"]

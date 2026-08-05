@@ -1,25 +1,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: anticheat
+  name: validador
   namespace: dgs
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: anticheat
+      app: validador
   template:
     metadata:
       labels:
-        app: anticheat
+        app: validador
     spec:
       initContainers:
         - name: wait-head-server
           image: busybox:1.36
           command: ['sh', '-c', 'until nc -z head-server 42424; do echo waiting for head-server; sleep 2; done']
       containers:
-        - name: anticheat
-          image: dgs-anticheat-node:latest
+        - name: validador
+          image: dgs-validador-node:latest
           imagePullPolicy: Never
           env:
             - name: HEAD_SERVER_HOST
@@ -30,9 +30,9 @@ spec:
               value: "persistence"
             - name: PERSISTENCE_PORT
               value: "42429"
-            - name: ANTICHEAT_UDP_PORT
+            - name: VALIDADOR_UDP_PORT
               value: "42427"
-            - name: ANTICHEAT_TCP_PORT
+            - name: VALIDADOR_TCP_PORT
               value: "42428"
           ports:
             - containerPort: 42427

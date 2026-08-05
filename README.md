@@ -30,8 +30,8 @@ A high-performance distributed game server infrastructure written in C++17, desi
 |------|----------|------|------|
 | `head_server_node` | TCP | 42424 | Orchestration, zone routing, k8s scaling |
 | `zone_node` | TCP + UDP | 42420 | Entity simulation, metrics reporting |
-| `cache_node` | TCP | 42425 / 42426 | Transfer queue between zones and anticheat |
-| `anticheat_node` | UDP + TCP | 42427 / 42428 | Position validation, forward to persistence |
+| `cache_node` | TCP | 42425 / 42426 | Transfer queue between zones and validador |
+| `validador_node` | UDP + TCP | 42427 / 42428 | Position validation, forward to persistence |
 | `persistance_node` | TCP | 42429 | MongoDB write, async CSV log |
 | `client_node` | HTTP + TCP + UDP | — | Login API → zone discovery → game |
 
@@ -64,7 +64,7 @@ dgs/
 │   ├── head_server_node.cpp
 │   ├── zone_node.cpp
 │   ├── cache_node.cpp
-│   ├── anticheat_node.cpp
+│   ├── validador_node.cpp
 │   ├── persistance_node.cpp
 │   └── client_node.cpp
 ├── src/
@@ -77,7 +77,7 @@ dgs/
 │   ├── head-server/     # Deployment + Service + RBAC
 │   ├── zone-node/       # Deployment + Service + HPA
 │   ├── cache/
-│   ├── anticheat/
+│   ├── validador/
 │   ├── persistence/
 │   └── deploy.sh
 ├── tests/
@@ -122,9 +122,9 @@ CHUNK_Z_MIN=0 CHUNK_Z_MAX=100 \
 HEAD_SERVER_HOST=127.0.0.1 \
 ./build/zone_node
 
-# AntiCheat
+# Validador
 HEAD_SERVER_HOST=127.0.0.1 PERSISTENCE_HOST=127.0.0.1 \
-./build/anticheat_node
+./build/validador_node
 
 # Persistence
 MONGO_URI=mongodb://localhost:27017 ./build/persistance_node
@@ -181,12 +181,12 @@ If the reported position lies outside `radio`, the packet is dropped and the eve
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `HEAD_SERVER_HOST` | `head-server` | zone_node, anticheat |
-| `HEAD_SERVER_PORT` | `42424` | zone_node, anticheat |
-| `PERSISTENCE_HOST` | `persistence` | anticheat |
-| `PERSISTENCE_PORT` | `42429` | anticheat |
-| `ANTICHEAT_UDP_PORT` | `42427` | anticheat |
-| `ANTICHEAT_TCP_PORT` | `42428` | anticheat |
+| `HEAD_SERVER_HOST` | `head-server` | zone_node, validador |
+| `HEAD_SERVER_PORT` | `42424` | zone_node, validador |
+| `PERSISTENCE_HOST` | `persistence` | validador |
+| `PERSISTENCE_PORT` | `42429` | validador |
+| `VALIDADOR_UDP_PORT` | `42427` | validador |
+| `VALIDADOR_TCP_PORT` | `42428` | validador |
 | `MONGO_URI` | `mongodb://mongodb:27017` | persistence |
 | `API_HOST` | `api` | client |
 | `API_PORT` | `8080` | client |

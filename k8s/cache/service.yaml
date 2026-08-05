@@ -10,6 +10,6 @@ spec:
     - name: zone
       port: 42425
       targetPort: 42425
-    - name: anticheat
+    - name: validador
       port: 42426
       targetPort: 42426

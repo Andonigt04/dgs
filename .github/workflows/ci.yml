@@ -38,7 +38,7 @@ jobs:
         run: |
           cmake --build build -j$(nproc) --target \
             head_server_node zone_node cache_node \
-            anticheat_node persistance_node dgs_client
+            validador_node persistance_node dgs_client
 
       - name: Build tests
         run: |
@@ -76,5 +76,5 @@ jobs:
           docker build -f docker/Dockerfile.head_server      -t dgs-head-server:latest      .
           docker build -f docker/Dockerfile.zone_node        -t dgs-zone-node:latest        .
           docker build -f docker/Dockerfile.cache_node       -t dgs-cache-node:latest       .
-          docker build -f docker/Dockerfile.anticheat_node   -t dgs-anticheat-node:latest   .
+          docker build -f docker/Dockerfile.validador_node   -t dgs-validador-node:latest   .
           docker build -f docker/Dockerfile.persistence_node -t dgs-persistence-node:latest .

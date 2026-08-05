@@ -87,19 +87,19 @@ static void loadGameModule(float csX, float csY, float csZ)
 
     const char* so = std::getenv("GAME_MODULE_SO") ? std::getenv("GAME_MODULE_SO") : "libharuka_rules.so";
     void* h = dlopen(so, RTLD_NOW);
-    if (!h) { std::cout << "[AntiCheat] sin modulo de reglas (" << so << "): " << dlerror()
+    if (!h) { std::cout << "[Validador] sin modulo de reglas (" << so << "): " << dlerror()
                         << " -> fallback generico" << std::endl; return; }
 
     auto entry = (const DGS::GameModule* (*)())dlsym(h, "dgs_game_module_v1");
-    if (!entry) { std::cout << "[AntiCheat] " << so << " sin dgs_game_module_v1 -> fallback" << std::endl; dlclose(h); return; }
+    if (!entry) { std::cout << "[Validador] " << so << " sin dgs_game_module_v1 -> fallback" << std::endl; dlclose(h); return; }
 
     const DGS::GameModule* m = entry();
     if (!m || m->abiVersion != DGS::GAME_MODULE_ABI) {
-        std::cout << "[AntiCheat] ABI del modulo != " << DGS::GAME_MODULE_ABI << " -> fallback" << std::endl;
+        std::cout << "[Validador] ABI del modulo != " << DGS::GAME_MODULE_ABI << " -> fallback" << std::endl;
         dlclose(h); return;
     }
     g_module = m;   // el .so queda cargado toda la vida del proceso (no dlclose)
-    std::cout << "[AntiCheat] modulo de reglas '" << (m->name ? m->name : "?") << "' ABI=" << m->abiVersion
+    std::cout << "[Validador] modulo de reglas '" << (m->name ? m->name : "?") << "' ABI=" << m->abiVersion
               << (g_wq.planetRadius > 1.0 ? " (con terreno)" : " (solo velocidad)") << std::endl;
 }
 
@@ -110,21 +110,21 @@ int main()
     DGS::TCPSocket headServer;
     DGS::TCPSocket persistence;
 
-    int         udpPort      = std::atoi(std::getenv("ANTICHEAT_UDP_PORT")  ? std::getenv("ANTICHEAT_UDP_PORT")  : "42427");
-    int         tcpPort      = std::atoi(std::getenv("ANTICHEAT_TCP_PORT")  ? std::getenv("ANTICHEAT_TCP_PORT")  : "42428");
+    int         udpPort      = std::atoi(std::getenv("VALIDADOR_UDP_PORT")  ? std::getenv("VALIDADOR_UDP_PORT")  : "42427");
+    int         tcpPort      = std::atoi(std::getenv("VALIDADOR_TCP_PORT")  ? std::getenv("VALIDADOR_TCP_PORT")  : "42428");
     const char* headHost     = std::getenv("HEAD_SERVER_HOST")               ? std::getenv("HEAD_SERVER_HOST")               : "head-server";
     int         headPort     = std::atoi(std::getenv("HEAD_SERVER_PORT")     ? std::getenv("HEAD_SERVER_PORT")     : "42424");
     const char* persHost     = std::getenv("PERSISTENCE_HOST")               ? std::getenv("PERSISTENCE_HOST")               : "persistence";
     int         persPort     = std::atoi(std::getenv("PERSISTENCE_PORT")     ? std::getenv("PERSISTENCE_PORT")     : "42429");
 
-    if (!udpSocket.bind(udpPort))           { std::cerr << "[AntiCheat] Error UDP:"  << udpPort  << std::endl; return 1; }
-    if (!tcpSocket.listen(tcpPort))         { std::cerr << "[AntiCheat] Error TCP:"  << tcpPort  << std::endl; return 1; }
-    if (!headServer.connect(headHost, headPort))  { std::cerr << "[AntiCheat] Error conectando HeadServer" << std::endl; return 1; }
-    if (!persistence.connect(persHost, persPort)) { std::cerr << "[AntiCheat] Error conectando Persistence" << std::endl; return 1; }
+    if (!udpSocket.bind(udpPort))           { std::cerr << "[Validador] Error UDP:"  << udpPort  << std::endl; return 1; }
+    if (!tcpSocket.listen(tcpPort))         { std::cerr << "[Validador] Error TCP:"  << tcpPort  << std::endl; return 1; }
+    if (!headServer.connect(headHost, headPort))  { std::cerr << "[Validador] Error conectando HeadServer" << std::endl; return 1; }
+    if (!persistence.connect(persHost, persPort)) { std::cerr << "[Validador] Error conectando Persistence" << std::endl; return 1; }
 
     uint8_t cmdBuf[512];
     int cmdBytes = headServer.receive(headServer.getSocketFD(), cmdBuf, sizeof(cmdBuf));
-    if (cmdBytes <= 0) { std::cerr << "[AntiCheat] No se recibio Command inicial" << std::endl; return 1; }
+    if (cmdBytes <= 0) { std::cerr << "[Validador] No se recibio Command inicial" << std::endl; return 1; }
 
     DGS::Packet cmdPacket;
     cmdPacket.setBuffer(cmdBuf, cmdBytes);
@@ -134,8 +134,8 @@ int main()
     float csY = cmd.chunkSizeY;
     float csZ = cmd.chunkSizeZ;
 
-    std::cout << "[AntiCheat] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") km" << std::endl;
-    std::cout << "[AntiCheat] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
+    std::cout << "[Validador] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") km" << std::endl;
+    std::cout << "[Validador] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
 
     loadGameModule(csX, csY, csZ);   // reglas del proyecto (mismo código que el cliente) o fallback
 
@@ -173,7 +173,7 @@ int main()
                 auto it = lastKnown.find(e.uuid);
                 if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
                 {
-                    std::cout << "[AntiCheat] CHEAT detectado (UDP) uuid=" << e.uuid << std::endl;
+                    std::cout << "[Validador] VIOLATION detectada (UDP) uuid=" << e.uuid << std::endl;
                     continue;
                 }
 
@@ -192,7 +192,7 @@ int main()
                 cacheFDs.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[AntiCheat] Cache conectado FD=" << newFD << std::endl;
+                std::cout << "[Validador] Cache conectado FD=" << newFD << std::endl;
             }
             else if (cacheFDs.count(fd))
             {
@@ -213,7 +213,7 @@ int main()
                 auto it = lastKnown.find(e.uuid);
                 if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
                 {
-                    std::cout << "[AntiCheat] CHEAT detectado (TCP) uuid=" << e.uuid << std::endl;
+                    std::cout << "[Validador] VIOLATION detectada (TCP) uuid=" << e.uuid << std::endl;
                     continue;
                 }
 

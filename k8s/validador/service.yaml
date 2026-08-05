@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: anticheat
+  name: validador
   namespace: dgs
 spec:
   selector:
-    app: anticheat
+    app: validador
   ports:
     - name: udp
       port: 42427

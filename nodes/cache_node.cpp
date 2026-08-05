@@ -11,30 +11,30 @@
 int main()
 {
     DGS::TCPSocket zoneSocket;
-    DGS::TCPSocket anticheatSocket;
+    DGS::TCPSocket validadorSocket;
 
     std::queue<DGS::EntityTransfer> pending;
     std::mutex mutex;
 
     if (!zoneSocket.listen(42425)) { std::cerr << "[Cache] Error al escuchar ZoneNodes" << std::endl; return 1; }
-    if (!anticheatSocket.listen(42426)) { std::cerr << "[AntiCheat] Error al escuchar AntiCheat" << std::endl; return 1; }
+    if (!validadorSocket.listen(42426)) { std::cerr << "[Validador] Error al escuchar Validador" << std::endl; return 1; }
 
-    std::cout << "[Cache] Escuchando ZoneNodes:42425 AntiCheat:42426" << std::endl;
+    std::cout << "[Cache] Escuchando ZoneNodes:42425 Validador:42426" << std::endl;
 
     int epollFD = epoll_create1(0);
 
     epoll_event ev;
     ev.events = EPOLLIN;
     
-    ev.data.fd = anticheatSocket.getSocketFD();
-    epoll_ctl(epollFD, EPOLL_CTL_ADD, anticheatSocket.getSocketFD(), &ev);
+    ev.data.fd = validadorSocket.getSocketFD();
+    epoll_ctl(epollFD, EPOLL_CTL_ADD, validadorSocket.getSocketFD(), &ev);
 
     ev.data.fd = zoneSocket.getSocketFD();
     epoll_ctl(epollFD, EPOLL_CTL_ADD, zoneSocket.getSocketFD(), &ev);
 
     epoll_event events[64];
     std::set<int> zoneFDs;
-    std::set<int> anticheatFDs;
+    std::set<int> validadorFDs;
 
     while (true)
     {
@@ -45,14 +45,14 @@ int main()
         {
             int fd = events[i].data.fd;
 
-            if (fd == anticheatSocket.getSocketFD())
+            if (fd == validadorSocket.getSocketFD())
             {
-                int newFD = anticheatSocket.accept();
+                int newFD = validadorSocket.accept();
                 if (newFD < 0) continue;
-                anticheatFDs.insert(newFD);
+                validadorFDs.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[Cache] AntiCheat conectado FD: " << newFD << std::endl;
+                std::cout << "[Cache] Validador conectado FD: " << newFD << std::endl;
             }
             else if (fd == zoneSocket.getSocketFD())
             {
@@ -63,7 +63,7 @@ int main()
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
                 std::cout << "[Cache] ZoneNode conectado FD: " << newFD << std::endl;
             }
-            else if (anticheatFDs.count(fd))
+            else if (validadorFDs.count(fd))
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (!pending.empty())
@@ -72,7 +72,7 @@ int main()
                     pending.pop();
                     DGS::Packet p;
                     p.pack(e);
-                    anticheatSocket.send(fd, p.getRawData(), p.getSize());
+                    validadorSocket.send(fd, p.getRawData(), p.getSize());
                 }
 
             }
