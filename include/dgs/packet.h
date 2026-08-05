@@ -82,6 +82,10 @@ namespace DGS
         void pack(const ValidateRequest& data);
         void pack(const ValidateAck& data);
         void pack(const ValidatorStatus& data);
+        void pack(const EntityReassign& data);
+        void pack(const ZoneLifecycle& data);
+        void packDelete(const ZoneLifecycle& data);   // §3.9: mismo struct, tipo PKT_DELETE_ZONE
+        void pack(const ZoneRegion& data);
         void pack(const PacketType& t) { clear(); write<PacketType>(t); }
 
         EntityTransfer unpackEntityTransfer();
@@ -95,6 +99,9 @@ namespace DGS
         ValidateRequest unpackValidateRequest();
         ValidateAck unpackValidateAck();
         ValidatorStatus unpackValidatorStatus();
+        EntityReassign unpackEntityReassign();
+        ZoneLifecycle unpackZoneLifecycle();
+        ZoneRegion unpackZoneRegion();
         PacketType unpackPacketType() { PacketType data; data = read<PacketType>(); return data; };
         
         PacketType getType() const { return buffer.empty() ? static_cast<PacketType>(0) : static_cast<PacketType>(buffer[0]); }

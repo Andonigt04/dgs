@@ -11,6 +11,7 @@ namespace DGS
     static constexpr uint32_t MAX_ENTITY_DATA = 4096;  // payload opaco máximo de una entidad.
     static constexpr uint32_t MAX_PACKET_SIZE = 65536; // cap de datagrama/paquete (véase §4.6 bug 6 y network.h).
     static constexpr uint64_t DEFAULT_LEASE_MS = 30000; // lease por defecto de una zona (véase §4.6 bug 1).
+    static constexpr uint32_t MAX_REGION_BYTES = 4096;   // blob de región en un PKT_ZONE_REGION (§3.9, cap transport)
 
     enum PacketType : uint8_t
     {
@@ -31,6 +32,8 @@ namespace DGS
         PKT_ACCOUNT         = 13,  // ban/permisos de cuenta (§3.7)
         PKT_DRAIN           = 14,  // ciclo de vida: pedir drenado antes de destruir zona (§3.9)
         PKT_DELETE_ZONE     = 15,  // ciclo de vida: confirmar destrucción de zona (§3.9)
+        PKT_REASSIGN        = 16,  // handoff de autoridad: zona → head → nueva zona dueña (§3.6)
+        PKT_ZONE_REGION     = 17,  // blob de estado de región (serializeRegion/mergeRegion, §3.9)
         PKT_DISCONNECT      = 255
     };
     
@@ -154,6 +157,38 @@ namespace DGS
         int  port;
     };
 
+    // Handoff de autoridad (§3.6): una entidad (o región) cambia de zona dueña. El zone_node que la
+    // simulaba la manda al head; el head la enruta a la nueva zona que cubre su chunk. La nueva dueña
+    // la promueve (ghost→real) y EMPIEZA a simularla; la vieja la deja de simular (lease).
+    struct EntityReassign
+    {
+        uint64_t entityUuid;
+        int32_t  chunkX, chunkY, chunkZ;
+        uint32_t fromZone;      // zona que la cedía (debug/auditoría)
+        uint32_t toZone;        // zona destino (0 = que el head la resuelva por chunk)
+    };
+
+    // Ciclo de vida de una zona (§3.9). Mismo struct para las DOS señales:
+    //   · PKT_DRAIN:        orchestrator → zona  (ack=0: "drena, vas a cesar"; zona → orchestrator ack=1)
+    //   · PKT_DELETE_ZONE:  orchestrator → zona  (el drenaje terminó: destruye tu zona y sal)
+    // `requestId` correlaciona la petición con su ack (timeout/fail-safe en el orquestador).
+    struct ZoneLifecycle
+    {
+        uint32_t requestId;     // seq de la operación de ciclo de vida
+        uint8_t  ack;           // 0 = petición, 1 = confirmación del nodo
+    };
+
+    // Estado de región serializado (fusión/traspaso §3.9): la zona que cede extrae el estado autoritativo
+    // de su región con `serializeRegion` y lo envía (→ head → nueva zona), que lo incorpora con
+    // `mergeRegion`. `chunkX/Y/Z` es el ancla que usa el head para enrutar al nodo que lo cubre.
+    struct ZoneRegion
+    {
+        int32_t  chunkX, chunkY, chunkZ;   // ancla de la región (metros→qué nodo la cubre)
+        uint32_t srcZone;                  // nodo que cede (debug/auditoría)
+        uint32_t size;                     // bytes válidos en data[]
+        uint8_t  data[MAX_REGION_BYTES];   // blob opaco, formato del módulo
+    };
+
     // Estado de vida de una zona (véase §3.9 del plan): el orquestador lo gestiona en paralelo al
     // ZoneInfo. NO va al wire: es bookkeeping local.
     enum class ZoneState : uint8_t
@@ -175,7 +210,12 @@ namespace DGS
         uint32_t ownerZone;     // zona dueña de la simulación (la que predice)
         uint8_t  moduleId;      // módulo de reglas esperado (GAME_MODULE_SO)
         uint8_t  kind;          // 0=move, 1=action (verbos críticos → fail-closed)
-        // payload opaco tras el header: estado PREDICHO por la zona + afirmación del cliente
+        // payload opaco (kind=0 MOVIMIENTO): el estado PREDICHO por la zona + la afirmación del cliente.
+        // La zona dueña NO re-simula; el validador compara esta afirmación con su predictora + tolerancia RTT.
+        EntityTransfer entity;   // estado actual (predicho) de la entidad
+        float lastGX, lastGY, lastGZ;  // posición GLOBAL previa conocida por la zona
+        float maxSpeed;          // límite del jugador (Stats.speed[0])
+        float dtSeconds;         // tiempo entre la última posición y la afirmación
     };
 
     struct ValidateAck
@@ -192,6 +232,8 @@ namespace DGS
         uint32_t reqTimeout;    // timeouts (→ failedTransfers del nodo)
         uint64_t bytesRecv;     // bytes de validación recibidos
         uint32_t failedTransfers;
+        uint32_t activeEntities; // entidades servidas por el nodo emisor
+        uint64_t timestampMs;    // época del reporte
     };
 
     enum DirtyFlag : uint32_t

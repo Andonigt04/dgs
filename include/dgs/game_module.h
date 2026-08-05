@@ -14,10 +14,11 @@
 // ================================================================================================
 #include "include/dgs/types.h"
 #include <cstdint>
+#include <cstddef>   // size_t (serializeRegion)
 
 namespace DGS
 {
-    static constexpr uint32_t GAME_MODULE_ABI = 2;   // v2: + validateAction (blob de acción opaco)
+    static constexpr uint32_t GAME_MODULE_ABI = 4;   // v4: módulo POR ZONA (ciclo de vida + traspaso)
 
     // Estado de mundo de SOLO-LECTURA que el host presta al módulo (vive toda la sesión).
     struct WorldQuery
@@ -55,6 +56,7 @@ namespace DGS
         ACT_DESTROY  = 2,   // destruir un objeto / estructura / ladrillo
         ACT_TRANSFER = 3,   // mover ítem entre inventarios (qué/estructura = opaco, tras el header)
         ACT_INTERACT = 4,   // uso/activación genérica
+        ACT_PLACE    = 5,   // COLOCAR una pieza de construcción (payload: PlaceAction, ver abajo)
         ACT__COUNT
     };
 
@@ -69,23 +71,86 @@ namespace DGS
         float    amount;      // cantidad (daño / nº de ítems) — debe ser finita y >= 0
     };
 
+    // Payload de ACT_PLACE, JUSTO DETRAS del ActionHeader. A diferencia del resto de payloads —opacos
+    // para el modulo por defecto— este SI lo entiende el motor: colocar es un verbo del ENGINE
+    // (HarukaConstruction), no de un juego concreto, y validarlo es GEOMETRIA pura. Asi el servidor
+    // decide con EL MISMO codigo que el cliente usa para su prediccion: nada de reimplementar reglas.
+    struct PlaceAction
+    {
+        uint16_t typeId;      // tipo de pieza en el catalogo (el mismo id estable que usa el cliente)
+        uint16_t pad;
+        double   pos[3];      // centro de la pieza (m, GLOBAL)
+        double   quat[4];     // orientacion (x,y,z,w)
+    };
+
+    // Descripción de un TIPO de pieza construible. El servidor no puede validar una colocación sin
+    // saber qué TAMAÑO tiene la pieza (sin eso no hay solape que comprobar), así que el catálogo tiene
+    // que viajar: el host lo envía UNA vez al cargar el mundo y el módulo valida con las medidas REALES,
+    // las mismas que el cliente. Es dato estático del mundo, no por-acción.
+    struct PieceDesc
+    {
+        uint16_t typeId;      // id estable del tipo (el cliente lo asigna por orden alfabético)
+        uint8_t  supports;    // bitmask: 1 = apoya en terreno, 2 = apoya en otra pieza
+        uint8_t  needsFlat;   // 1 = exige suelo llano (cimentación)
+        float    half[3];     // semiejes de la pieza (m)
+    };
+
+    // Una ZONA = la porción del mundo que sirve UN nodo del DGS. Es un puntero opaco creado por el
+    // módulo: el host no mira dentro. Todo el estado autoritativo (piezas colocadas, catálogo) vive
+    // colgando de la zona, NO en variables globales del módulo.
+    //
+    // POR QUÉ: con estado global, un nodo que sirviera dos zonas las mezclaría, no habría nada que
+    // "reasignar" al mover un trozo de escena a otro nodo, y el estado moriría en el `dlclose` sin orden
+    // ni posibilidad de liberarlo antes. Con zonas: crear, traspasar y destruir son operaciones normales.
+    typedef void* ZoneHandle;
+
     // vtable del módulo. Un puntero de función NULO = "sin regla" → el host aplica su fallback genérico.
     struct GameModule
     {
         uint32_t    abiVersion;   // DEBE == GAME_MODULE_ABI o el host lo rechaza
         const char* name;         // p.ej. "survival"
 
+        // --- CICLO DE VIDA de una zona ---------------------------------------------------------
+        // El host crea una zona al empezar a servir una región y la DESTRUYE al dejar de servirla
+        // (traspaso a otro nodo, apagado ordenado). Destruir es explícito a propósito: dejarlo al
+        // final del proceso es lo que produce liberaciones fuera de orden.
+        ZoneHandle (*createZone)(const WorldQuery* w);
+        void       (*destroyZone)(ZoneHandle z);
+
         // 1 = movimiento plausible/legal; 0 = cheat (el host descarta + escalará sospecha en F4).
-        int (*validateMove)(const MoveSample* s, const WorldQuery* w);
+        int (*validateMove)(ZoneHandle z, const MoveSample* s, const WorldQuery* w);
 
         // 1 = acción admisible; 0 = rechazada. `blob`/`n` = bytes OPACOS (ActionHeader + payload del
         // juego); `actor` = uuid que la ejecuta. El módulo por defecto valida invariantes SIN estado
-        // (verbo conocido, cantidad finita/no-negativa, tamaño mínimo); la semántica con estado (¿tiene
-        // el ítem?, ¿es el dueño?, alcance real) la aporta el módulo del proyecto. NULO → el host acepta.
-        int (*validateAction)(uint32_t actor, const uint8_t* blob, uint16_t n, const WorldQuery* w);
+        // (verbo conocido, cantidad finita/no-negativa, tamaño mínimo) MÁS colocación (ACT_PLACE), que
+        // sí es geometría del motor. La semántica de juego la aporta el módulo del proyecto.
+        int (*validateAction)(ZoneHandle z, uint32_t actor, const uint8_t* blob, uint16_t n,
+                              const WorldQuery* w);
 
-        // --- Reservado (nulo por ahora) ---
-        // void (*step)(EntityTransfer* e, float dt, const WorldQuery* w);
+        // Catálogo de piezas construibles de esta zona. El host lo llama al crearla, antes de validar
+        // colocaciones: sin el tamaño de cada pieza no hay solape que comprobar.
+        void (*setPieceCatalog)(ZoneHandle z, const PieceDesc* types, uint16_t n);
+
+        // --- TRASPASO de una región entre nodos ------------------------------------------------
+        // `serializeRegion` extrae el estado autoritativo dentro de una esfera (centro+radio) a un
+        // buffer; `mergeRegion` lo incorpora en otra zona. Con esas dos operaciones se resuelven los
+        // dos movimientos que necesita un mundo repartido:
+        //   · REASIGNAR un trozo de escena: serializar en el nodo A → mergear en B → A lo suelta.
+        //   · AMPLIAR una zona: mergear la región cedida por el vecino, sin recargar nada.
+        // Devuelve los bytes escritos, o los NECESARIOS si `cap` es insuficiente (llamar con out=nullptr
+        // para preguntar el tamaño). Formato versionado; el módulo es dueño de él.
+        size_t (*serializeRegion)(ZoneHandle z, const double center[3], double radius,
+                                  uint8_t* out, size_t cap);
+        int    (*mergeRegion)(ZoneHandle z, const uint8_t* in, size_t n);
+
+        // `dropRegion` suelta lo que ya sirve otro nodo (el paso final de una reasignación).
+        void   (*dropRegion)(ZoneHandle z, const double center[3], double radius);
+
+        // SIMULACIÓN (P4, §3.6): la ZONA DUEÑA ejecuta `step` a tick fijo sobre UNA entidad que posee
+        // (C4 del plan v2). Solo el nodo autoritativo avanza la entidad; los demás la proyectan como
+        // ghost. `dt` = tick en segundos. Null = la zona no simula (solo validación) y el mundo va por
+        // las actualizaciones del cliente.
+        void   (*step)(ZoneHandle z, EntityTransfer* e, float dt, const WorldQuery* w);
     };
 }
 

@@ -75,11 +75,70 @@ int main()
                 serverSocket.send(clientFD, p.getRawData(), p.getSize());
     });
 
+    dispatcher.registerHandler(DGS::PKT_VALIDATOR_STATUS, [&](int fd, DGS::Packet& p)
+    {
+        auto st = p.unpackValidatorStatus();
+        std::cout << "[HeadServer] PKT_VALIDATOR_STATUS fd=" << fd
+                  << " estado=" << (int)st.state
+                  << " req=" << st.reqSent
+                  << " timeouts=" << st.reqTimeout
+                  << " viol=" << st.failedTransfers << std::endl;
+
+        DGS::LogEntry entry{};
+        entry.time_stamp  = (uint64_t)std::time(nullptr);
+        entry.type        = DGS::LOG_METRICS;
+        entry.fd          = fd;
+        entry.ramUsage    = st.state == 2 ? 1.0f : 0.0f;   // circuito abierto → carga crítica
+        entry.performance = st.state == 2 ? 0.0f : 1.0f;
+        logger.log(entry);
+    });
+
     dispatcher.registerHandler(DGS::PKT_GHOST_DELTA, [&](int fd, DGS::Packet& p)
     {
         auto neighbors = orchestrator.findNeighbors(fd);
         for (int neighborFD : neighbors)
             serverSocket.send(neighborFD, p.getRawData(), p.getSize());
+    });
+
+    dispatcher.registerHandler(DGS::PKT_REASSIGN, [&](int fd, DGS::Packet& p)
+    {
+        auto ra = p.unpackEntityReassign();
+
+        // §3.6 handoff: reasignar la autoridad de una entidad a la zona que cubre su chunk. La
+        // autoridad la resuelve el orquestador por chunk (no confiar en ids lógicos del remitente).
+        int targetFD = orchestrator.findTargetNode(ra.chunkX, ra.chunkY, ra.chunkZ);
+
+        std::cout << "[HeadServer] PKT_REASSIGN uuid=" << ra.entityUuid
+                  << " chunk=(" << ra.chunkX << "," << ra.chunkY << "," << ra.chunkZ << ")"
+                  << " targetFD=" << targetFD << std::endl;
+
+        if (targetFD != -1 && targetFD != fd)
+            serverSocket.send(targetFD, p.getRawData(), p.getSize());
+    });
+
+        dispatcher.registerHandler(DGS::PKT_ZONE_REGION, [&](int fd, DGS::Packet& p)
+    {
+        // §3.9 Fusión/traspaso: la zona que cede serializó su región; la enrutamos por ancla a la zona
+        // que cubre ese chunk (que la incorporará con mergeRegion).
+        auto reg = p.unpackZoneRegion();
+        int targetFD = orchestrator.findTargetNode(reg.chunkX, reg.chunkY, reg.chunkZ);
+        std::cout << "[HeadServer] PKT_ZONE_REGION src=" << reg.srcZone
+                  << " bytes=" << reg.size << " targetFD=" << targetFD << std::endl;
+        if (targetFD != -1 && targetFD != fd)
+            serverSocket.send(targetFD, p.getRawData(), p.getSize());
+    });
+
+    dispatcher.registerHandler(DGS::PKT_DRAIN, [&](int fd, DGS::Packet& p)
+    {
+        // §3.9: el zone_node confirma su drenado (ack=1). El orquestador destruye la zona (pod +
+        // topología + réplicas) y le manda PKT_DELETE_ZONE. Las peticiones (ack=0) salen del
+        // orquestador → zona y nunca llegan aquí.
+        auto lc = p.unpackZoneLifecycle();
+        if (lc.ack == 1)
+        {
+            std::cout << "[HeadServer] PKT_DRAIN ack fd=" << fd << " requestId=" << lc.requestId << std::endl;
+            orchestrator.handleZoneLifecycle(fd, lc);
+        }
     });
 
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p)

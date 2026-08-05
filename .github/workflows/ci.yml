@@ -43,13 +43,14 @@ jobs:
       - name: Build tests
         run: |
           cmake --build build -j$(nproc) --target \
-            ping_pong_test logger_test thread_pool_test
+            ping_pong_test logger_test thread_pool_test wire_test
 
       - name: Run tests
         run: |
           timeout 5 ./build/ping_pong_test   || true
           timeout 5 ./build/thread_pool_test || true
           timeout 5 ./build/logger_test      || true
+          ./build/wire_test
 
   docker-build:
     runs-on: ubuntu-22.04

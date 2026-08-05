@@ -286,7 +286,13 @@ namespace DGS
         write<uint32_t>(data.ownerZone);
         write<uint8_t>(data.moduleId);
         write<uint8_t>(data.kind);
-        // payload opaco (estado predicho por la zona + afirmación del cliente) se añadirá en P2 (§2.2)
+        // payload opaco (kind=0 MOVIMIENTO): estado predicho por la zona + afirmación del cliente
+        writeRaw(reinterpret_cast<const uint8_t*>(&data.entity), sizeof(DGS::EntityTransfer));
+        write<float>(data.lastGX);
+        write<float>(data.lastGY);
+        write<float>(data.lastGZ);
+        write<float>(data.maxSpeed);
+        write<float>(data.dtSeconds);
     }
 
     ValidateRequest Packet::unpackValidateRequest()
@@ -298,6 +304,12 @@ namespace DGS
         data.ownerZone = read<uint32_t>();
         data.moduleId = read<uint8_t>();
         data.kind = read<uint8_t>();
+        readRaw(reinterpret_cast<uint8_t*>(&data.entity), sizeof(DGS::EntityTransfer));
+        data.lastGX = read<float>();
+        data.lastGY = read<float>();
+        data.lastGZ = read<float>();
+        data.maxSpeed = read<float>();
+        data.dtSeconds = read<float>();
         return data;
     }
 
@@ -329,6 +341,8 @@ namespace DGS
         write<uint32_t>(data.reqTimeout);
         write<uint64_t>(data.bytesRecv);
         write<uint32_t>(data.failedTransfers);
+        write<uint32_t>(data.activeEntities);
+        write<uint64_t>(data.timestampMs);
     }
 
     ValidatorStatus Packet::unpackValidatorStatus()
@@ -340,6 +354,84 @@ namespace DGS
         data.reqTimeout = read<uint32_t>();
         data.bytesRecv = read<uint64_t>();
         data.failedTransfers = read<uint32_t>();
+        data.activeEntities = read<uint32_t>();
+        data.timestampMs = read<uint64_t>();
         return data;
+    }
+
+    void Packet::pack(const EntityReassign& data)
+    {
+        clear();
+        write<PacketType>(PKT_REASSIGN);
+        write<uint64_t>(data.entityUuid);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
+        write<uint32_t>(data.fromZone);
+        write<uint32_t>(data.toZone);
+    }
+
+    EntityReassign Packet::unpackEntityReassign()
+    {
+        readPos = 1;
+        EntityReassign data{};
+        data.entityUuid = read<uint64_t>();
+        data.chunkX = read<int32_t>();
+        data.chunkY = read<int32_t>();
+        data.chunkZ = read<int32_t>();
+        data.fromZone = read<uint32_t>();
+        data.toZone = read<uint32_t>();
+        return data;
+    }
+
+    void Packet::pack(const ZoneLifecycle& data)
+    {
+        clear();
+        write<PacketType>(PKT_DRAIN);          // mismo struct para PKT_DRAIN y PKT_DELETE_ZONE
+        write<uint32_t>(data.requestId);
+        write<uint8_t>(data.ack);
+    }
+
+    ZoneLifecycle Packet::unpackZoneLifecycle()
+    {
+        readPos = 1;
+        ZoneLifecycle data{};
+        data.requestId = read<uint32_t>();
+        data.ack = read<uint8_t>();
+        return data;
+    }
+
+    void Packet::pack(const ZoneRegion& data)
+    {
+        clear();
+        write<PacketType>(PKT_ZONE_REGION);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
+        write<uint32_t>(data.srcZone);
+        write<uint32_t>(data.size);
+        writeRaw(data.data, data.size);
+    }
+
+    ZoneRegion Packet::unpackZoneRegion()
+    {
+        readPos = 1;
+        ZoneRegion data{};
+        data.chunkX = read<int32_t>();
+        data.chunkY = read<int32_t>();
+        data.chunkZ = read<int32_t>();
+        data.srcZone = read<uint32_t>();
+        data.size = read<uint32_t>();
+        if (data.size > sizeof(data.data)) throw std::runtime_error("ZoneRegion overflow");
+        readRaw(data.data, data.size);
+        return data;
+    }
+
+    void Packet::packDelete(const ZoneLifecycle& data)
+    {
+        clear();
+        write<PacketType>(PKT_DELETE_ZONE);
+        write<uint32_t>(data.requestId);
+        write<uint8_t>(data.ack);
     }
 };

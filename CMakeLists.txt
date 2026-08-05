@@ -29,6 +29,7 @@ add_executable(head_server_node nodes/head_server_node.cpp ${COMMON_SRCS})
 target_link_libraries(head_server_node httplib::httplib)
 
 add_executable(zone_node nodes/zone_node.cpp ${COMMON_SRCS})
+target_link_libraries(zone_node ${CMAKE_DL_LIBS})   # dlopen del modulo de reglas por proyecto (module->step)
 
 add_executable(persistance_node nodes/persistance_node.cpp ${COMMON_SRCS})
 target_link_libraries(persistance_node
@@ -57,6 +58,7 @@ endif()
 add_executable(ping_pong_test tests/ping_pong.cpp ${COMMON_SRCS})
 add_executable(thread_pool_test tests/thread_pool_test.cpp ${COMMON_SRCS})
 add_executable(logger_test tests/logger_test.cpp ${COMMON_SRCS})
+add_executable(wire_test tests/wire_test.cpp ${COMMON_SRCS})
 
 find_package(SFML 2.5 COMPONENTS graphics window system)
 if(SFML_FOUND)
