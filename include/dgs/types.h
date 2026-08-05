@@ -151,7 +151,7 @@ namespace DGS
         float    rot[4];              // quaternion xyzw
         Stats    stats;
         uint16_t dataSize;            // bytes válidos en data[]
-        uint8_t  st[MAX_GHOST_DATA]; // payload opaco definido por el engine
+        uint8_t  data[MAX_GHOST_DATA]; // payload opaco definido por el engine
     };
 
     struct ChatMessage

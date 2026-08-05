@@ -65,8 +65,8 @@ namespace DGS
         SocketAddrType destAddr{};
 
 #ifdef HARUKA_IPV6
-        destAddr.sin_family = AF_FAMILY;
-        destAddr.sin_port = htons(port);
+        destAddr.sin6_family = AF_FAMILY;
+        destAddr.sin6_port = htons(port);
         inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin6_addr);
 #else
         destAddr.sin_family = AF_FAMILY;
@@ -88,11 +88,14 @@ namespace DGS
         if (bytesRecived >= 0)
         {
 #ifdef HARUKA_IPV6
-            outAddress = inet_ntoa(fromAddr.sin6_addr);
+            char ipStr[INET6_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET6, &fromAddr.sin6_addr, ipStr, sizeof(ipStr));  // inet_ntoa es IPv4-only
+            outAddress = ipStr;
+            outPort = ntohs(fromAddr.sin6_port);
 #else
             outAddress = inet_ntoa(fromAddr.sin_addr);
-#endif
             outPort = ntohs(fromAddr.sin_port);
+#endif
         }
 
         return bytesRecived;

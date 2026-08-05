@@ -38,6 +38,7 @@ target_link_libraries(persistance_node
 
 add_executable(cache_node nodes/cache_node.cpp ${COMMON_SRCS})
 add_executable(anticheat_node nodes/anticheat_node.cpp ${COMMON_SRCS})
+target_link_libraries(anticheat_node ${CMAKE_DL_LIBS})   # dlopen del modulo de reglas por proyecto
 
 add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
 target_link_libraries(dgs_client httplib::httplib)

@@ -1,6 +1,7 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
 #include "include/dgs/types.h"
+#include "include/dgs/game_module.h"   // ABI del MÓDULO DE REGLAS por proyecto (dlopen)
 
 #include <sys/epoll.h>
 #include <cstring>
@@ -8,6 +9,8 @@
 #include <map>
 #include <set>
 #include <iostream>
+#include <dlfcn.h>
+#include <cstdlib>
 
 static constexpr float SCALE       = 1000.0f;
 
@@ -25,7 +28,17 @@ static uint64_t nowMs()
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static bool validate(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
+// ------------------------------------------------------------------------------------------------
+// MÓDULO DE REGLAS del PROYECTO (cargado en caliente). El DGS es GENÉRICO: NO conoce la física ni las
+// estructuras del juego (inventario, casting, edición de mundo) — solo transporta bytes y DELEGA la
+// semántica en el módulo, que el proyecto entrega como .so (mismo código que el cliente usa para
+// predecir). Aquí solo el verbo de MOVIMIENTO; los demás (validateAction, ...) crecen sobre el mismo
+// contrato sin tocar este nodo. Si no hay módulo, se usa el `validate()` histórico como fallback.
+static const DGS::GameModule* g_module = nullptr;   // null → fallback genérico
+static DGS::WorldQuery        g_wq{};               // estado de mundo de solo-lectura para el módulo
+
+// Fallback GENÉRICO histórico: solo velocidad/teleport (sin terreno; el DGS no conoce el mundo).
+static bool validateFallback(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
 {
     float dt = (nowMs() - last.timestamp_ms) / 1000.0f;
     if (dt <= 0 || dt > 2.f) return true;
@@ -37,6 +50,57 @@ static bool validate(const DGS::EntityTransfer& e, const LastKnown& last, float 
 
     float maxDist = (last.maxSpeed * dt) + (SCALE / 1000.0f);
     return distSq <= (maxDist * maxDist);
+}
+
+// Punto ÚNICO de validación de movimiento: si hay módulo del proyecto, arma el MoveSample y delega en
+// él (mismas reglas que el cliente); si no, cae al fallback genérico. Devuelve true = movimiento legal.
+static bool validateMoveDGS(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
+{
+    if (!g_module || !g_module->validateMove)
+        return validateFallback(e, last, csX, csY, csZ);
+
+    DGS::MoveSample s{};
+    s.now       = &e;
+    s.lastGX    = last.gx;
+    s.lastGY    = last.gy;
+    s.lastGZ    = last.gz;
+    s.maxSpeed  = last.maxSpeed;
+    s.dtSeconds = (nowMs() - last.timestamp_ms) / 1000.0f;
+    return g_module->validateMove(&s, &g_wq) != 0;
+}
+
+// Carga el módulo del proyecto (GAME_MODULE_SO, def. "libharuka_rules.so") y prepara el WorldQuery.
+// El planeta (para el anti-noclip) solo se activa si el operador lo provisiona por entorno — mientras
+// el head-server no lo propague, g_wq.planetRadius=0 y el módulo valida SOLO velocidad (como el
+// fallback). El chunkSize sí viene siempre en el Command inicial.
+static void loadGameModule(float csX, float csY, float csZ)
+{
+    g_wq = DGS::WorldQuery{};
+    g_wq.chunkSizeX = csX; g_wq.chunkSizeY = csY; g_wq.chunkSizeZ = csZ;
+    // Planeta OPCIONAL por entorno (pruebas locales del anti-noclip). Requiere pos GLOBAL en metros.
+    if (const char* r = std::getenv("GAME_PLANET_RADIUS")) {
+        g_wq.planetRadius    = std::atof(r);
+        g_wq.seed            = (uint32_t)std::atol(std::getenv("GAME_SEED")            ? std::getenv("GAME_SEED")            : "0");
+        g_wq.reliefStrength  = (float)   std::atof(std::getenv("GAME_RELIEF")          ? std::getenv("GAME_RELIEF")          : "1.0");
+        g_wq.profile         = (int32_t) std::atol(std::getenv("GAME_PROFILE")         ? std::getenv("GAME_PROFILE")         : "0");
+    }
+
+    const char* so = std::getenv("GAME_MODULE_SO") ? std::getenv("GAME_MODULE_SO") : "libharuka_rules.so";
+    void* h = dlopen(so, RTLD_NOW);
+    if (!h) { std::cout << "[AntiCheat] sin modulo de reglas (" << so << "): " << dlerror()
+                        << " -> fallback generico" << std::endl; return; }
+
+    auto entry = (const DGS::GameModule* (*)())dlsym(h, "dgs_game_module_v1");
+    if (!entry) { std::cout << "[AntiCheat] " << so << " sin dgs_game_module_v1 -> fallback" << std::endl; dlclose(h); return; }
+
+    const DGS::GameModule* m = entry();
+    if (!m || m->abiVersion != DGS::GAME_MODULE_ABI) {
+        std::cout << "[AntiCheat] ABI del modulo != " << DGS::GAME_MODULE_ABI << " -> fallback" << std::endl;
+        dlclose(h); return;
+    }
+    g_module = m;   // el .so queda cargado toda la vida del proceso (no dlclose)
+    std::cout << "[AntiCheat] modulo de reglas '" << (m->name ? m->name : "?") << "' ABI=" << m->abiVersion
+              << (g_wq.planetRadius > 1.0 ? " (con terreno)" : " (solo velocidad)") << std::endl;
 }
 
 int main()
@@ -73,6 +137,8 @@ int main()
     std::cout << "[AntiCheat] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") km" << std::endl;
     std::cout << "[AntiCheat] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
 
+    loadGameModule(csX, csY, csZ);   // reglas del proyecto (mismo código que el cliente) o fallback
+
     int epollFD = epoll_create1(0);
     epoll_event ev;
     ev.events = EPOLLIN;
@@ -105,7 +171,7 @@ int main()
                 std::memcpy(&e, buffer, sizeof(e));
 
                 auto it = lastKnown.find(e.uuid);
-                if (it != lastKnown.end() && !validate(e, it->second, csX, csY, csZ))
+                if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
                 {
                     std::cout << "[AntiCheat] CHEAT detectado (UDP) uuid=" << e.uuid << std::endl;
                     continue;
@@ -145,7 +211,7 @@ int main()
                 auto e = p.unpackEntityTransfer();
 
                 auto it = lastKnown.find(e.uuid);
-                if (it != lastKnown.end() && !validate(e, it->second, csX, csY, csZ))
+                if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
                 {
                     std::cout << "[AntiCheat] CHEAT detectado (TCP) uuid=" << e.uuid << std::endl;
                     continue;
