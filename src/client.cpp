@@ -1,5 +1,6 @@
 #include "include/dgs/client.h"
 
+#include <cmath>
 #include <httplib.h>
 #include <iostream>
 #include <cstring>
@@ -108,7 +109,7 @@ namespace DGS
         e.pos[2] = pos[2];
         
         // Quaternion yaw → uint16 angle
-        float yaw  = std::atan2f(2.0f * (rot[3] * rot[1]), 1.0f - 2.0f * (rot[1] * rot[1]));
+        float yaw  = std::atan2(2.0f * (rot[3] * rot[1]), 1.0f - 2.0f * (rot[1] * rot[1]));
         e.angle    = static_cast<uint16_t>((yaw + 3.14159265f) * (32767.5f / 3.14159265f));
 
         sendEntityUDP(e);
