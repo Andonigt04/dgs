@@ -27,6 +27,15 @@ void insertEntity(mongocxx::collection& col, const DGS::EntityTransfer& e)
         << "dataSize" << (int32_t)e.dataSize
         << "state"    << (int32_t)e.state;
 
+    // C6 (§3.6): blob OPACO del módulo. El DGS no lo interpreta — solo lo transporta y lo persiste
+    // como binario para que el módulo pueda reconstruir su estado (same code en cliente/server).
+    // Sin esto, al recargar una zona el estado del módulo se pierde aunque pos/stats sobrevivan.
+    if (e.dataSize > 0)
+    {
+        doc << "moduleBlob" << bsoncxx::types::b_binary{
+            bsoncxx::binary_sub_type::k_binary, e.dataSize, e.data};
+    }
+
     col.insert_one(doc.view());
 }
 

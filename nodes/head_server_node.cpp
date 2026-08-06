@@ -84,6 +84,11 @@ int main()
                   << " timeouts=" << st.reqTimeout
                   << " viol=" << st.failedTransfers << std::endl;
 
+        // P6 (F1): state=2 = validador caído / circuito abierto en esa zona → el master reasigna su
+        // región a un vecino sano (traspaso por métrica fallida) para no servir sin veredicto.
+        if (st.state == 2)
+            orchestrator.notifyValidatorDown(fd, st);
+
         DGS::LogEntry entry{};
         entry.time_stamp  = (uint64_t)std::time(nullptr);
         entry.type        = DGS::LOG_METRICS;

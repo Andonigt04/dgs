@@ -263,6 +263,10 @@ namespace DGS
         write<uint32_t>(data.uuid);
         writeString(std::string(data.username));
         writeString(std::string(data.text));
+        // §3.7: canal + seq + época (rate-limit y orden por canal en el servicio de chat).
+        write<uint8_t>(data.channel);
+        write<uint64_t>(data.seq);
+        write<uint32_t>(data.timestampMs);
     }
 
     ChatMessage Packet::unpackChatMessage()
@@ -274,6 +278,9 @@ namespace DGS
         std::strncpy(data.username, uname.c_str(), sizeof(data.username) - 1);
         std::string text = readString();
         std::strncpy(data.text, text.c_str(), sizeof(data.text) - 1);
+        data.channel     = read<uint8_t>();
+        data.seq         = read<uint64_t>();
+        data.timestampMs = read<uint32_t>();
         return data;
     }
 
@@ -433,5 +440,57 @@ namespace DGS
         write<PacketType>(PKT_DELETE_ZONE);
         write<uint32_t>(data.requestId);
         write<uint8_t>(data.ack);
+    }
+
+    // §3.7: delta social de guild/party (PKT_SOCIAL_DELTA).
+    void Packet::pack(const SocialDelta& data)
+    {
+        clear();
+        write<PacketType>(PKT_SOCIAL_DELTA);
+        write<uint32_t>(data.targetUuid);
+        write<uint32_t>(data.scopeUuid);
+        write<uint8_t>(data.kind);
+        write<uint8_t>(data.rank);
+        write<int32_t>(data.zoneId);
+        write<uint64_t>(data.seq);
+    }
+
+    SocialDelta Packet::unpackSocialDelta()
+    {
+        readPos = 1;
+        SocialDelta data{};
+        data.targetUuid = read<uint32_t>();
+        data.scopeUuid  = read<uint32_t>();
+        data.kind       = read<uint8_t>();
+        data.rank       = read<uint8_t>();
+        data.zoneId     = read<int32_t>();
+        data.seq        = read<uint64_t>();
+        return data;
+    }
+
+    // §3.7: acción de cuenta (PKT_ACCOUNT): ban/permisos.
+    void Packet::pack(const AccountAction& data)
+    {
+        clear();
+        write<PacketType>(PKT_ACCOUNT);
+        write<uint32_t>(data.actorUuid);
+        write<uint32_t>(data.targetUuid);
+        write<uint8_t>(data.action);
+        write<uint32_t>(data.permFlags);
+        write<uint32_t>(data.durationS);
+        writeRaw(reinterpret_cast<const uint8_t*>(data.reason), sizeof(data.reason));
+    }
+
+    AccountAction Packet::unpackAccountAction()
+    {
+        readPos = 1;
+        AccountAction data{};
+        data.actorUuid = read<uint32_t>();
+        data.targetUuid = read<uint32_t>();
+        data.action     = read<uint8_t>();
+        data.permFlags  = read<uint32_t>();
+        data.durationS  = read<uint32_t>();
+        readRaw(reinterpret_cast<uint8_t*>(data.reason), sizeof(data.reason));
+        return data;
     }
 };

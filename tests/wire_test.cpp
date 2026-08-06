@@ -179,11 +179,44 @@ static void roundTripChat()
     a.uuid = 77;
     std::strncpy(a.username, "andoni", sizeof(a.username) - 1);
     std::strncpy(a.text, "hola mundo", sizeof(a.text) - 1);
+    a.channel = DGS::CHAT_GUILD;
+    a.seq = 42;
+    a.timestampMs = 1234567890;
     DGS::Packet p; p.pack(a);
     CHECK(p.getType() == DGS::PKT_CHAT, "ChatMessage: primer byte");
     b = p.unpackChatMessage();
     CHECK(b.uuid == a.uuid && std::strcmp(b.username, a.username) == 0 && std::strcmp(b.text, a.text) == 0,
           "ChatMessage: campos");
+    CHECK(b.channel == a.channel && b.seq == a.seq && b.timestampMs == a.timestampMs,
+          "ChatMessage: canal/seq/época (§3.7)");
+}
+
+static void roundTripSocial()
+{
+    DGS::SocialDelta a{}, b{};
+    a.targetUuid = 1001; a.scopeUuid = 7; a.kind = DGS::SOCIAL_GUILD_RANK;
+    a.rank = 3; a.zoneId = 5; a.seq = 9;
+    DGS::Packet p; p.pack(a);
+    CHECK(p.getType() == DGS::PKT_SOCIAL_DELTA, "SocialDelta: primer byte");
+    b = p.unpackSocialDelta();
+    CHECK(b.targetUuid == a.targetUuid && b.scopeUuid == a.scopeUuid && b.kind == a.kind &&
+          b.rank == a.rank && b.zoneId == a.zoneId && b.seq == a.seq,
+          "SocialDelta: campos");
+}
+
+static void roundTripAccount()
+{
+    DGS::AccountAction a{}, b{};
+    a.actorUuid = 1; a.targetUuid = 555; a.action = DGS::ACC_BAN;
+    a.permFlags = 0; a.durationS = 86400;
+    std::strncpy(a.reason, "trampa de velocidad", sizeof(a.reason) - 1);
+    DGS::Packet p; p.pack(a);
+    CHECK(p.getType() == DGS::PKT_ACCOUNT, "AccountAction: primer byte");
+    b = p.unpackAccountAction();
+    CHECK(b.actorUuid == a.actorUuid && b.targetUuid == a.targetUuid && b.action == a.action &&
+          b.permFlags == a.permFlags && b.durationS == a.durationS &&
+          std::memcmp(b.reason, a.reason, sizeof(a.reason)) == 0,
+          "AccountAction: campos");
 }
 
 static void roundTripValidate()
@@ -289,6 +322,8 @@ int main()
     roundTripZoneList();
     roundTripGhost();
     roundTripChat();
+    roundTripSocial();
+    roundTripAccount();
     roundTripValidate();
     roundTripValidatorStatus();
     roundTripReassign();

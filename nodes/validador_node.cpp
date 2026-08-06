@@ -132,6 +132,21 @@ static bool validateMoveRequest(const DGS::ValidateRequest& r, float csX, float 
     return moduleValidateMove(&s);
 }
 
+// P7 (§2.3, §3.7): valida una ACCIÓN (kind=1, verbos críticos: destroy/place/ACT_TRANSFER). La economía
+// y los verbos destructivos son FAIL-CLOSED: sin módulo, módulo sospechoso o validateAction null → SE
+// RECHAZA (la economía jamás es cliente-autoritativa). Con módulo, el veredicto lo decide el proyecto
+// vía `validateAction` sobre el blob OPACO que viaja en `data[0..dataSize)` (el DGS no lo interpreta).
+// ACT_TRANSFER (economía de gremio) entra exactamente por aquí.
+static bool validateActionRequest(const DGS::ValidateRequest& r)
+{
+    if (!g_module || !g_module->validateAction || g_moduleSuspicious.load())
+        return false;   // fail-closed: sin veredicto → rechazar (banco de gremio, loot, trade)
+
+    // Blob opaco de la acción (ActionHeader + payload del juego) transportado en data[].
+    return g_module->validateAction(g_zone, (uint32_t)r.entityUuid,
+                                    r.entity.data, r.entity.dataSize, &g_wq) == 1;
+}
+
 // Punto ÚNICO de validación de movimiento: si hay módulo del proyecto, arma el MoveSample y delega en
 // él (mismas reglas que el cliente); si no, cae al fallback genérico. Devuelve true = movimiento legal.
 static bool validateMoveDGS(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
@@ -314,7 +329,10 @@ int main()
                 {
                     // P2: request-ack de las zonas (ownerZone predice, validador queda de árbitro).
                     DGS::ValidateRequest req = p.unpackValidateRequest();
-                    bool ok = (req.kind == 0) ? validateMoveRequest(req, csX, csY, csZ) : false;
+                    // kind=0 movimiento → validateMove; kind=1 acción (destroy/place/ACT_TRANSFER) →
+                    // validateAction con FAIL-CLOSED (P7 §2.3/§3.7): sin veredicto del módulo se rechaza.
+                    bool ok = (req.kind == 0) ? validateMoveRequest(req, csX, csY, csZ)
+                                              : validateActionRequest(req);
 
                     DGS::ValidateAck ack{};
                     ack.requestId = req.requestId;

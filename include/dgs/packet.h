@@ -86,6 +86,9 @@ namespace DGS
         void pack(const ZoneLifecycle& data);
         void packDelete(const ZoneLifecycle& data);   // §3.9: mismo struct, tipo PKT_DELETE_ZONE
         void pack(const ZoneRegion& data);
+        // §3.7 Plano social/cuenta: deltas de guild/party + acciones de cuenta (ban/permisos).
+        void pack(const SocialDelta& data);
+        void pack(const AccountAction& data);
         void pack(const PacketType& t) { clear(); write<PacketType>(t); }
 
         EntityTransfer unpackEntityTransfer();
@@ -102,6 +105,8 @@ namespace DGS
         EntityReassign unpackEntityReassign();
         ZoneLifecycle unpackZoneLifecycle();
         ZoneRegion unpackZoneRegion();
+        SocialDelta unpackSocialDelta();
+        AccountAction unpackAccountAction();
         PacketType unpackPacketType() { PacketType data; data = read<PacketType>(); return data; };
         
         PacketType getType() const { return buffer.empty() ? static_cast<PacketType>(0) : static_cast<PacketType>(buffer[0]); }

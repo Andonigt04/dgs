@@ -372,12 +372,29 @@ int main()
     bool validated = connectToValidator();
     if (!validated) sleep(3);   // reintento el siguiente ciclo
 
+    // ---- P7 (§3.7): suscripción de la ZONA al nodo social. La zona NUNCA decide cuenta: aplica lo que
+    // el nodo social le dice (bans/permisos → bloquea entrada de baneados). El canal local del chat lo
+    // emite la zona por interés espacial; los demás canales los enruta el social (fan-out por suscripción).
+    const char* socialHost = std::getenv("SOCIAL_HOST") ? std::getenv("SOCIAL_HOST") : "social";
+    int         socialPort = std::atoi(std::getenv("SOCIAL_TCP_PORT") ? std::getenv("SOCIAL_TCP_PORT") : "42430");
+    DGS::TCPSocket tcp_social;
+    if (tcp_social.connect(socialHost, socialPort))
+    {
+        struct timeval tvSOC { 0, 5000 };
+        setsockopt(tcp_social.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvSOC, sizeof(tvSOC));
+        std::cout << "[ZoneNode] P7: suscrito al nodo social " << socialHost << ":" << socialPort << std::endl;
+    }
+    else
+        std::cout << "[ZoneNode] P7: nodo social no disponible en " << socialHost << ":"
+                  << socialPort << " (sin bans locales)" << std::endl;
+
     z_installCrashGuard();       // contención de crashes del .so (§3.5)
     loadZoneModule();            // módulo de reglas del proyecto (o sin simulación)
 
     std::map<uint32_t, LastPosition>  lastPosition;       // uuid → baseline
     std::map<uint32_t, PendingValidation> pendingValid;   // requestId → en vuelo
     std::map<uint32_t, uint64_t>      lastReqMs;          // uuid → último REQ enviado (throttle)
+    std::map<uint32_t, uint64_t>      bannedUntilMs;      // P7: uuid → hasta cuándo bloqueado (0=siempre)
 
     uint32_t reqSeq      = 1;
     uint32_t statSent    = 0;
@@ -421,6 +438,16 @@ int main()
                 DGS::EntityTransfer e;
                 std::memcpy(&e, udpBuf, sizeof(e));
                 clientMap[e.uuid] = { clientAddr, clientPort };
+
+                // ---- P7 (§3.7): la zona aplica lo que el nodo social decide (NUNCA lo decide ella).
+                // Cuenta baneada → se bloquea la ENTRADA (el cliente sigue mandando posiciones, pero la
+                // zona no las sirve ni las simula). La zona NO juzga: solo aplica el ban recibido.
+                auto banIt = bannedUntilMs.find(e.uuid);
+                if (banIt != bannedUntilMs.end() && (banIt->second == 0 || nowMs() < banIt->second))
+                {
+                    statRejected++;
+                    continue;   // baneado: no se propaga
+                }
 
                 // ---- P2: pre-chequeo local S1 + request de validación ----
                 uint64_t now = nowMs();
@@ -528,6 +555,27 @@ int main()
                             cbState = 0; cbOpenUntil = 0;
                         }
                     }
+                }
+            }
+        }
+
+        // P7 (§3.7): recibir del nodo social (bans/permisos). La zona solo APLICA lo que el social decide.
+        {
+            uint8_t socBuf[8192];
+            int sv = tcp_social.receive(tcp_social.getSocketFD(), socBuf, sizeof(socBuf));
+            if (sv > 0)
+            {
+                DGS::Packet sp;
+                sp.setBuffer(socBuf, sv);
+                if (sp.getType() == DGS::PKT_ACCOUNT)
+                {
+                    auto a = sp.unpackAccountAction();
+                    if (a.action == DGS::ACC_BAN)
+                        bannedUntilMs[a.targetUuid] = a.durationS ? nowMs() + (uint64_t)a.durationS * 1000 : 0;
+                    else if (a.action == DGS::ACC_UNBAN)
+                        bannedUntilMs.erase(a.targetUuid);
+                    std::cout << "[ZoneNode] P7: ban/permisos de cuenta uuid=" << a.targetUuid
+                              << " action=" << (int)a.action << std::endl;
                 }
             }
         }

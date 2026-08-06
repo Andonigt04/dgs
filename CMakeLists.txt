@@ -38,8 +38,11 @@ target_link_libraries(persistance_node
 )
 
 add_executable(cache_node nodes/cache_node.cpp ${COMMON_SRCS})
+add_executable(social_node nodes/social_node.cpp ${COMMON_SRCS})   # §3.7 plano social/cuenta (P7)
 add_executable(validador_node nodes/validador_node.cpp ${COMMON_SRCS})
 target_link_libraries(validador_node ${CMAKE_DL_LIBS})   # dlopen del modulo de reglas por proyecto
+
+add_executable(dgs tools/dgs_cli.cpp)   # §3.8 (P8): instalador/deployer/CLI (run/install/up/status/logs)
 
 add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
 target_link_libraries(dgs_client httplib::httplib)
@@ -59,6 +62,10 @@ add_executable(ping_pong_test tests/ping_pong.cpp ${COMMON_SRCS})
 add_executable(thread_pool_test tests/thread_pool_test.cpp ${COMMON_SRCS})
 add_executable(logger_test tests/logger_test.cpp ${COMMON_SRCS})
 add_executable(wire_test tests/wire_test.cpp ${COMMON_SRCS})
+add_executable(robust_test tests/robust_test.cpp ${COMMON_SRCS})
+target_link_libraries(robust_test ${CMAKE_DL_LIBS})   # dlopen del módulo de reglas (determinismo)
+add_executable(spawn_parity_test tests/spawn_parity_test.cpp)   # §3.8 (P8): paridad de backends
+target_link_libraries(spawn_parity_test httplib::httplib)
 
 find_package(SFML 2.5 COMPONENTS graphics window system)
 if(SFML_FOUND)

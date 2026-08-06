@@ -265,6 +265,65 @@ namespace DGS
         uint32_t uuid;
         char     username[32];
         char     text[256];
+        uint8_t  channel;        // ChatChannel (§3.7): local/guild/trade/global
+        uint64_t seq;            // nº de orden en el canal (fan-out tipo GhostDelta, anti-replay)
+        uint32_t timestampMs;    // época del mensaje (rate-limit + moderación en el servicio de chat)
+    };
+
+    // §3.7: canal de chat. El `local` sí pasa por `zone_node` (interés espacial); el resto lo enruta el
+    // servicio de chat (head/nodo social) con fan-out por suscripción, no por proximidad.
+    enum ChatChannel : uint8_t
+    {
+        CHAT_LOCAL  = 0,   // interés espacial (zona dueña)
+        CHAT_GUILD  = 1,   // membresía de gremio (nodo social)
+        CHAT_TRADE  = 2,   // economía (rate-limit + moderación)
+        CHAT_GLOBAL = 3
+    };
+
+    // §3.7: tipo de delta social (guild/party). El estado es pequeño y viaja por EVENTOS a los miembros
+    // ONLINE (la UI se suscribe, no consulta). Fuente de verdad: persistance_node (MongoDB).
+    enum SocialKind : uint8_t
+    {
+        SOCIAL_GUILD_JOIN    = 0,   // targetUuid entra en scopeUuid (guildId)
+        SOCIAL_GUILD_LEAVE   = 1,   // targetUuid abandona
+        SOCIAL_GUILD_RANK    = 2,   // rango de targetUuid cambia (rank)
+        SOCIAL_GUILD_DISBAND = 3,   // se disuelve scopeUuid
+        SOCIAL_PARTY_JOIN    = 4,   // party de scopeUuid
+        SOCIAL_PARTY_LEAVE   = 5,
+        SOCIAL_FRIEND_ADD    = 6,   // relación entre targetUuid y scopeUuid
+        SOCIAL_FRIEND_REMOVE = 7,
+        SOCIAL_ZONE_UPDATE   = 8    // zoneId del miembro (para routing/estado)
+    };
+
+    // §3.7: delta de guild/party (PKT_SOCIAL_DELTA). Un solo nodo social escribe (regla 1 de §3.7:
+    // un solo dueño por tipo de dato); las zonas/head solo leen ids.
+    struct SocialDelta
+    {
+        uint32_t targetUuid;   // miembro afectado
+        uint32_t scopeUuid;    // guildId / partyId (0 = personal/amigos)
+        uint8_t  kind;         // SocialKind
+        uint8_t  rank;         // rango nuevo (SOCIAL_GUILD_RANK)
+        int32_t  zoneId;       // id de zona del miembro (SOCIAL_ZONE_UPDATE)
+        uint64_t seq;          // orden por canal/evento (anti-replay)
+    };
+
+    // §3.7: acciones de CUENTA (PKT_ACCOUNT): ban/permisos. El ban escalado de la sospecha se materializa
+    // aquí (validador → head → nodo social → todas las zonas lo ven: "uuid baneado" → bloquea entrada).
+    enum AccountActionKind : uint8_t
+    {
+        ACC_BAN      = 0,   // banear cuenta (opcional con duración)
+        ACC_UNBAN    = 1,   // levantar ban
+        ACC_SET_PERM = 2    // cambiar permisos
+    };
+
+    struct AccountAction
+    {
+        uint32_t actorUuid;    // quién ejecuta (admin/moderador, validado por permisos)
+        uint32_t targetUuid;   // cuenta afectada
+        uint8_t  action;       // AccountActionKind
+        uint32_t permFlags;    // permisos (ACC_SET_PERM)
+        uint32_t durationS;    // 0 = permanente (ACC_BAN)
+        char     reason[64];   // motivo (moderación/log)
     };
 
     struct LogEntry
