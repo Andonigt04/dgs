@@ -1,7 +1,7 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
 #include "include/dgs/types.h"
-#include "include/dgs/game_module.h"   // ABI del MÓDULO DE REGLAS por proyecto (dlopen)
+#include "include/dgs/game_module.h"   // ABI of the per-project RULES MODULE (dlopen)
 
 #include <sys/epoll.h>
 #include <cstring>
@@ -32,21 +32,21 @@ static uint64_t nowMs()
 }
 
 // ------------------------------------------------------------------------------------------------
-// MÓDULO DE REGLAS del PROYECTO (cargado en caliente). El DGS es GENÉRICO: NO conoce la física ni las
-// estructuras del juego (inventario, casting, edición de mundo) — solo transporta bytes y DELEGA la
-// semántica en el módulo, que el proyecto entrega como .so (mismo código que el cliente usa para
-// predecir). Aquí solo el verbo de MOVIMIENTO; los demás (validateAction, ...) crecen sobre el mismo
-// contrato sin tocar este nodo. Si no hay módulo, se usa el `validate()` histórico como fallback.
-static const DGS::GameModule* g_module = nullptr;   // null → fallback genérico
-static DGS::WorldQuery        g_wq{};               // estado de mundo de solo-lectura para el módulo
-static DGS::ZoneHandle        g_zone = nullptr;     // v4: zona creada por el módulo (estado autoritativo)
+// The PROJECT's RULES MODULE (hot-loaded). The DGS is GENERIC: it knows neither the physics nor the
+// game's structures (inventory, casting, world editing) — it only carries bytes and DELEGATES the
+// semantics to the module, which the project ships as a .so (the same code the client uses to
+// predict). Only the MOVEMENT verb here; the rest (validateAction, …) grow on the same contract
+// without touching this node. With no module the historical `validate()` is used as a fallback.
+static const DGS::GameModule* g_module = nullptr;   // null → generic fallback
+static DGS::WorldQuery        g_wq{};               // read-only world state for the module
+static DGS::ZoneHandle        g_zone = nullptr;     // v4: zone created by the module (authoritative state)
 
 // ------------------------------------------------------------------------------------------------
-// Contención de crashes del módulo (§3.5). El .so del proyecto es código de terceros: un SIGSEGV dentro
-// de validateMove/step mataría el nodo entero. Guard: la llamada al módulo se envuelve en sigsetjmp; el
-// manejador de señales fatales, si la señal cae DENTRO del módulo (g_inModule), hace siglongjmp de vuelta
-// → el proceso sigue vivo y el módulo queda marcado como SOSPECHOSO (fallback genérico desde entonces).
-// Las señales fuera del módulo se re-lanzan con el comportamiento por defecto (crash real).
+// Module crash containment (§3.5). The project's .so is third-party code: a SIGSEGV inside
+// validateMove/step would kill the whole node. Guard: the call into the module is wrapped in
+// sigsetjmp; the fatal-signal handler, if the signal lands INSIDE the module (g_inModule),
+// siglongjmps back → the process stays alive and the module is marked SUSPECT (generic fallback from
+// then on). Signals outside the module are re-raised with the default behaviour (a real crash).
 static sigjmp_buf              g_sigJmp;
 static volatile sig_atomic_t   g_inModule = 0;
 static std::atomic<bool>       g_moduleSuspicious{false};
@@ -81,7 +81,7 @@ static void installCrashGuard()
     sigaction(SIGILL,  &sa, nullptr);
 }
 
-// Llama a g_module->validateMove bajo el crash-guard. Devuelve true = movimiento legal.
+// Calls g_module->validateMove under the crash guard. Returns true = legal movement.
 static bool moduleValidateMove(const DGS::MoveSample* s)
 {
     if (sigsetjmp(g_sigJmp, 1) == 0)
@@ -91,11 +91,11 @@ static bool moduleValidateMove(const DGS::MoveSample* s)
         g_inModule = 0;
         return r != 0;
     }
-    std::cout << "[Validador] CRASH del modulo de reglas -> sospechoso, fallback generico" << std::endl;
-    return false;   // conservador: el movimiento se descarta
+    std::cout << "[Validator] CRASH in the rules module -> suspect, generic fallback" << std::endl;
+    return false;   // conservative: the movement is discarded
 }
 
-// Fallback GENÉRICO histórico: solo velocidad/teleport (sin terreno; el DGS no conoce el mundo).
+// Historical GENERIC fallback: speed/teleport only (no terrain; the DGS does not know the world).
 static bool validateFallback(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
 {
     float dt = (nowMs() - last.timestamp_ms) / 1000.0f;
@@ -110,9 +110,9 @@ static bool validateFallback(const DGS::EntityTransfer& e, const LastKnown& last
     return distSq <= (maxDist * maxDist);
 }
 
-// Valida un REQUEST (P2): la zona dueña envió su estado PREDICHO + la afirmación del cliente. El
-// validador usa el MISMO camino que UDP/TCP (módulo del proyecto o fallback genérico) para emitir el
-// veredicto. Devuelve true = movimiento legal.
+// Validates a REQUEST (P2): the owning zone sent its PREDICTED state plus the client's claim. The
+// validator uses the SAME path as UDP/TCP (project module or generic fallback) to issue the verdict.
+// Returns true = legal movement.
 static bool validateMoveRequest(const DGS::ValidateRequest& r, float csX, float csY, float csZ)
 {
     if (!g_module || !g_module->validateMove || g_moduleSuspicious.load())
@@ -132,23 +132,24 @@ static bool validateMoveRequest(const DGS::ValidateRequest& r, float csX, float 
     return moduleValidateMove(&s);
 }
 
-// P7 (§2.3, §3.7): valida una ACCIÓN (kind=1, verbos críticos: destroy/place/ACT_TRANSFER). La economía
-// y los verbos destructivos son FAIL-CLOSED: sin módulo, módulo sospechoso o validateAction null → SE
-// RECHAZA (la economía jamás es cliente-autoritativa). Con módulo, el veredicto lo decide el proyecto
-// vía `validateAction` sobre el blob OPACO que viaja en `data[0..dataSize)` (el DGS no lo interpreta).
-// ACT_TRANSFER (economía de gremio) entra exactamente por aquí.
+// P7 (§2.3, §3.7): validates an ACTION (kind=1, critical verbs: destroy/place/ACT_TRANSFER). The
+// economy and the destructive verbs are FAIL-CLOSED: no module, a suspect module or a null
+// validateAction → REJECTED (the economy is never client-authoritative). With a module the verdict is
+// the project's, via `validateAction` over the OPAQUE blob carried in `data[0..dataSize)` (the DGS
+// does not interpret it). ACT_TRANSFER (guild economy) comes in through exactly this path.
 static bool validateActionRequest(const DGS::ValidateRequest& r)
 {
     if (!g_module || !g_module->validateAction || g_moduleSuspicious.load())
-        return false;   // fail-closed: sin veredicto → rechazar (banco de gremio, loot, trade)
+        return false;   // fail-closed: no verdict → reject (guild bank, loot, trade)
 
-    // Blob opaco de la acción (ActionHeader + payload del juego) transportado en data[].
+    // Opaque action blob (ActionHeader + the game's payload) carried in data[].
     return g_module->validateAction(g_zone, (uint32_t)r.entityUuid,
                                     r.entity.data, r.entity.dataSize, &g_wq) == 1;
 }
 
-// Punto ÚNICO de validación de movimiento: si hay módulo del proyecto, arma el MoveSample y delega en
-// él (mismas reglas que el cliente); si no, cae al fallback genérico. Devuelve true = movimiento legal.
+// The SINGLE point of movement validation: if the project module is present, it builds the MoveSample
+// and delegates to it (the same rules as the client); otherwise it falls back to the generic path.
+// Returns true = legal movement.
 static bool validateMoveDGS(const DGS::EntityTransfer& e, const LastKnown& last, float csX, float csY, float csZ)
 {
     if (!g_module || !g_module->validateMove || g_moduleSuspicious.load())
@@ -164,15 +165,15 @@ static bool validateMoveDGS(const DGS::EntityTransfer& e, const LastKnown& last,
     return moduleValidateMove(&s);
 }
 
-// Carga el módulo del proyecto (GAME_MODULE_SO, def. "libharuka_rules.so") y prepara el WorldQuery.
-// El planeta (para el anti-noclip) solo se activa si el operador lo provisiona por entorno — mientras
-// el head-server no lo propague, g_wq.planetRadius=0 y el módulo valida SOLO velocidad (como el
-// fallback). El chunkSize sí viene siempre en el Command inicial.
+// Loads the project's module (GAME_MODULE_SO, default "libharuka_rules.so") and prepares the
+// WorldQuery. The planet (for anti-noclip) is only enabled if the operator provisions it through the
+// environment — while the head server does not propagate it, g_wq.planetRadius = 0 and the module
+// validates SPEED ONLY (like the fallback). chunkSize does always arrive in the initial Command.
 static void loadGameModule(float csX, float csY, float csZ)
 {
     g_wq = DGS::WorldQuery{};
     g_wq.chunkSizeX = csX; g_wq.chunkSizeY = csY; g_wq.chunkSizeZ = csZ;
-    // Planeta OPCIONAL por entorno (pruebas locales del anti-noclip). Requiere pos GLOBAL en metros.
+    // OPTIONAL planet from the environment (local anti-noclip testing). Needs GLOBAL position in metres.
     if (const char* r = std::getenv("GAME_PLANET_RADIUS")) {
         g_wq.planetRadius    = std::atof(r);
         g_wq.seed            = (uint32_t)std::atol(std::getenv("GAME_SEED")            ? std::getenv("GAME_SEED")            : "0");
@@ -182,44 +183,53 @@ static void loadGameModule(float csX, float csY, float csZ)
 
     const char* so = std::getenv("GAME_MODULE_SO") ? std::getenv("GAME_MODULE_SO") : "libharuka_rules.so";
     void* h = dlopen(so, RTLD_NOW);
-    if (!h) { std::cout << "[Validador] sin modulo de reglas (" << so << "): " << dlerror()
+    if (!h) { std::cout << "[Validator] no rules module (" << so << "): " << dlerror()
                         << " -> fallback generico" << std::endl; return; }
 
     auto entry = (const DGS::GameModule* (*)())dlsym(h, "dgs_game_module_v1");
-    if (!entry) { std::cout << "[Validador] " << so << " sin dgs_game_module_v1 -> fallback" << std::endl; dlclose(h); return; }
+    if (!entry) { std::cout << "[Validator] " << so << " has no dgs_game_module_v1 -> fallback" << std::endl; dlclose(h); return; }
 
     const DGS::GameModule* m = entry();
     if (!m || m->abiVersion != DGS::GAME_MODULE_ABI) {
-        std::cout << "[Validador] ABI del modulo != " << DGS::GAME_MODULE_ABI << " -> fallback" << std::endl;
+        std::cout << "[Validator] module ABI != " << DGS::GAME_MODULE_ABI << " -> fallback" << std::endl;
         dlclose(h); return;
     }
-    g_module = m;   // el .so queda cargado toda la vida del proceso (no dlclose)
+    g_module = m;   // the .so stays loaded for the life of the process (no dlclose)
 
-    // v4: crear la zona del módulo (estado autoritativo por zona, no globals). Si el módulo NO expone
-    // createZone (módulo v4 incompleto/corrupto), no lo usamos para validar → fallback genérico.
+    // v4: create the module's zone (authoritative state per zone, not globals). If the module does NOT
+    // expose createZone (an incomplete/corrupt v4 module) we do not use it to validate → generic fallback.
     if (m->createZone)
     {
         g_zone = m->createZone(&g_wq);
         if (!g_zone)
         {
-            std::cout << "[Validador] createZone devolvio null -> fallback generico" << std::endl;
+            std::cout << "[Validator] createZone returned null -> generic fallback" << std::endl;
             g_module = nullptr;
             return;
         }
     }
     else
     {
-        std::cout << "[Validador] modulo sin createZone (v4 incompleto) -> fallback generico" << std::endl;
+        std::cout << "[Validator] module has no createZone (incomplete v4) -> generic fallback" << std::endl;
         g_module = nullptr;
         return;
     }
 
-    std::cout << "[Validador] modulo de reglas '" << (m->name ? m->name : "?") << "' ABI=" << m->abiVersion
-              << (g_wq.planetRadius > 1.0 ? " (con terreno)" : " (solo velocidad)") << std::endl;
+    std::cout << "[Validator] rules module '" << (m->name ? m->name : "?") << "' ABI=" << m->abiVersion
+              << (g_wq.planetRadius > 1.0 ? " (with terrain)" : " (speed only)") << std::endl;
 }
 
 int main()
 {
+    // ⚠️ A NODE MUST NOT DIE BECAUSE A PEER HUNG UP. Writing to a socket whose other end has closed
+    // raises SIGPIPE, and its default action is to KILL the process. No node installed this, and the
+    // whole suite stayed green anyway: every test calls `signal(SIGPIPE, SIG_IGN)` before `fork()`, and
+    // a child INHERITS an ignored disposition — so under CTest the nodes survived, and started from a
+    // shell, systemd, Docker or `dgs run` they died the first time a peer disconnected.
+    // Measured with the same binary and the same environment: parent ignoring SIGPIPE -> ran the full
+    // 6 s; ordinary parent -> exit 141 (128 + SIGPIPE) within seconds of the head closing.
+    // A closed peer is an ordinary event: `send` returns EPIPE and the reconnect paths handle it.
+    std::signal(SIGPIPE, SIG_IGN);
     DGS::UDPSocket udpSocket;
     DGS::TCPSocket tcpSocket;
     DGS::TCPSocket headServer;
@@ -232,14 +242,19 @@ int main()
     const char* persHost     = std::getenv("PERSISTENCE_HOST")               ? std::getenv("PERSISTENCE_HOST")               : "persistence";
     int         persPort     = std::atoi(std::getenv("PERSISTENCE_PORT")     ? std::getenv("PERSISTENCE_PORT")     : "42429");
 
-    if (!udpSocket.bind(udpPort))           { std::cerr << "[Validador] Error UDP:"  << udpPort  << std::endl; return 1; }
-    if (!tcpSocket.listen(tcpPort))         { std::cerr << "[Validador] Error TCP:"  << tcpPort  << std::endl; return 1; }
-    if (!headServer.connect(headHost, headPort))  { std::cerr << "[Validador] Error conectando HeadServer" << std::endl; return 1; }
-    if (!persistence.connect(persHost, persPort)) { std::cerr << "[Validador] Error conectando Persistence" << std::endl; return 1; }
+    // Threshold for the minimum-dt discard (see the block in the UDP path). Configurable because it
+    // depends on the client's cadence: it has to sit comfortably below it.
+    const uint64_t minDtMs = (uint64_t)std::atoi(std::getenv("VALIDADOR_MIN_DT_MS")
+                                                 ? std::getenv("VALIDADOR_MIN_DT_MS") : "5");
+
+    if (!udpSocket.bind(udpPort))           { std::cerr << "[Validator] UDP error on port "  << udpPort  << std::endl; return 1; }
+    if (!tcpSocket.listen(tcpPort))         { std::cerr << "[Validator] TCP error on port "  << tcpPort  << std::endl; return 1; }
+    if (!headServer.connect(headHost, headPort))  { std::cerr << "[Validator] Failed to connect to HeadServer" << std::endl; return 1; }
+    if (!persistence.connect(persHost, persPort)) { std::cerr << "[Validator] Failed to connect to Persistence" << std::endl; return 1; }
 
     uint8_t cmdBuf[512];
     int cmdBytes = headServer.receive(headServer.getSocketFD(), cmdBuf, sizeof(cmdBuf));
-    if (cmdBytes <= 0) { std::cerr << "[Validador] No se recibio Command inicial" << std::endl; return 1; }
+    if (cmdBytes <= 0) { std::cerr << "[Validator] No initial Command received" << std::endl; return 1; }
 
     DGS::Packet cmdPacket;
     cmdPacket.setBuffer(cmdBuf, cmdBytes);
@@ -249,11 +264,11 @@ int main()
     float csY = cmd.chunkSizeY;
     float csZ = cmd.chunkSizeZ;
 
-    std::cout << "[Validador] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") km" << std::endl;
-    std::cout << "[Validador] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
+    std::cout << "[Validator] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") m" << std::endl;
+    std::cout << "[Validator] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
 
-    installCrashGuard();                  // contención de crashes del .so (§3.5)
-    loadGameModule(csX, csY, csZ);        // reglas del proyecto (mismo código que el cliente) o fallback
+    installCrashGuard();                  // crash containment for the .so (§3.5)
+    loadGameModule(csX, csY, csZ);        // the project's rules (same code as the client) or fallback
 
     int epollFD = epoll_create1(0);
     epoll_event ev;
@@ -287,10 +302,32 @@ int main()
                 std::memcpy(&e, buffer, sizeof(e));
 
                 auto it = lastKnown.find(e.uuid);
-                if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
+                if (it != lastKnown.end())
                 {
-                    std::cout << "[Validador] VIOLATION detectada (UDP) uuid=" << e.uuid << std::endl;
-                    continue;
+                    // ⚠️ MINIMUM-dt DISCARD — the defence against UDP REORDERING.
+                    //
+                    // UDP reorders routinely on the real internet. When an old sample arrives AFTER a
+                    // newer one it carries a large distance and a near-zero `dt`: exactly the signature
+                    // of a teleport. Measured through a degrading proxy (`net_degraded`), that produced
+                    // **13 false violations out of 14 reordering events** — an honest player on a bad
+                    // route accused of cheating, one by one.
+                    //
+                    // The sample is neither judged NOR used to update the baseline. Both halves matter:
+                    //   · not judging it removes the false positive;
+                    //   · not updating `lastKnown` denies a cheater any benefit — their state does not
+                    //     advance, so their next sample is measured against the GOOD baseline.
+                    // Which means flooding with back-to-back samples buys no distance: it throws it away.
+                    //
+                    // The threshold sits WELL below any real cadence (20 Hz = 50 ms, 100 Hz = 10 ms)
+                    // so legitimate traffic is never discarded.
+                    const uint64_t dtMs = nowMs() - it->second.timestamp_ms;
+                    if (dtMs < minDtMs) continue;
+
+                    if (!validateMoveDGS(e, it->second, csX, csY, csZ))
+                    {
+                        std::cout << "[Validator] VIOLATION detected (UDP) uuid=" << e.uuid << std::endl;
+                        continue;
+                    }
                 }
 
                 lastKnown[e.uuid] = {
@@ -308,7 +345,7 @@ int main()
                 cacheFDs.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[Validador] Cache conectado FD=" << newFD << std::endl;
+                std::cout << "[Validator] Cache connected FD=" << newFD << std::endl;
             }
             else if (cacheFDs.count(fd))
             {
@@ -327,21 +364,22 @@ int main()
 
                 if (p.getType() == DGS::PKT_VALIDATE_REQ)
                 {
-                    // P2: request-ack de las zonas (ownerZone predice, validador queda de árbitro).
+                    // P2: request-ack from the zones (ownerZone predicts, the validator arbitrates).
                     DGS::ValidateRequest req = p.unpackValidateRequest();
-                    // kind=0 movimiento → validateMove; kind=1 acción (destroy/place/ACT_TRANSFER) →
-                    // validateAction con FAIL-CLOSED (P7 §2.3/§3.7): sin veredicto del módulo se rechaza.
+                    // kind=0 movement → validateMove; kind=1 action (destroy/place/ACT_TRANSFER) →
+                    // validateAction, FAIL-CLOSED (P7 §2.3/§3.7): with no verdict from the module it is
+                    // rejected.
                     bool ok = (req.kind == 0) ? validateMoveRequest(req, csX, csY, csZ)
                                               : validateActionRequest(req);
 
                     DGS::ValidateAck ack{};
                     ack.requestId = req.requestId;
                     ack.verdict   = ok ? 1 : 0;
-                    // weight: intensidad de la sospecha (solo si es violación)
+                    // weight: intensity of the suspicion (only when it is a violation)
                     ack.weight    = ok ? 0 : 1;
                     if (!ok)
                     {
-                        std::cout << "[Validador] VIOLATION detectada (REQ) uuid=" << req.entityUuid
+                        std::cout << "[Validator] VIOLATION detected (REQ) uuid=" << req.entityUuid
                                   << " zone=" << req.ownerZone << " kind=" << (int)req.kind << std::endl;
                     }
                     DGS::Packet ackPacket;
@@ -355,7 +393,7 @@ int main()
                 auto it = lastKnown.find(e.uuid);
                 if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))
                 {
-                    std::cout << "[Validador] VIOLATION detectada (TCP) uuid=" << e.uuid << std::endl;
+                    std::cout << "[Validator] VIOLATION detected (TCP) uuid=" << e.uuid << std::endl;
                     continue;
                 }
 

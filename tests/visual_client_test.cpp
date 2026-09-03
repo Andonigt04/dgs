@@ -7,18 +7,18 @@
 int main() {
     sf::RenderWindow window(sf::VideoMode(800, 600), "DGS Engine Stress Test");
     
-    // Configuración inicial
-    float currentSpeed = 200.0f; // Unidades por segundo
+    // Initial configuration
+    float currentSpeed = 200.0f; // units per second
     DGS::EntityTransfer entity{};
     entity.uuid = 1001;
     entity.stats.speed[0] = currentSpeed;
 
-    // 1. Conexión inicial al HeadServer
+    // 1. Initial connection to the HeadServer
     DGS::TCPSocket head;
     bool connected = head.connect("127.0.0.1", 42424);
-    if (!connected) std::cerr << "[VisualTest] Sin conexion a HeadServer, modo offline" << std::endl;
+    if (!connected) std::cerr << "[VisualTest] No connection to HeadServer, offline mode" << std::endl;
 
-    // 2. Simulación de bucle
+    // 2. Loop simulation
     sf::Clock deltaClock;
     sf::CircleShape visualPlayer(10.f);
     visualPlayer.setFillColor(sf::Color::Cyan);
@@ -30,7 +30,7 @@ int main() {
             if (event.type == sf::Event::Closed) window.close();
         }
 
-        // --- LÓGICA DE TEST (CHEATS) ---
+        // --- TEST LOGIC (CHEATS) ---
         float speedMultiplier = 1.0f;
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::E)) {
             speedMultiplier = 10.0f; // SPEED HACK ACTIVADO
@@ -48,8 +48,8 @@ int main() {
 
         visualPlayer.move(mov * currentSpeed * speedMultiplier * dt);
 
-        // --- ENVIAR AL MOTOR PARA VALIDACIÓN ---
-        // Preparamos el paquete de la entidad
+        // --- SEND TO THE ENGINE FOR VALIDATION ---
+        // Prepare the entity packet
         entity.pos[0] = visualPlayer.getPosition().x;
         entity.pos[1] = visualPlayer.getPosition().y;
         

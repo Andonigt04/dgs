@@ -2,15 +2,15 @@
 #define DGS_GAME_MODULE_H
 
 // ================================================================================================
-// ABI ESTABLE entre el HOST del DGS (que hace dlopen) y el MÓDULO DE REGLAS por proyecto (.so).
+// STABLE ABI between the DGS HOST (which dlopens) and the per-project RULES MODULE (.so).
 //
-// Objetivo (ver docs PLAN_DGS_ANTICHEAT del juego): el DGS es GENÉRICO y NO se toca por juego. Cada
-// proyecto entrega su lib<proyecto>_rules.so que exporta `dgs_game_module_v1()`; el DGS delega en él
-// TODA la semántica de juego (física, casting, qué se mueve, edición de mundo). El mismo código se
-// compila estático en el CLIENTE (predicción) y como .so para el DGS (validación) → mismas reglas.
+// Goal (see the game's PLAN_DGS_ANTICHEAT docs): the DGS is GENERIC and is never edited per game.
+// Each project ships its lib<project>_rules.so exporting `dgs_game_module_v1()`; the DGS delegates
+// ALL game semantics to it (physics, casting, what moves, world editing). The same code is compiled
+// statically into the CLIENT (prediction) and as a .so for the DGS (validation) → identical rules.
 //
-// Versionado: si se rompe el ABI, se añade `dgs_game_module_v2()` (símbolo nuevo); el core NO se edita.
-// F0: solo validateMove (replica el validate() histórico). F1+: validateAction, step, serialize...
+// Versioning: if the ABI breaks, add `dgs_game_module_v2()` (a new symbol); the core is NOT edited.
+// F0: validateMove only (replicating the historical validate()). F1+: validateAction, step, serialize…
 // ================================================================================================
 #include "include/dgs/types.h"
 #include <cstdint>
@@ -18,143 +18,146 @@
 
 namespace DGS
 {
-    static constexpr uint32_t GAME_MODULE_ABI = 4;   // v4: módulo POR ZONA (ciclo de vida + traspaso)
+    static constexpr uint32_t GAME_MODULE_ABI = 4;   // v4: module PER ZONE (lifecycle + handoff)
 
-    // Estado de mundo de SOLO-LECTURA que el host presta al módulo (vive toda la sesión).
+    // READ-ONLY world state the host lends to the module (lives for the whole session).
     struct WorldQuery
     {
-        float chunkSizeX, chunkSizeY, chunkSizeZ;   // km — para des-cuantizar la posición global
+        // ⚠️ METRES, despite the historical "km" in this comment. The unit is the one the host passes
+        // in `Command::chunkSize*`, and everything downstream de-quantises the global position with it.
+        float chunkSizeX, chunkSizeY, chunkSizeZ;
 
-        // PLANETA ACTIVO — para validar el movimiento contra el TERRENO (no atravesar el suelo,
-        // no volar). El host lo rellena con su mundo. El módulo reconstruye los WorldGenParams del
-        // `seed` y muestrea el terreno ANALÍTICO (mismo sampler CPU en cliente y servidor → sin GL,
-        // determinista). Todo en METROS, mismas unidades que la posición global.
-        double   planetCenter[3];   // centro del planeta (m)
-        double   planetRadius;      // radio = nivel del mar (m)
-        uint32_t seed;              // semilla del mundo (deriveWorldParams)
-        float    reliefStrength;    // parámetro de escena
+        // ACTIVE PLANET — for validating movement against the TERRAIN (no walking through the ground,
+        // no flying). The host fills this in from its world. The module rebuilds the WorldGenParams
+        // from `seed` and samples the ANALYTIC terrain (same CPU sampler on client and server → no GL,
+        // deterministic). All in METRES, the same units as the global position.
+        double   planetCenter[3];   // planet centre (m)
+        double   planetRadius;      // radius = sea level (m)
+        uint32_t seed;              // world seed (deriveWorldParams)
+        float    reliefStrength;    // scene parameter
         int32_t  profile;           // 0 terran · 1 moon · 2 gas
-        // F1+: getEntity(uuid), reloj de mundo (mareas/viento)...
+        // F1+: getEntity(uuid), world clock (tides/wind)…
     };
 
-    // Una muestra de movimiento a validar: estado NUEVO reportado vs último punto conocido.
+    // One movement sample to validate: the NEW reported state vs the last known point.
     struct MoveSample
     {
-        const EntityTransfer* now;      // lo que el cliente afirma AHORA
-        float lastGX, lastGY, lastGZ;   // último punto GLOBAL conocido (m)
-        float maxSpeed;                 // m/s permitidos (clase/estado)
-        float dtSeconds;                // s desde el último punto (lo mide el host)
+        const EntityTransfer* now;      // what the client claims RIGHT NOW
+        float lastGX, lastGY, lastGZ;   // last known GLOBAL point (m)
+        float maxSpeed;                 // m/s allowed (class/state)
+        float dtSeconds;                // s since the last point (measured by the host)
     };
 
-    // Verbos GENÉRICOS de acción. El módulo por defecto del motor entiende este encabezado (común a
-    // muchos juegos); un proyecto puede ignorarlo y leer su propio formato del MISMO blob. El DGS NUNCA
-    // mira dentro: para él la acción es opaca — solo la transporta y delega el veredicto en el módulo.
+    // GENERIC action verbs. The engine's default module understands this header (common to many
+    // games); a project may ignore it and read its own format from the SAME blob. The DGS NEVER looks
+    // inside: to it the action is opaque — it only carries it and delegates the verdict to the module.
     enum ActionVerb : uint16_t
     {
         ACT_NONE     = 0,
-        ACT_DAMAGE   = 1,   // quitar vida a un target
-        ACT_DESTROY  = 2,   // destruir un objeto / estructura / ladrillo
-        ACT_TRANSFER = 3,   // mover ítem entre inventarios (qué/estructura = opaco, tras el header)
-        ACT_INTERACT = 4,   // uso/activación genérica
-        ACT_PLACE    = 5,   // COLOCAR una pieza de construcción (payload: PlaceAction, ver abajo)
+        ACT_DAMAGE   = 1,   // take health off a target
+        ACT_DESTROY  = 2,   // destroy an object / structure / brick
+        ACT_TRANSFER = 3,   // move an item between inventories (what/structure = opaque, after the header)
+        ACT_INTERACT = 4,   // generic use/activation
+        ACT_PLACE    = 5,   // PLACE a building piece (payload: PlaceAction, see below)
         ACT__COUNT
     };
 
-    // Encabezado que abre el blob de una acción. Lo que sigue (payload específico del juego: qué ítem,
-    // qué hechizo, layout del inventario) es OPACO para el módulo por defecto — lo lee el del proyecto.
+    // The header that opens an action blob. What follows (game-specific payload: which item, which
+    // spell, inventory layout) is OPAQUE to the default module — the project's module reads it.
     struct ActionHeader
     {
         uint16_t verb;        // ActionVerb
-        uint16_t flags;       // reservado (0 por ahora)
-        uint64_t target;      // uuid objetivo (0 = ninguno)
-        float    at[3];       // punto de la acción (m, GLOBAL) — para validar alcance en F+
-        float    amount;      // cantidad (daño / nº de ítems) — debe ser finita y >= 0
+        uint16_t flags;       // reserved (0 for now)
+        uint64_t target;      // target uuid (0 = none)
+        float    at[3];       // point of the action (m, GLOBAL) — for range checks in F+
+        float    amount;      // quantity (damage / item count) — must be finite and >= 0
     };
 
-    // Payload de ACT_PLACE, JUSTO DETRAS del ActionHeader. A diferencia del resto de payloads —opacos
-    // para el modulo por defecto— este SI lo entiende el motor: colocar es un verbo del ENGINE
-    // (HarukaConstruction), no de un juego concreto, y validarlo es GEOMETRIA pura. Asi el servidor
-    // decide con EL MISMO codigo que el cliente usa para su prediccion: nada de reimplementar reglas.
+    // ACT_PLACE payload, RIGHT BEHIND the ActionHeader. Unlike every other payload — opaque to the
+    // default module — the engine DOES understand this one: placing is an ENGINE verb
+    // (HarukaConstruction), not a per-game one, and validating it is pure GEOMETRY. That way the server
+    // decides with THE SAME code the client uses for its prediction: no reimplementing rules.
     struct PlaceAction
     {
-        uint16_t typeId;      // tipo de pieza en el catalogo (el mismo id estable que usa el cliente)
+        uint16_t typeId;      // piece type in the catalogue (the same stable id the client uses)
         uint16_t pad;
-        double   pos[3];      // centro de la pieza (m, GLOBAL)
-        double   quat[4];     // orientacion (x,y,z,w)
+        double   pos[3];      // centre of the piece (m, GLOBAL)
+        double   quat[4];     // orientation (x, y, z, w)
     };
 
-    // Descripción de un TIPO de pieza construible. El servidor no puede validar una colocación sin
-    // saber qué TAMAÑO tiene la pieza (sin eso no hay solape que comprobar), así que el catálogo tiene
-    // que viajar: el host lo envía UNA vez al cargar el mundo y el módulo valida con las medidas REALES,
-    // las mismas que el cliente. Es dato estático del mundo, no por-acción.
+    // Description of a buildable piece TYPE. The server cannot validate a placement without knowing how
+    // BIG the piece is (with no size there is no overlap to check), so the catalogue has to travel: the
+    // host sends it ONCE when loading the world and the module validates against the REAL measurements,
+    // the same ones the client uses. It is static world data, not per-action.
     struct PieceDesc
     {
-        uint16_t typeId;      // id estable del tipo (el cliente lo asigna por orden alfabético)
-        uint8_t  supports;    // bitmask: 1 = apoya en terreno, 2 = apoya en otra pieza
-        uint8_t  needsFlat;   // 1 = exige suelo llano (cimentación)
-        float    half[3];     // semiejes de la pieza (m)
+        uint16_t typeId;      // stable type id (the client assigns it in alphabetical order)
+        uint8_t  supports;    // bitmask: 1 = rests on terrain, 2 = rests on another piece
+        uint8_t  needsFlat;   // 1 = requires flat ground (foundation)
+        float    half[3];     // half-extents of the piece (m)
     };
 
-    // Una ZONA = la porción del mundo que sirve UN nodo del DGS. Es un puntero opaco creado por el
-    // módulo: el host no mira dentro. Todo el estado autoritativo (piezas colocadas, catálogo) vive
-    // colgando de la zona, NO en variables globales del módulo.
+    // A ZONE = the slice of world ONE DGS node serves. It is an opaque pointer created by the module:
+    // the host never looks inside. All authoritative state (placed pieces, catalogue) hangs off the
+    // zone, NOT off globals in the module.
     //
-    // POR QUÉ: con estado global, un nodo que sirviera dos zonas las mezclaría, no habría nada que
-    // "reasignar" al mover un trozo de escena a otro nodo, y el estado moriría en el `dlclose` sin orden
-    // ni posibilidad de liberarlo antes. Con zonas: crear, traspasar y destruir son operaciones normales.
+    // WHY: with global state a node serving two zones would mix them, there would be nothing to
+    // "reassign" when moving a chunk of scene to another node, and the state would die at `dlclose`
+    // with no ordering and no chance to release it earlier. With zones, creating, handing over and
+    // destroying are ordinary operations.
     typedef void* ZoneHandle;
 
-    // vtable del módulo. Un puntero de función NULO = "sin regla" → el host aplica su fallback genérico.
+    // The module's vtable. A NULL function pointer = "no rule" → the host applies its generic fallback.
     struct GameModule
     {
-        uint32_t    abiVersion;   // DEBE == GAME_MODULE_ABI o el host lo rechaza
-        const char* name;         // p.ej. "survival"
+        uint32_t    abiVersion;   // MUST == GAME_MODULE_ABI or the host rejects it
+        const char* name;         // e.g. "survival"
 
-        // --- CICLO DE VIDA de una zona ---------------------------------------------------------
-        // El host crea una zona al empezar a servir una región y la DESTRUYE al dejar de servirla
-        // (traspaso a otro nodo, apagado ordenado). Destruir es explícito a propósito: dejarlo al
-        // final del proceso es lo que produce liberaciones fuera de orden.
+        // --- ZONE LIFECYCLE --------------------------------------------------------------------
+        // The host creates a zone when it starts serving a region and DESTROYS it when it stops
+        // (handoff to another node, orderly shutdown). Destruction is explicit on purpose: leaving it
+        // to process exit is what produces out-of-order teardown.
         ZoneHandle (*createZone)(const WorldQuery* w);
         void       (*destroyZone)(ZoneHandle z);
 
-        // 1 = movimiento plausible/legal; 0 = cheat (el host descarta + escalará sospecha en F4).
+        // 1 = plausible/legal movement; 0 = cheat (the host discards it and escalates suspicion in F4).
         int (*validateMove)(ZoneHandle z, const MoveSample* s, const WorldQuery* w);
 
-        // 1 = acción admisible; 0 = rechazada. `blob`/`n` = bytes OPACOS (ActionHeader + payload del
-        // juego); `actor` = uuid que la ejecuta. El módulo por defecto valida invariantes SIN estado
-        // (verbo conocido, cantidad finita/no-negativa, tamaño mínimo) MÁS colocación (ACT_PLACE), que
-        // sí es geometría del motor. La semántica de juego la aporta el módulo del proyecto.
+        // 1 = action admissible; 0 = rejected. `blob`/`n` = OPAQUE bytes (ActionHeader + the game's
+        // payload); `actor` = the uuid performing it. The default module validates STATELESS invariants
+        // (known verb, finite/non-negative amount, minimum size) PLUS placement (ACT_PLACE), which is
+        // engine geometry. Game semantics come from the project's module.
         int (*validateAction)(ZoneHandle z, uint32_t actor, const uint8_t* blob, uint16_t n,
                               const WorldQuery* w);
 
-        // Catálogo de piezas construibles de esta zona. El host lo llama al crearla, antes de validar
-        // colocaciones: sin el tamaño de cada pieza no hay solape que comprobar.
+        // Catalogue of this zone's buildable pieces. The host calls it on creation, before validating
+        // any placement: without each piece's size there is no overlap to check.
         void (*setPieceCatalog)(ZoneHandle z, const PieceDesc* types, uint16_t n);
 
-        // --- TRASPASO de una región entre nodos ------------------------------------------------
-        // `serializeRegion` extrae el estado autoritativo dentro de una esfera (centro+radio) a un
-        // buffer; `mergeRegion` lo incorpora en otra zona. Con esas dos operaciones se resuelven los
-        // dos movimientos que necesita un mundo repartido:
-        //   · REASIGNAR un trozo de escena: serializar en el nodo A → mergear en B → A lo suelta.
-        //   · AMPLIAR una zona: mergear la región cedida por el vecino, sin recargar nada.
-        // Devuelve los bytes escritos, o los NECESARIOS si `cap` es insuficiente (llamar con out=nullptr
-        // para preguntar el tamaño). Formato versionado; el módulo es dueño de él.
+        // --- HANDING A REGION between nodes ----------------------------------------------------
+        // `serializeRegion` extracts the authoritative state inside a sphere (centre+radius) into a
+        // buffer; `mergeRegion` folds it into another zone. Those two operations cover the two moves a
+        // distributed world needs:
+        //   · REASSIGN a chunk of scene: serialise on node A → merge on B → A drops it.
+        //   · GROW a zone: merge the region the neighbour ceded, without reloading anything.
+        // Returns bytes written, or bytes NEEDED if `cap` is too small (call with out=nullptr to ask
+        // for the size). Versioned format; the module owns it.
         size_t (*serializeRegion)(ZoneHandle z, const double center[3], double radius,
                                   uint8_t* out, size_t cap);
         int    (*mergeRegion)(ZoneHandle z, const uint8_t* in, size_t n);
 
-        // `dropRegion` suelta lo que ya sirve otro nodo (el paso final de una reasignación).
+        // `dropRegion` releases what another node already serves (the last step of a reassignment).
         void   (*dropRegion)(ZoneHandle z, const double center[3], double radius);
 
-        // SIMULACIÓN (P4, §3.6): la ZONA DUEÑA ejecuta `step` a tick fijo sobre UNA entidad que posee
-        // (C4 del plan v2). Solo el nodo autoritativo avanza la entidad; los demás la proyectan como
-        // ghost. `dt` = tick en segundos. Null = la zona no simula (solo validación) y el mundo va por
-        // las actualizaciones del cliente.
+        // SIMULATION (P4, §3.6): the OWNING ZONE runs `step` at a fixed tick over ONE entity it owns
+        // (C4 of plan v2). Only the authoritative node advances the entity; the rest project it as a
+        // ghost. `dt` = tick in seconds. Null = the zone does not simulate (validation only) and the
+        // world advances from client updates.
         void   (*step)(ZoneHandle z, EntityTransfer* e, float dt, const WorldQuery* w);
     };
 }
 
-// CADA módulo exporta ESTE símbolo (C linkage → dlsym estable entre compiladores/versiones).
+// EVERY module exports THIS symbol (C linkage → dlsym stable across compilers/versions).
 extern "C" const DGS::GameModule* dgs_game_module_v1(void);
 
 #endif // DGS_GAME_MODULE_H

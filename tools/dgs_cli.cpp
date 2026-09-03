@@ -1,18 +1,18 @@
-// dgs — instalador/deployer y CLI del DGS (§3.8, P8).
+// dgs — the DGS installer/deployer and CLI (§3.8, P8).
 //
-// Un solo binario decide el modo:
-//   dgs run                  — portable: arranca el DGS standalone (todos los nodos locales, fork/exec)
-//                              desde donde esté, sin instalar nada. Backend de spawn LOCAL.
+// A single binary decides the mode:
+//   dgs run                  — portable: starts the DGS standalone (every node local, fork/exec) from
+//                              wherever it sits, installing nothing. LOCAL spawn backend.
 //   dgs install [--systemd]  — instala binarios en /opt/dgs y opcionalmente unidades systemd.
 //   dgs uninstall            — revierte `dgs install`.
-//   dgs up [--terraform]     — cluster: aplica k8s (o provisiona infra con terraform y luego k8s).
-//   dgs down                 — detiene el DGS (local: SIGTERM a los procesos; cluster: kubectl delete).
-//   dgs status               — muestra estado (funciona igual en los 3 modos).
-//   dgs logs [nodo]          — cola de logs del nodo (o de todos).
+//   dgs up [--terraform]     — cluster: applies k8s (or provisions infra with terraform, then k8s).
+//   dgs down                 — stops the DGS (local: SIGTERM to the processes; cluster: kubectl delete).
+//   dgs status               — shows status (works the same in all 3 modes).
+//   dgs logs [node]          — tails a node's logs (or all of them).
 //
-// Regla (§3.8): el comportamiento del DGS no depende del modo. El modo solo cambia el backend de spawn
-// y la infra. El orquestador usa el mismo enum SpawnBackend (orchestrator.h); aquí el CLI solo lanza
-// los procesos del standalone o delega en kubectl/terraform para el cluster.
+// Rule (§3.8): the DGS's behaviour does not depend on the mode. The mode only changes the spawn backend
+// and the infrastructure. The orchestrator uses the same SpawnBackend enum (orchestrator.h); here the
+// CLI only launches the standalone processes or delegates to kubectl/terraform for the cluster.
 
 #include <iostream>
 #include <string>
@@ -33,20 +33,20 @@ static const std::vector<std::string> NODOS =
     { "head_server_node", "persistance_node", "cache_node",
       "validador_node",   "social_node",      "zone_node" };
 
-// Puertos/roles para mensajes (solo informativo en el CLI).
+// Ports/roles for messages (informational only in the CLI).
 static const std::vector<std::string> NODO_PUERTO =
     { "TCP:42424", "TCP:42429", "TCP:42425/42426", "UDP:42427/TCP:42428", "TCP:42430", "UDP:42425" };
 
 static void usage()
 {
     std::cout << "uso: dgs <comando> [opciones]\n"
-              << "  run                    standalone portable (todos los nodos locales, sin instalar)\n"
+              << "  run                    portable standalone (every node local, nothing installed)\n"
               << "  install [--systemd]    instala binarios en " << INSTALL_DIR << " [+ unidades systemd]\n"
-              << "  uninstall              revierte la instalacion\n"
+              << "  uninstall              reverts the installation\n"
               << "  up [--terraform]       cluster: aplica k8s (y opcionalmente provisiona terraform)\n"
-              << "  down                   detiene el DGS (local o cluster)\n"
-              << "  status                 estado del DGS\n"
-              << "  logs [nodo]            logs de un nodo o de todos\n";
+              << "  down                   stops the DGS (local or cluster)\n"
+              << "  status                 DGS status\n"
+              << "  logs [node]            logs for one node or all of them\n";
 }
 
 // --- utilidades ----------------------------------------------------------------------------------
@@ -98,7 +98,7 @@ static int cmdRun(const std::vector<std::string>& args)
     std::string logDir  = envOr("DGS_LOG_DIR", "logs");
     mkdirP(logDir);
 
-    // Env compartido standalone: todos los nodos se ven entre sí en 127.0.0.1.
+    // Shared standalone env: every node sees the others on 127.0.0.1.
     std::string headHost = envOr("HEAD_SERVER_HOST", "127.0.0.1");
     std::string headPort = envOr("HEAD_SERVER_PORT", "42424");
     std::string persHost = envOr("PERSISTENCE_HOST", "127.0.0.1");
@@ -110,7 +110,7 @@ static int cmdRun(const std::vector<std::string>& args)
 
     std::cout << "[dgs] run: standalone en " << binDir << " (logs en " << logDir << ")" << std::endl;
 
-    // Orden: head primero (los demás se conectan), luego el resto; la zona base arranca al final.
+    // Order: head first (the others connect to it), then the rest; the base zone starts last.
     std::vector<std::string> orden = NODOS;   // head, persistance, cache, validador, social, zone
 
     signal(SIGINT, onSignal);
@@ -127,7 +127,7 @@ static int cmdRun(const std::vector<std::string>& args)
 
         if (pid == 0)
         {
-            // Hijo: redirige stdout/stderr al log y ejecuta el nodo.
+            // Child: redirects stdout/stderr to the log and runs the node.
             freopen(log.c_str(), "a", stdout);
             freopen(log.c_str(), "a", stderr);
             setenv("HEAD_SERVER_HOST", headHost.c_str(), 1);
@@ -140,14 +140,14 @@ static int cmdRun(const std::vector<std::string>& args)
             setenv("SOCIAL_TCP_PORT",  socialPort.c_str(), 1);
             setenv("MY_POD_IP", "127.0.0.1", 1);
             execl(path.c_str(), path.c_str(), (char*)nullptr);
-            std::cerr << "[dgs] no se pudo ejecutar " << path << std::endl;
+            std::cerr << "[dgs] could not execute " << path << std::endl;
             _exit(127);
         }
 
         g_children[g_nchildren++] = pid;
         std::cout << "[dgs] " << bin << " pid=" << pid << " " << NODO_PUERTO[i]
                   << "  log=" << log << std::endl;
-        usleep(300000);   // dar tiempo a que cada nodo bindee antes del siguiente (orden de conexiones)
+        usleep(300000);   // give each node time to bind before the next one (connection ordering)
     }
 
     std::cout << "[dgs] standalone arriba. Ctrl-C para detener." << std::endl;
@@ -157,7 +157,7 @@ static int cmdRun(const std::vector<std::string>& args)
         pid_t dead = waitpid(-1, &st, 0);
         if (dead > 0)
         {
-            std::cout << "[dgs] nodo " << dead << " termino (rc=" << st << ")" << std::endl;
+            std::cout << "[dgs] node " << dead << " exited (rc=" << st << ")" << std::endl;
             bool allDead = true;
             for (int i = 0; i < g_nchildren; ++i)
                 if (g_children[i] > 0 && g_children[i] != dead && kill(g_children[i], 0) == 0) allDead = false;
@@ -175,7 +175,7 @@ static int cmdInstall(const std::vector<std::string>& args)
     bool systemd = std::find(args.begin(), args.end(), "--systemd") != args.end();
     std::string binDir = envOr("DGS_BIN_DIR", ".");
 
-    if (!mkdirP(INSTALL_DIR + std::string("/bin"))) { std::cerr << "[dgs] no puedo crear " << INSTALL_DIR << std::endl; return 1; }
+    if (!mkdirP(INSTALL_DIR + std::string("/bin"))) { std::cerr << "[dgs] cannot create " << INSTALL_DIR << std::endl; return 1; }
 
     for (const auto& bin : NODOS)
     {
@@ -235,7 +235,7 @@ static int cmdUp(const std::vector<std::string>& args)
 
     if (terraform)
     {
-        std::cout << "[dgs] provisionando infra con terraform..." << std::endl;
+        std::cout << "[dgs] provisioning infrastructure with terraform..." << std::endl;
         runCmd("terraform -chdir=terraform init -input=false");
         runCmd("terraform -chdir=terraform apply -auto-approve");
     }
@@ -254,14 +254,14 @@ static int cmdUp(const std::vector<std::string>& args)
 
 static int cmdDown()
 {
-    // Local: si hay procesos del standalone (dgs run), se matan. Cluster: kubectl delete.
+    // Local: if standalone processes exist (dgs run), kill them. Cluster: kubectl delete.
     std::string pidfile = envOr("DGS_PIDFILE", "");
     (void)pidfile;
     for (const auto& bin : NODOS)
         runCmd("pkill -f " + bin + " 2>/dev/null || true");
     runCmd("kubectl delete -f k8s/zone-node -f k8s/head-server -f k8s/validador "
            "-f k8s/cache -f k8s/persistence -f k8s/mongodb --ignore-not-found 2>/dev/null || true");
-    std::cout << "[dgs] down: nodos locales detenidos / cluster eliminado." << std::endl;
+    std::cout << "[dgs] down: local nodes stopped / cluster deleted." << std::endl;
     return 0;
 }
 
@@ -270,7 +270,7 @@ static int cmdDown()
 static int cmdStatus()
 {
     bool haveKubectl = system("command -v kubectl >/dev/null 2>&1") == 0;
-    std::cout << "[dgs] estado:" << std::endl;
+    std::cout << "[dgs] status:" << std::endl;
 
     for (const auto& bin : NODOS)
     {
@@ -279,7 +279,7 @@ static int cmdStatus()
         std::string pid;
         if (fp) { char buf[64]; if (fgets(buf, sizeof(buf), fp)) pid = buf; pclose(fp); }
         std::cout << "  " << bin << ": "
-                  << (pid.empty() ? "no ejecutandose (local)" : "pid=" + pid);
+                  << (pid.empty() ? "not running (local)" : "pid=" + pid);
         std::cout << std::endl;
     }
 
@@ -314,6 +314,15 @@ static int cmdLogs(const std::vector<std::string>& args)
 
 int main(int argc, char** argv)
 {
+    // ⚠️ A NODE MUST NOT DIE BECAUSE A PEER HUNG UP. Writing to a socket whose other end has closed
+    // raises SIGPIPE, and its default action is to KILL the process. No node installed this, and the
+    // whole suite stayed green anyway: every test calls `signal(SIGPIPE, SIG_IGN)` before `fork()`, and
+    // a child INHERITS an ignored disposition — so under CTest the nodes survived, and started from a
+    // shell, systemd, Docker or `dgs run` they died the first time a peer disconnected.
+    // Measured with the same binary and the same environment: parent ignoring SIGPIPE -> ran the full
+    // 6 s; ordinary parent -> exit 141 (128 + SIGPIPE) within seconds of the head closing.
+    // A closed peer is an ordinary event: `send` returns EPIPE and the reconnect paths handle it.
+    std::signal(SIGPIPE, SIG_IGN);
     if (argc < 2) { usage(); return 1; }
     std::string cmd = argv[1];
     std::vector<std::string> args;

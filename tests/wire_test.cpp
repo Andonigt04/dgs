@@ -1,12 +1,12 @@
 // ================================================================================================
-// wire_test — round-trip de pack/unpack de TODOS los packets del DGS (P5, §4.3 del plan).
-// Para cada tipo: rellena campos, empaqueta, desempagueta y compara. Verifica también que el primer
-// byte (el PacketType) es el esperado. Los structs que llevan payload opaco (data[]) se rellenan con
-// un patrón reconocible para que una pérdida de bytes se note.
+// wire_test — pack/unpack round trip for EVERY DGS packet (P5, §4.3 of the plan).
+// For each type: fill the fields, pack, unpack and compare. It also verifies that the first byte (the
+// PacketType) is the expected one. Structs carrying an opaque payload (data[]) are filled with a
+// recognisable pattern so a loss of bytes shows up.
 //
-// Se enlaza contra src/packet.cpp (COMMON_SRCS) → valida el wire FORMAT REAL, no solo el layout.
-// Este test se añadió con §3.9 (PKT_DRAIN/PKT_DELETE_ZONE/PKT_ZONE_REGION) y cubre además todo lo
-// de P2/P3/P4 (Validate*, ValidatorStatus, EntityReassign).
+// Linked against src/packet.cpp (COMMON_SRCS) → it validates the REAL wire FORMAT, not just the layout.
+// This test was added along with §3.9 (PKT_DRAIN/PKT_DELETE_ZONE/PKT_ZONE_REGION) and additionally
+// covers everything from P2/P3/P4 (Validate*, ValidatorStatus, EntityReassign).
 // ================================================================================================
 #include "include/dgs/packet.h"
 #include "include/dgs/types.h"
@@ -25,7 +25,7 @@ static int g_checks   = 0;
 
 static uint8_t patternByte(uint32_t i) { return (uint8_t)(0x5A + (i & 0x3F)); }
 
-// rellena un EntityTransfer con un patrón determinista
+// fills an EntityTransfer with a deterministic pattern
 static void fillEntity(DGS::EntityTransfer& e, uint32_t uuid)
 {
     std::memset(&e, 0, sizeof(e));
@@ -56,7 +56,7 @@ static void roundTripEntity()
     CHECK(b.dataSize == a.dataSize, "EntityTransfer: dataSize");
     bool dataOk = b.dataSize == a.dataSize;
     for (uint32_t i = 0; dataOk && i < a.dataSize; i++) dataOk = (b.data[i] == patternByte(i));
-    CHECK(dataOk, "EntityTransfer: payload opaco íntegro");
+    CHECK(dataOk, "EntityTransfer: opaque payload intact");
 }
 
 static void roundTripCommand()
@@ -146,7 +146,7 @@ static void roundTripZoneList()
     for (int i = 0; i < a.count; i++)
         ok = ok && b.zones[i].chunkXMin == a.zones[i].chunkXMin &&
                   std::strcmp(b.zones[i].addr, a.zones[i].addr) == 0 && b.zones[i].port == a.zones[i].port;
-    CHECK(ok, "ZoneListResponse: zonas íntegras");
+    CHECK(ok, "ZoneListResponse: zones intact");
 }
 
 static void roundTripGhost()
@@ -170,7 +170,7 @@ static void roundTripGhost()
     CHECK(b.stats.speed[0] == a.stats.speed[0], "GhostDelta: stats");
     bool dataOk = b.dataSize == a.dataSize;
     for (uint16_t i = 0; dataOk && i < a.dataSize; i++) dataOk = (b.data[i] == patternByte(i));
-    CHECK(dataOk, "GhostDelta: payload opaco íntegro");
+    CHECK(dataOk, "GhostDelta: opaque payload intact");
 }
 
 static void roundTripChat()
@@ -188,7 +188,7 @@ static void roundTripChat()
     CHECK(b.uuid == a.uuid && std::strcmp(b.username, a.username) == 0 && std::strcmp(b.text, a.text) == 0,
           "ChatMessage: campos");
     CHECK(b.channel == a.channel && b.seq == a.seq && b.timestampMs == a.timestampMs,
-          "ChatMessage: canal/seq/época (§3.7)");
+          "ChatMessage: channel/seq/epoch (§3.7)");
 }
 
 static void roundTripSocial()
@@ -278,7 +278,7 @@ static void roundTripReassign()
 static void roundTripLifecycle()
 {
     DGS::ZoneLifecycle a{}, b{};
-    a.requestId = 4242; a.ack = 1;   // ack del nodo (DRAIN)
+    a.requestId = 4242; a.ack = 1;   // the node's ack (DRAIN)
     DGS::Packet p; p.pack(a);
     CHECK(p.getType() == DGS::PKT_DRAIN, "ZoneLifecycle(pack): primer byte = PKT_DRAIN");
     b = p.unpackZoneLifecycle();
@@ -308,7 +308,7 @@ static void roundTripZoneRegion()
     CHECK(b.srcZone == a.srcZone && b.size == a.size, "ZoneRegion: srcZone/size");
     bool ok = b.size == a.size;
     for (uint32_t i = 0; ok && i < a.size; i++) ok = (b.data[i] == patternByte(i));
-    CHECK(ok, "ZoneRegion: blob de región íntegro");
+    CHECK(ok, "ZoneRegion: region blob intact");
 }
 
 int main()
@@ -330,6 +330,6 @@ int main()
     roundTripLifecycle();
     roundTripZoneRegion();
 
-    std::printf("[wire_test] %d checks, %d fallos\n", g_checks, g_failures);
+    std::printf("[wire_test] %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -22,7 +22,9 @@ jobs:
 
       - name: Install mongocxx
         run: |
-          git clone --depth 1 --branch r3.10.1 https://github.com/mongodb/mongo-cxx-driver.git
+          # r3.11.0 is the version `persistance_node` and `persistence_e2e` were built and run
+          # against locally; CI should compile the same one, not a nearby guess.
+          git clone --depth 1 --branch r3.11.0 https://github.com/mongodb/mongo-cxx-driver.git
           cmake -S mongo-cxx-driver -B mongo-cxx-driver/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -36,21 +38,65 @@ jobs:
 
       - name: Build nodes
         run: |
+          # ⚠️ `social_node` is on this list ON PURPOSE: it was not, and so it went a long time
+          # WITHOUT BEING COMPILED and nobody noticed (`PKT_SOCIAL_DELTA`/`PKT_CHAT` unqualified).
+          # A target CI does not build rots in silence.
           cmake --build build -j$(nproc) --target \
-            head_server_node zone_node cache_node \
+            head_server_node zone_node cache_node social_node \
             validador_node persistance_node dgs_client
 
       - name: Build tests
         run: |
           cmake --build build -j$(nproc) --target \
-            ping_pong_test logger_test thread_pool_test wire_test
+            ping_pong_test logger_test thread_pool_test wire_test robust_test \
+            spawn_parity_test validator_e2e_test zone_e2e_test \
+            reconnect_e2e_test action_e2e_test ghost_e2e_test \
+            cache_e2e_test social_e2e_test persistence_e2e_test net_degraded_test \
+            zone_policy_e2e_test head_routing_e2e_test orchestrator_test client_e2e_test \
+            viewer_e2e_test \
+            stub_rules stub_rules_actions
 
+      # ⚠️ NO `|| true`. Three of the four tests used to run as `timeout 5 ... || true`, so their
+      # result was thrown away: `ping_pong_test` — the only real round trip against the server —
+      # could not fail the build even if it tried. And none of them checked anything: all three did
+      # `return 0` regardless. Rewritten to give a verdict, and now that verdict rules. The timeout
+      # lives in CTest (60 s), and `ping_pong_test` starts and kills the node itself.
       - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+  # The same tests, under ThreadSanitizer. It is a separate job rather than part of the main one
+  # because TSan shifts the timings enough that a failure here does not mean the same thing as there —
+  # and because an instrumented run takes several times longer.
+  #
+  # Verified before writing this, with a counter-proof: with `stop` written unsynchronised TSan reports
+  # `data race ... thread_pool.h:60 in workersLoop()`; with the write under the mutex, clean.
+  tsan:
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
-          timeout 5 ./build/ping_pong_test   || true
-          timeout 5 ./build/thread_pool_test || true
-          timeout 5 ./build/logger_test      || true
-          ./build/wire_test
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libssl-dev pkg-config
+
+      - name: Configure con ThreadSanitizer
+        run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DDGS_TSAN=ON
+
+      - name: Build
+        run: |
+          cmake --build build-tsan -j$(nproc) --target \
+            head_server_node validador_node stub_rules \
+            ping_pong_test logger_test thread_pool_test wire_test robust_test \
+            spawn_parity_test validator_e2e_test zone_e2e_test \
+            reconnect_e2e_test action_e2e_test ghost_e2e_test \
+            cache_e2e_test social_e2e_test net_degraded_test \
+            zone_policy_e2e_test head_routing_e2e_test stub_rules_actions
+
+      - name: Run tests bajo TSan
+        run: ctest --test-dir build-tsan --output-on-failure
 
   docker-build:
     runs-on: ubuntu-22.04

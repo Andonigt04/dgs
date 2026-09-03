@@ -6,12 +6,12 @@
 namespace DGS
 {
     static constexpr uint8_t  MAX_ZONES       = 16;
-    // Longitudes máx (véase §4.6 del plan): reemplaza los mágicos 16/4096.
-    static constexpr uint32_t MAX_ADDR_LEN    = 16;    // "255.255.255.255"+null. IPv6 → 46 (ver build HARUKA_USE_IPV6).
-    static constexpr uint32_t MAX_ENTITY_DATA = 4096;  // payload opaco máximo de una entidad.
-    static constexpr uint32_t MAX_PACKET_SIZE = 65536; // cap de datagrama/paquete (véase §4.6 bug 6 y network.h).
-    static constexpr uint64_t DEFAULT_LEASE_MS = 30000; // lease por defecto de una zona (véase §4.6 bug 1).
-    static constexpr uint32_t MAX_REGION_BYTES = 4096;   // blob de región en un PKT_ZONE_REGION (§3.9, cap transport)
+    // Max lengths (see §4.6 of the plan): replaces the magic 16/4096.
+    static constexpr uint32_t MAX_ADDR_LEN    = 16;    // "255.255.255.255"+null. IPv6 → 46 (see the HARUKA_USE_IPV6 build).
+    static constexpr uint32_t MAX_ENTITY_DATA = 4096;  // max opaque payload of one entity.
+    static constexpr uint32_t MAX_PACKET_SIZE = 65536; // datagram/packet cap (see §4.6 bug 6 and network.h).
+    static constexpr uint64_t DEFAULT_LEASE_MS = 30000; // default lease of a zone (see §4.6 bug 1).
+    static constexpr uint32_t MAX_REGION_BYTES = 4096;   // region blob inside a PKT_ZONE_REGION (§3.9, transport cap)
 
     enum PacketType : uint8_t
     {
@@ -24,16 +24,22 @@ namespace DGS
         PKT_ZONE_RESPONSE   = 6,
         PKT_ZONE_LIST       = 7,
         PKT_GHOST_DELTA     = 8,
-        // Nuevos packets del plan (PLAN_DGS_VALIDADOR): request/ack de validación + telemetría al master.
-        PKT_VALIDATE_REQ    = 9,   // zone_node → validador  (afirmación vs estado predicho, §2.2)
-        PKT_VALIDATE_ACK    = 10,  // validador → zone_node  (veredicto correlacionado, §2.2)
-        PKT_VALIDATOR_STATUS= 11,  // zone_node → head_server (telemetría/lease, §2.2 y §4)
+        // Packets added by the plan (PLAN_DGS_VALIDADOR): validation request/ack + telemetry to the master.
+        PKT_VALIDATE_REQ    = 9,   // zone_node → validator  (claim vs predicted state, §2.2)
+        PKT_VALIDATE_ACK    = 10,  // validator → zone_node  (correlated verdict, §2.2)
+        PKT_VALIDATOR_STATUS= 11,  // zone_node → head_server (telemetry/lease, §2.2 and §4)
         PKT_SOCIAL_DELTA    = 12,  // guild/party deltas (§3.7)
-        PKT_ACCOUNT         = 13,  // ban/permisos de cuenta (§3.7)
-        PKT_DRAIN           = 14,  // ciclo de vida: pedir drenado antes de destruir zona (§3.9)
-        PKT_DELETE_ZONE     = 15,  // ciclo de vida: confirmar destrucción de zona (§3.9)
-        PKT_REASSIGN        = 16,  // handoff de autoridad: zona → head → nueva zona dueña (§3.6)
-        PKT_ZONE_REGION     = 17,  // blob de estado de región (serializeRegion/mergeRegion, §3.9)
+        PKT_ACCOUNT         = 13,  // account ban/permissions (§3.7)
+        PKT_DRAIN           = 14,  // lifecycle: request draining before destroying a zone (§3.9)
+        PKT_DELETE_ZONE     = 15,  // lifecycle: confirm zone destruction (§3.9)
+        PKT_REASSIGN        = 16,  // authority handoff: zone → head → new owning zone (§3.6)
+        PKT_ZONE_REGION     = 17,  // region state blob (serializeRegion/mergeRegion, §3.9)
+        // READ-ONLY OBSERVER (viewer/ops). Sent by UDP to a zone: "add me to your broadcast". It is a
+        // 1-byte packet and carries nothing else on purpose — an observer must be unable to introduce
+        // anything into the world. The zone answers with the SAME stream it already sends its clients
+        // (entities + ghosts), keeps observers in their own registry, and expires them on a lease so a
+        // viewer that goes away stops being fed.
+        PKT_OBSERVE         = 18,
         PKT_DISCONNECT      = 255
     };
     
@@ -115,28 +121,29 @@ namespace DGS
         int     port;
     };
 
-    // Zona como la ve el ORQUESTADOR (local): es un ZoneInfoPublic (lo que viaja / se consulta) + `fd` del
-    // socket de control con el nodo + estado de vida (véase §3.9). ⚠️ La base se declara ANTES: no se puede
-    // derivar de un tipo incompleto. `fd` NO va al wire (`pack(ServerMetrics)` solo serializa bounds/
-    // addr/port, véase packet.cpp) → este cambio NO afecta al formato de red.
+    // A zone as the ORCHESTRATOR sees it (local): a ZoneInfoPublic (what travels / is queried) plus the
+    // `fd` of the control socket to the node plus its liveness state (see §3.9). ⚠️ The base is declared
+    // BEFORE: you cannot derive from an incomplete type. `fd` does NOT go on the wire
+    // (`pack(ServerMetrics)` only serialises bounds/addr/port, see packet.cpp) → this change does NOT
+    // affect the network format.
     struct ZoneInfo : public ZoneInfoPublic
     {
         int fd;
     };
 
-    // Métricas que el nodo reporta al orquestador (§4 del plan). Los campos nuevos van AL FINAL para no
-    // desplazar los existentes. ⚠️ Añadir campos cambia el layout de red → recompilar pack/unpack a la vez
-    // (P0, §4.5). Contadores MONOTÓNICOS desde arranque (§4.1).
+    // Metrics the node reports to the orchestrator (§4 of the plan). New fields go AT THE END so the
+    // existing ones do not shift. ⚠️ Adding fields changes the wire layout → recompile pack/unpack
+    // together (P0, §4.5). Counters are MONOTONIC since start-up (§4.1).
     struct ServerMetrics
     {
-        ZoneInfo node;          // zonas (por bounds + addr:port; `fd` no viaja)
+        ZoneInfo node;          // zones (by bounds + addr:port; `fd` does not travel)
         float    ramUsage;      // 0..1
         float    performance;   // 0..1
-        uint64_t startTimeS;    // época de arranque del nodo (distinguir nodo nuevo de sano, §4.6 bug 5)
-        uint64_t bytesRx;       // bytes recibidos desde arranque
-        uint64_t bytesTx;       // bytes enviados desde arranque
-        uint32_t failedTransfers; // transferencias/validaciones fallidas (timeout o error)
-        uint32_t activeEntities;  // entidades servidas (heurística de escalado)
+        uint64_t startTimeS;    // node start epoch (tells a fresh node from a healthy one, §4.6 bug 5)
+        uint64_t bytesRx;       // bytes received since start-up
+        uint64_t bytesTx;       // bytes sent since start-up
+        uint32_t failedTransfers; // failed transfers/validations (timeout or error)
+        uint32_t activeEntities;  // entities served (scaling heuristic)
     };
 
     struct ZoneQuery
@@ -157,83 +164,84 @@ namespace DGS
         int  port;
     };
 
-    // Handoff de autoridad (§3.6): una entidad (o región) cambia de zona dueña. El zone_node que la
-    // simulaba la manda al head; el head la enruta a la nueva zona que cubre su chunk. La nueva dueña
-    // la promueve (ghost→real) y EMPIEZA a simularla; la vieja la deja de simular (lease).
+    // Authority handoff (§3.6): an entity (or region) changes owning zone. The zone_node that was
+    // simulating it sends it to the head; the head routes it to the new zone covering its chunk. The new
+    // owner promotes it (ghost→real) and STARTS simulating it; the old one stops (lease).
     struct EntityReassign
     {
         uint64_t entityUuid;
         int32_t  chunkX, chunkY, chunkZ;
-        uint32_t fromZone;      // zona que la cedía (debug/auditoría)
-        uint32_t toZone;        // zona destino (0 = que el head la resuelva por chunk)
+        uint32_t fromZone;      // zone that gave it up (debug/audit)
+        uint32_t toZone;        // destination zone (0 = let the head resolve it by chunk)
     };
 
-    // Ciclo de vida de una zona (§3.9). Mismo struct para las DOS señales:
-    //   · PKT_DRAIN:        orchestrator → zona  (ack=0: "drena, vas a cesar"; zona → orchestrator ack=1)
-    //   · PKT_DELETE_ZONE:  orchestrator → zona  (el drenaje terminó: destruye tu zona y sal)
-    // `requestId` correlaciona la petición con su ack (timeout/fail-safe en el orquestador).
+    // Zone lifecycle (§3.9). The same struct carries BOTH signals:
+    //   · PKT_DRAIN:        orchestrator → zone  (ack=0: "drain, you are being retired"; zone → orchestrator ack=1)
+    //   · PKT_DELETE_ZONE:  orchestrator → zone  (draining finished: destroy your zone and exit)
+    // `requestId` correlates the request with its ack (timeout/fail-safe in the orchestrator).
     struct ZoneLifecycle
     {
-        uint32_t requestId;     // seq de la operación de ciclo de vida
-        uint8_t  ack;           // 0 = petición, 1 = confirmación del nodo
+        uint32_t requestId;     // seq of the lifecycle operation
+        uint8_t  ack;           // 0 = request, 1 = the node's confirmation
     };
 
-    // Estado de región serializado (fusión/traspaso §3.9): la zona que cede extrae el estado autoritativo
-    // de su región con `serializeRegion` y lo envía (→ head → nueva zona), que lo incorpora con
-    // `mergeRegion`. `chunkX/Y/Z` es el ancla que usa el head para enrutar al nodo que lo cubre.
+    // Serialised region state (merge/handoff §3.9): the ceding zone extracts its region's authoritative
+    // state with `serializeRegion` and sends it (→ head → new zone), which folds it in with
+    // `mergeRegion`. `chunkX/Y/Z` is the anchor the head uses to route to the node covering it.
     struct ZoneRegion
     {
-        int32_t  chunkX, chunkY, chunkZ;   // ancla de la región (metros→qué nodo la cubre)
-        uint32_t srcZone;                  // nodo que cede (debug/auditoría)
-        uint32_t size;                     // bytes válidos en data[]
-        uint8_t  data[MAX_REGION_BYTES];   // blob opaco, formato del módulo
+        int32_t  chunkX, chunkY, chunkZ;   // region anchor (metres → which node covers it)
+        uint32_t srcZone;                  // ceding node (debug/audit)
+        uint32_t size;                     // valid bytes in data[]
+        uint8_t  data[MAX_REGION_BYTES];   // opaque blob, the module's format
     };
 
-    // Estado de vida de una zona (véase §3.9 del plan): el orquestador lo gestiona en paralelo al
-    // ZoneInfo. NO va al wire: es bookkeeping local.
+    // A zone's liveness state (see §3.9 of the plan): the orchestrator keeps it alongside the ZoneInfo.
+    // It does NOT go on the wire: it is local bookkeeping.
     enum class ZoneState : uint8_t
     {
-        PROVISIONING = 0,   // spawn en curso, sin primer ServerMetrics
-        READY,              // sirviendo y registrada en activeZones
-        DRAINING,           // en proceso de cesión (scale-down / muerte), §3.9
-        DEAD,               // lease vencido, a reasignar/limpiar
-        DESTROYED           // pod/pod eliminado, entrada a purgar
+        PROVISIONING = 0,   // spawn in flight, no first ServerMetrics yet
+        READY,              // serving and registered in activeZones
+        DRAINING,           // being handed over (scale-down / death), §3.9
+        DEAD,               // lease expired, to be reassigned/cleaned up
+        DESTROYED           // pod removed, entry to be purged
     };
 
-    // --- Request/ack de validación (PLAN_DGS_VALIDADOR §2.2) ---------------------------------------------
-    // El validador NO re-simula: compara la afirmación del cliente contra el estado PREDICHO por la zona
-    // dueña (misma regla que §3.6). `requestId` es un seq por remitente → idempotencia + anti-replay (§2.3).
+    // --- Validation request/ack (PLAN_DGS_VALIDADOR §2.2) ------------------------------------------------
+    // The validator does NOT re-simulate: it compares the client's claim against the state PREDICTED by
+    // the owning zone (same rule as §3.6). `requestId` is a per-sender seq → idempotency + anti-replay (§2.3).
     struct ValidateRequest
     {
-        uint32_t requestId;     // seq por remitente (anti-replay)
-        uint64_t entityUuid;    // entidad/op a validar
-        uint32_t ownerZone;     // zona dueña de la simulación (la que predice)
-        uint8_t  moduleId;      // módulo de reglas esperado (GAME_MODULE_SO)
-        uint8_t  kind;          // 0=move, 1=action (verbos críticos → fail-closed)
-        // payload opaco (kind=0 MOVIMIENTO): el estado PREDICHO por la zona + la afirmación del cliente.
-        // La zona dueña NO re-simula; el validador compara esta afirmación con su predictora + tolerancia RTT.
-        EntityTransfer entity;   // estado actual (predicho) de la entidad
-        float lastGX, lastGY, lastGZ;  // posición GLOBAL previa conocida por la zona
-        float maxSpeed;          // límite del jugador (Stats.speed[0])
-        float dtSeconds;         // tiempo entre la última posición y la afirmación
+        uint32_t requestId;     // per-sender seq (anti-replay)
+        uint64_t entityUuid;    // entity/op to validate
+        uint32_t ownerZone;     // zone that owns the simulation (the one predicting)
+        uint8_t  moduleId;      // expected rules module (GAME_MODULE_SO)
+        uint8_t  kind;          // 0=move, 1=action (critical verbs → fail-closed)
+        // Opaque payload (kind=0 MOVEMENT): the state PREDICTED by the zone plus the client's claim.
+        // The owning zone does NOT re-simulate; the validator compares this claim against its own
+        // predictor plus an RTT tolerance.
+        EntityTransfer entity;   // current (predicted) entity state
+        float lastGX, lastGY, lastGZ;  // previous GLOBAL position known to the zone
+        float maxSpeed;          // the player's limit (Stats.speed[0])
+        float dtSeconds;         // time between the last position and the claim
     };
 
     struct ValidateAck
     {
         uint32_t requestId;
-        int8_t   verdict;       // 1 = plausible, 0 = violación
-        uint16_t weight;        // peso de la violación (0 si veredicto=1)
+        int8_t   verdict;       // 1 = plausible, 0 = violation
+        uint16_t weight;        // weight of the violation (0 when verdict = 1)
     };
 
     struct ValidatorStatus
     {
         int8_t   state;         // 0=UP 1=DEGRADED 2=DOWN/OPEN (circuit breaker §2.3)
-        uint32_t reqSent;       // validaciones pedidas
-        uint32_t reqTimeout;    // timeouts (→ failedTransfers del nodo)
-        uint64_t bytesRecv;     // bytes de validación recibidos
+        uint32_t reqSent;       // validations requested
+        uint32_t reqTimeout;    // timeouts (→ the node's failedTransfers)
+        uint64_t bytesRecv;     // validation bytes received
         uint32_t failedTransfers;
-        uint32_t activeEntities; // entidades servidas por el nodo emisor
-        uint64_t timestampMs;    // época del reporte
+        uint32_t activeEntities; // entities served by the reporting node
+        uint64_t timestampMs;    // epoch of the report
     };
 
     enum DirtyFlag : uint32_t
@@ -245,19 +253,19 @@ namespace DGS
 
     static constexpr uint16_t MAX_GHOST_DATA = 4096;
 
-    // ⚠️ `alignas` va DESPUÉS de `struct`: escrito delante, el compilador lo IGNORA (-Wattributes) y la
-    // estructura se quedaba con alineación 8. sizeof ya es múltiplo de 16 (4176) → alinearlo NO cambia el
-    // layout ni el formato de red, solo alinea de verdad.
+    // ⚠️ `alignas` goes AFTER `struct`: written in front of it the compiler IGNORES it (-Wattributes)
+    // and the struct kept alignment 8. sizeof is already a multiple of 16 (4176) → aligning it does NOT
+    // change the layout or the wire format, it just actually aligns.
     struct alignas(16) GhostDelta
     {
         uint64_t uuid;
         int32_t  chunkX, chunkY, chunkZ;
         uint32_t dirtyMask;
-        float    pos[3];              // local dentro del chunk, metros
+        float    pos[3];              // local within the chunk, metres
         float    rot[4];              // quaternion xyzw
         Stats    stats;
-        uint16_t dataSize;            // bytes válidos en data[]
-        uint8_t  data[MAX_GHOST_DATA]; // payload opaco definido por el engine
+        uint16_t dataSize;            // valid bytes in data[]
+        uint8_t  data[MAX_GHOST_DATA]; // opaque payload defined by the engine
     };
 
     struct ChatMessage
@@ -266,64 +274,64 @@ namespace DGS
         char     username[32];
         char     text[256];
         uint8_t  channel;        // ChatChannel (§3.7): local/guild/trade/global
-        uint64_t seq;            // nº de orden en el canal (fan-out tipo GhostDelta, anti-replay)
-        uint32_t timestampMs;    // época del mensaje (rate-limit + moderación en el servicio de chat)
+        uint64_t seq;            // sequence number in the channel (GhostDelta-style fan-out, anti-replay)
+        uint32_t timestampMs;    // message epoch (rate limit + moderation in the chat service)
     };
 
-    // §3.7: canal de chat. El `local` sí pasa por `zone_node` (interés espacial); el resto lo enruta el
-    // servicio de chat (head/nodo social) con fan-out por suscripción, no por proximidad.
+    // §3.7: chat channel. `local` does go through `zone_node` (spatial interest); the rest is routed by
+    // the chat service (head/social node) with subscription fan-out, not proximity.
     enum ChatChannel : uint8_t
     {
-        CHAT_LOCAL  = 0,   // interés espacial (zona dueña)
-        CHAT_GUILD  = 1,   // membresía de gremio (nodo social)
-        CHAT_TRADE  = 2,   // economía (rate-limit + moderación)
+        CHAT_LOCAL  = 0,   // spatial interest (owning zone)
+        CHAT_GUILD  = 1,   // guild membership (social node)
+        CHAT_TRADE  = 2,   // economy (rate limit + moderation)
         CHAT_GLOBAL = 3
     };
 
-    // §3.7: tipo de delta social (guild/party). El estado es pequeño y viaja por EVENTOS a los miembros
-    // ONLINE (la UI se suscribe, no consulta). Fuente de verdad: persistance_node (MongoDB).
+    // §3.7: kind of social delta (guild/party). The state is small and travels as EVENTS to the ONLINE
+    // members (the UI subscribes, it does not poll). Source of truth: persistance_node (MongoDB).
     enum SocialKind : uint8_t
     {
-        SOCIAL_GUILD_JOIN    = 0,   // targetUuid entra en scopeUuid (guildId)
-        SOCIAL_GUILD_LEAVE   = 1,   // targetUuid abandona
-        SOCIAL_GUILD_RANK    = 2,   // rango de targetUuid cambia (rank)
-        SOCIAL_GUILD_DISBAND = 3,   // se disuelve scopeUuid
-        SOCIAL_PARTY_JOIN    = 4,   // party de scopeUuid
+        SOCIAL_GUILD_JOIN    = 0,   // targetUuid joins scopeUuid (guildId)
+        SOCIAL_GUILD_LEAVE   = 1,   // targetUuid leaves
+        SOCIAL_GUILD_RANK    = 2,   // targetUuid's rank changes (rank)
+        SOCIAL_GUILD_DISBAND = 3,   // scopeUuid is disbanded
+        SOCIAL_PARTY_JOIN    = 4,   // scopeUuid's party
         SOCIAL_PARTY_LEAVE   = 5,
-        SOCIAL_FRIEND_ADD    = 6,   // relación entre targetUuid y scopeUuid
+        SOCIAL_FRIEND_ADD    = 6,   // relationship between targetUuid and scopeUuid
         SOCIAL_FRIEND_REMOVE = 7,
-        SOCIAL_ZONE_UPDATE   = 8    // zoneId del miembro (para routing/estado)
+        SOCIAL_ZONE_UPDATE   = 8    // the member's zoneId (for routing/state)
     };
 
-    // §3.7: delta de guild/party (PKT_SOCIAL_DELTA). Un solo nodo social escribe (regla 1 de §3.7:
-    // un solo dueño por tipo de dato); las zonas/head solo leen ids.
+    // §3.7: guild/party delta (PKT_SOCIAL_DELTA). A single social node writes (rule 1 of §3.7: one
+    // owner per data type); zones and the head only read ids.
     struct SocialDelta
     {
-        uint32_t targetUuid;   // miembro afectado
-        uint32_t scopeUuid;    // guildId / partyId (0 = personal/amigos)
+        uint32_t targetUuid;   // affected member
+        uint32_t scopeUuid;    // guildId / partyId (0 = personal/friends)
         uint8_t  kind;         // SocialKind
-        uint8_t  rank;         // rango nuevo (SOCIAL_GUILD_RANK)
-        int32_t  zoneId;       // id de zona del miembro (SOCIAL_ZONE_UPDATE)
-        uint64_t seq;          // orden por canal/evento (anti-replay)
+        uint8_t  rank;         // new rank (SOCIAL_GUILD_RANK)
+        int32_t  zoneId;       // the member's zone id (SOCIAL_ZONE_UPDATE)
+        uint64_t seq;          // ordering per channel/event (anti-replay)
     };
 
-    // §3.7: acciones de CUENTA (PKT_ACCOUNT): ban/permisos. El ban escalado de la sospecha se materializa
-    // aquí (validador → head → nodo social → todas las zonas lo ven: "uuid baneado" → bloquea entrada).
+    // §3.7: ACCOUNT actions (PKT_ACCOUNT): ban/permissions. A ban escalated from suspicion materialises
+    // here (validator → head → social node → every zone sees it: "uuid banned" → entry blocked).
     enum AccountActionKind : uint8_t
     {
-        ACC_BAN      = 0,   // banear cuenta (opcional con duración)
-        ACC_UNBAN    = 1,   // levantar ban
-        ACC_SET_PERM = 2    // cambiar permisos
+        ACC_BAN      = 0,   // ban an account (optionally with a duration)
+        ACC_UNBAN    = 1,   // lift a ban
+        ACC_SET_PERM = 2    // change permissions
     };
 
     struct AccountAction
     {
-        uint32_t actorUuid;    // quién ejecuta (admin/moderador, validado por permisos)
-        uint32_t targetUuid;   // cuenta afectada
+        uint32_t actorUuid;    // who performs it (admin/moderator, permission-checked)
+        uint32_t targetUuid;   // affected account
         uint8_t  action;       // AccountActionKind
         uint32_t permFlags;    // permisos (ACC_SET_PERM)
-        uint32_t durationS;    // 0 = permanente (ACC_BAN)
-        char     reason[64];   // motivo (moderación/log)
+        uint32_t durationS;    // 0 = permanent (ACC_BAN)
+        char     reason[64];   // reason (moderation/log)
     };
 
     struct LogEntry

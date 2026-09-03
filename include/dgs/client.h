@@ -9,6 +9,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 
 namespace DGS
@@ -22,14 +23,14 @@ namespace DGS
 
         void disconnect();
 
-        // Re-query automático al HeadServer si el chunk cambia
+        // Automatic re-query to the HeadServer when the chunk changes
         void sendTransform(uint32_t uuid,
                            int32_t chunkX, int32_t chunkY, int32_t chunkZ,
                            const float pos[3], const float rot[4]);
 
         void sendStats(uint32_t uuid, const Stats& stats);
 
-        // Payload opaco — el engine serializa su inventario aquí
+        // Opaque payload — the engine serialises its inventory here
         void sendInventory(uint32_t uuid, const uint8_t* data, uint16_t size);
 
         void sendChat(uint32_t uuid, const std::string& username, const std::string& text);
@@ -59,7 +60,20 @@ namespace DGS
         std::vector<GhostDelta>     m_incomingGhosts;
         std::vector<ChatMessage>    m_incomingChats;
 
+        // ⚠️ ONE READER PER SOCKET. `queryZone` used to read `m_tcp` directly while `recvLoop` was
+        // reading the very same descriptor from another thread. Two consequences, and the second is
+        // worse than the first:
+        //   · the answer was routinely swallowed by `recvLoop` (which discards PKT_ZONE_RESPONSE in its
+        //     `default:`), so the query timed out — measured: 6 of 9 runs;
+        //   · and because `receive()` reads a 4-byte length prefix and then the payload, the two threads
+        //     could split a single message between them and desynchronise the stream for good.
+        // Now `recvLoop` owns the descriptor and hands the response over through this pair.
+        std::condition_variable m_zoneCv;
+        bool                    m_zoneAnswered = false;
+        ZoneResponse            m_zoneResp{};
+
         bool queryZone(uint32_t uuid, int32_t chunkX, int32_t chunkY, int32_t chunkZ);
+        void applyZone(const ZoneResponse& z);
         void recvLoop();
         void sendEntityUDP(const EntityTransfer& e);
     };

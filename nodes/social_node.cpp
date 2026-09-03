@@ -1,23 +1,24 @@
 // ================================================================================================
-// social_node — PLANO SOCIAL/CUENTA (§3.7, P7).
+// social_node — SOCIAL/ACCOUNT PLANE (§3.7, P7).
 //
-// Un solo nodo social/account es el dueño del plano NO espacial (guilds, parties, amigos, bans,
-// economía de gremio): regla 1 de §3.7 ("un solo dueño por tipo de dato"). Las zonas/head solo leen
-// ids. Recibe del head los eventos de validación escalados (validador → head → social → todas las
-// zonas ven "uuid baneado") y de los clientes los deltas sociales; mantiene el estado pequeño en
-// memoria y difunde los eventos por SECUENCIA (seq por canal, tipo GhostDelta pero de canal, no de
-// chunk) a los miembros ONLINE suscritos.
+// A single social/account node owns the NON-spatial plane (guilds, parties, friends, bans, guild
+// economy): rule 1 of §3.7 ("one owner per data type"). Zones and the head only read ids. It receives
+// escalated validation events from the head (validator → head → social → every zone sees "uuid
+// banned") and social deltas from clients; it keeps the small state in memory and broadcasts events by
+// SEQUENCE (seq per channel — GhostDelta-style, but per channel rather than per chunk) to the
+// subscribed ONLINE members.
 //
-// Este nodo también hace de SERVICIO DE CHAT: routing por canal y suscripción por uuid (no por
-// proximidad), rate-limit por canal (CHAT_RATE_MS por uuid) y seq de orden por canal, ANTES del
-// fan-out (anti-spam/anti-abuse — NO física → no pasa por el validador, §3.7).
+// This node is also the CHAT SERVICE: routing per channel and subscription per uuid (not by
+// proximity), a per-channel rate limit (CHAT_RATE_MS per uuid) and an ordering seq per channel, all
+// BEFORE the fan-out (anti-spam/anti-abuse — NOT physics → it never reaches the validator, §3.7).
 //
-// Estados de cuenta (bans/permisos) se aplican aquí y se reenvían a las zonas conectadas para que
-// bloqueen entrada. Persistencia write-through → persistance_node (MongoDB) vía TCP (PERSISTENCE_*).
+// Account states (bans/permissions) are applied here and forwarded to the connected zones so they can
+// block entry. Write-through persistence → persistance_node (MongoDB) over TCP (PERSISTENCE_*).
 // ================================================================================================
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
 #include "include/dgs/types.h"
+#include <csignal>
 
 #include <sys/epoll.h>
 #include <map>
@@ -35,20 +36,20 @@ static uint64_t nowMs()
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// Estado en memoria del plano social (fuente de verdad en esta sesión; write-through a persistence).
+// In-memory state of the social plane (source of truth for this session; write-through to persistence).
 struct SocialState
 {
-    // guildId → {miembro → rango}
+    // guildId → {member → rank}
     std::map<uint32_t, std::map<uint32_t, uint8_t>> guilds;
-    // partyId → miembros
+    // partyId → members
     std::map<uint32_t, std::set<uint32_t>> parties;
-    // uuid → {amigo}
+    // uuid → {friend}
     std::map<uint32_t, std::set<uint32_t>> friends;
-    // uuid baneado → {hasta (0=permanente), motivo}
+    // banned uuid → {until (0 = permanent), reason}
     std::map<uint32_t, std::pair<uint64_t, std::string>> banned;
-    // permisos por cuenta
+    // permissions per account
     std::map<uint32_t, uint32_t> perms;
-    // seq por canal (orden/fan-out)
+    // seq per channel (ordering/fan-out)
     std::map<uint8_t, uint64_t> seqByChannel;
 };
 
@@ -58,13 +59,13 @@ static void broadcast(int fd, DGS::TCPSocket& s, const std::set<int>& subscriber
         if (sub != fd) s.send(sub, raw, n);
 }
 
-// Aplica un delta social al estado y lo difunde con seq (§3.7).
+// Applies a social delta to the state and broadcasts it with a seq (§3.7).
 static void applySocialDelta(DGS::TCPSocket& s, const std::set<int>& subscribers,
                              int fd, DGS::Packet& p, SocialState& st, DGS::TCPSocket& persistence)
 {
     auto d = p.unpackSocialDelta();
 
-    uint64_t seq = ++st.seqByChannel[PKT_SOCIAL_DELTA];
+    uint64_t seq = ++st.seqByChannel[DGS::PKT_SOCIAL_DELTA];
     d.seq = seq;
 
     switch (d.kind)
@@ -77,13 +78,13 @@ static void applySocialDelta(DGS::TCPSocket& s, const std::set<int>& subscribers
         case DGS::SOCIAL_PARTY_LEAVE: st.parties[d.scopeUuid].erase(d.targetUuid); break;
         case DGS::SOCIAL_FRIEND_ADD:  st.friends[d.targetUuid].insert(d.scopeUuid); break;
         case DGS::SOCIAL_FRIEND_REMOVE: st.friends[d.targetUuid].erase(d.scopeUuid); break;
-        case DGS::SOCIAL_ZONE_UPDATE: /* routing info; opaco para el plano social */ break;
+        case DGS::SOCIAL_ZONE_UPDATE: /* routing info; opaque to the social plane */ break;
     }
 
     DGS::Packet out; out.pack(d);
     broadcast(fd, s, subscribers, out.getRawData(), out.getSize());
 
-    // Write-through de la economía/guild → persistance_node (best-effort; si no está, seguimos).
+    // Write-through of guild/economy state → persistance_node (best-effort; if it is down we go on).
     persistence.send(persistence.getSocketFD(), out.getRawData(), out.getSize());
 
     std::cout << "[Social] delta kind=" << (int)d.kind
@@ -91,13 +92,13 @@ static void applySocialDelta(DGS::TCPSocket& s, const std::set<int>& subscribers
               << " seq=" << seq << std::endl;
 }
 
-// Servicio de chat: routing por canal + rate-limit por uuid + seq de orden (§3.7).
+// Chat service: per-channel routing + per-uuid rate limit + ordering seq (§3.7).
 static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers,
                        int fd, DGS::Packet& p, SocialState& st)
 {
     auto c = p.unpackChatMessage();
 
-    static const uint32_t RATE_MS = 500;   // máx 2 msgs/s por uuid (anti-spam)
+    static const uint32_t RATE_MS = 500;   // max 2 msgs/s per uuid (anti-spam)
     static std::map<uint32_t, uint64_t> lastChatAt;
 
     uint64_t now = nowMs();
@@ -105,25 +106,25 @@ static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers,
     if (last != lastChatAt.end() && now - last->second < RATE_MS)
     {
         std::cout << "[Social] chat rate-limit uuid=" << c.uuid
-                  << " (hace " << (now - last->second) << "ms)" << std::endl;
-        return;   // descartado (anti-spam) — no llega al fan-out
+                  << " (" << (now - last->second) << "ms ago)" << std::endl;
+        return;   // dropped (anti-spam) — never reaches the fan-out
     }
     lastChatAt[c.uuid] = now;
 
-    // Canal local → lo enruta la zona por interés espacial; el resto, por suscripción aquí (§3.7).
-    if (c.channel == DGS::CHAT_LOCAL) return;   // la zona dueña lo emite, no el social
+    // Local channel → routed by the zone through spatial interest; the rest by subscription here (§3.7).
+    if (c.channel == DGS::CHAT_LOCAL) return;   // the owning zone emits it, not the social node
 
-    c.seq = ++st.seqByChannel[PKT_CHAT];
+    c.seq = ++st.seqByChannel[DGS::PKT_CHAT];
     c.timestampMs = (uint32_t)std::time(nullptr);
 
     DGS::Packet out; out.pack(c);
     broadcast(fd, s, subscribers, out.getRawData(), out.getSize());
 
-    std::cout << "[Social] chat canal=" << (int)c.channel << " uuid=" << c.uuid
+    std::cout << "[Social] chat channel=" << (int)c.channel << " uuid=" << c.uuid
               << " seq=" << c.seq << std::endl;
 }
 
-// Acción de cuenta (ban/permisos): se aplica aquí y se reenvía a todas las zonas conectadas.
+// Account action (ban/permissions): applied here and forwarded to every connected zone.
 static void handleAccount(DGS::TCPSocket& s, const std::set<int>& subscribers,
                           int fd, DGS::Packet& p, SocialState& st, DGS::TCPSocket& persistence)
 {
@@ -144,27 +145,37 @@ static void handleAccount(DGS::TCPSocket& s, const std::set<int>& subscribers,
     broadcast(fd, s, subscribers, out.getRawData(), out.getSize());
     persistence.send(persistence.getSocketFD(), out.getRawData(), out.getSize());
 
-    std::cout << "[Social] cuenta action=" << (int)a.action
+    std::cout << "[Social] account action=" << (int)a.action
               << " target=" << a.targetUuid << (a.action == DGS::ACC_BAN ? " BAN" : "") << std::endl;
 }
 
 int main()
 {
+    // ⚠️ A NODE MUST NOT DIE BECAUSE A PEER HUNG UP. Writing to a socket whose other end has closed
+    // raises SIGPIPE, and its default action is to KILL the process. No node installed this, and the
+    // whole suite stayed green anyway: every test calls `signal(SIGPIPE, SIG_IGN)` before `fork()`, and
+    // a child INHERITS an ignored disposition — so under CTest the nodes survived, and started from a
+    // shell, systemd, Docker or `dgs run` they died the first time a peer disconnected.
+    // Measured with the same binary and the same environment: parent ignoring SIGPIPE -> ran the full
+    // 6 s; ordinary parent -> exit 141 (128 + SIGPIPE) within seconds of the head closing.
+    // A closed peer is an ordinary event: `send` returns EPIPE and the reconnect paths handle it.
+    std::signal(SIGPIPE, SIG_IGN);
     DGS::TCPSocket socialSocket;
-    if (!socialSocket.listen(42430))
+    const int socialPort = std::atoi(std::getenv("SOCIAL_TCP_PORT") ? std::getenv("SOCIAL_TCP_PORT") : "42430");
+    if (!socialSocket.listen(socialPort))
     {
-        std::cerr << "[Social] Error al escuchar en 42430" << std::endl;
+        std::cerr << "[Social] Failed to listen on 42430" << std::endl;
         return 1;
     }
-    std::cout << "[Social] Escuchando TCP:42430 (plano social/cuenta + chat)" << std::endl;
+    std::cout << "[Social] Listening on TCP:42430 (social/account plane + chat)" << std::endl;
 
-    // Write-through opcional a persistence (MongoDB) — fuente de verdad para bans/guilds.
+    // Optional write-through to persistence (MongoDB) — source of truth for bans/guilds.
     DGS::TCPSocket persistence;
     const char* persHost = std::getenv("PERSISTENCE_HOST") ? std::getenv("PERSISTENCE_HOST") : "persistence";
     int         persPort = std::atoi(std::getenv("PERSISTENCE_PORT") ? std::getenv("PERSISTENCE_PORT") : "42429");
     if (!persistence.connect(persHost, persPort))
-        std::cout << "[Social] Persistence no disponible en " << persHost << ":" << persPort
-                  << " -> solo estado en memoria" << std::endl;
+        std::cout << "[Social] Persistence unavailable at " << persHost << ":" << persPort
+                  << " -> in-memory state only" << std::endl;
 
     int epollFD = epoll_create1(0);
     epoll_event ev;
@@ -190,7 +201,7 @@ int main()
                 subscribers.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[Social] Suscriptor conectado FD=" << newFD << std::endl;
+                std::cout << "[Social] Subscriber connected FD=" << newFD << std::endl;
             }
             else if (subscribers.count(fd))
             {

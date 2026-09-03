@@ -97,7 +97,7 @@ namespace DGS
         write<int32_t>(data.node.chunkZMax);
         writeString(std::string(data.node.addr));
         write<int>(data.node.port);
-        // Campos nuevos del plan (§4): monotónicos desde arranque → distintos de 0 para un nodo sano.
+        // Fields added by the plan (§4): monotonic since start-up → non-zero for a healthy node.
         write<uint64_t>(data.startTimeS);
         write<uint64_t>(data.bytesRx);
         write<uint64_t>(data.bytesTx);
@@ -263,7 +263,7 @@ namespace DGS
         write<uint32_t>(data.uuid);
         writeString(std::string(data.username));
         writeString(std::string(data.text));
-        // §3.7: canal + seq + época (rate-limit y orden por canal en el servicio de chat).
+        // §3.7: channel + seq + epoch (rate limit and per-channel ordering in the chat service).
         write<uint8_t>(data.channel);
         write<uint64_t>(data.seq);
         write<uint32_t>(data.timestampMs);
@@ -293,7 +293,7 @@ namespace DGS
         write<uint32_t>(data.ownerZone);
         write<uint8_t>(data.moduleId);
         write<uint8_t>(data.kind);
-        // payload opaco (kind=0 MOVIMIENTO): estado predicho por la zona + afirmación del cliente
+        // opaque payload (kind=0 MOVEMENT): state predicted by the zone + the client's claim
         writeRaw(reinterpret_cast<const uint8_t*>(&data.entity), sizeof(DGS::EntityTransfer));
         write<float>(data.lastGX);
         write<float>(data.lastGY);
@@ -394,7 +394,7 @@ namespace DGS
     void Packet::pack(const ZoneLifecycle& data)
     {
         clear();
-        write<PacketType>(PKT_DRAIN);          // mismo struct para PKT_DRAIN y PKT_DELETE_ZONE
+        write<PacketType>(PKT_DRAIN);          // same struct for PKT_DRAIN and PKT_DELETE_ZONE
         write<uint32_t>(data.requestId);
         write<uint8_t>(data.ack);
     }
@@ -468,7 +468,7 @@ namespace DGS
         return data;
     }
 
-    // §3.7: acción de cuenta (PKT_ACCOUNT): ban/permisos.
+    // §3.7: account action (PKT_ACCOUNT): ban/permissions.
     void Packet::pack(const AccountAction& data)
     {
         clear();

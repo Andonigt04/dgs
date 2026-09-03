@@ -3,6 +3,10 @@
 
 #include "include/dgs/types.h"
 #include "include/dgs/network.h"
+// ⚠️ This header USES `DGS::Packet` and did not include it: it only compiled if whoever included it
+// had already pulled in `packet.h`. The nodes do, so it went unnoticed; the moment a test includes it
+// on its own it fails with `'Packet' is not a member of 'DGS'`. A header must compile by itself.
+#include "include/dgs/packet.h"
 
 #include <httplib.h>
 
@@ -21,8 +25,8 @@
 
 namespace DGS
 {
-    // Umbrales/constantes CONFIGURABLES de evaluacion (§4.2). Se lean de env, con default.
-    // Se resuelven una vez (no por llamada) para no pagar getenv/atof en el hot path de metricas.
+    // CONFIGURABLE evaluation thresholds/constants (§4.2). Read from the environment, with defaults.
+    // Resolved once (not per call) so the metrics hot path never pays for getenv/atof.
     static float evalCfg(const char* name, float def)
     {
         const char* v = std::getenv(name);
@@ -40,27 +44,27 @@ namespace DGS
         double   txEWMA = 0.0;
     };
 
-    // §3.9 (P9b): operaciones de ciclo de vida con PRIORIDAD formal. Mayor valor = se ejecuta primero.
-    // Los disparadores de evaluateServer/sweep NO mutan el clúster directamente: encolan la operación
-    // y `processLifecycleQueue()` ejecuta UNA por tick por prioridad global. Orden: CRASH/lease (lo más
-    // urgente) > REASIGN por fallo (P6/F1: validador caído / failedTransfers alto) > MERGE > SPLIT.
-    // Así un pod muerto se evicta antes que cualquier fusión/escalado, y un split nunca se ejecuta en
-    // el mismo tick que un merge pendiente de la misma zona.
+    // §3.9 (P9b): lifecycle operations with a formal PRIORITY. Higher value = executed first.
+    // The triggers in evaluateServer/sweep do NOT mutate the cluster directly: they enqueue the
+    // operation and `processLifecycleQueue()` runs ONE per tick by global priority. Order: CRASH/lease
+    // (most urgent) > REASSIGN on failure (P6/F1: validator down / high failedTransfers) > MERGE >
+    // SPLIT. That way a dead pod is evicted before any merge/scale, and a split never runs in the same
+    // tick as a merge pending on the same zone.
     enum class LifecycleOp : uint8_t
     {
         LIFECYCLE_SPLIT     = 0,   // bajo carga (load/net)
-        LIFECYCLE_MERGE     = 1,   // zona ociosa (ventana + histéresis)
-        LIFECYCLE_REASSIGN  = 2,   // P6: zona fallando (P2+O5, F1) → traspaso a vecino sano
+        LIFECYCLE_MERGE     = 1,   // idle zone (window + hysteresis)
+        LIFECYCLE_REASSIGN  = 2,   // P6: failing zone (P2+O5, F1) → handoff to a healthy neighbour
         LIFECYCLE_EVICT     = 3    // crash / lease vencido
     };
 
-    // §3.8 (P8): backend de SPAWN abstracto. El orquestador NO conoce la infra: cada backend implementa
-    // create/destroy/resize con la MISMA semántica de ciclo de vida (§3.9), de modo que standalone y
-    // cluster se comportan igual (F14). El modo solo cambia cómo se materializa un nodo:
-    //   - LOCAL:     fork/exec del binario zone_node en el mismo nodo (dev/demo/portable, 1 nodo).
-    //   - K8S:       API kubernetes desde dentro del clúster (ServiceAccount) — el modo cluster real.
-    //   - TERRAFORM: infra ya provisionada por `dgs up --terraform`; el spawn aplica el MISMO manifest
-    //                vía `kubectl apply` (paridad con K8S, pero el clúster lo levantó terraform).
+    // §3.8 (P8): abstract SPAWN backend. The orchestrator does NOT know the infrastructure: every
+    // backend implements create/destroy/resize with the SAME lifecycle semantics (§3.9), so standalone
+    // and cluster behave identically (F14). The mode only changes how a node is materialised:
+    //   - LOCAL:     fork/exec of the zone_node binary on this same machine (dev/demo/portable, 1 node).
+    //   - K8S:       the kubernetes API from inside the cluster (ServiceAccount) — the real cluster mode.
+    //   - TERRAFORM: infrastructure already provisioned by `dgs up --terraform`; spawn applies the SAME
+    //                manifest via `kubectl apply` (parity with K8S, but terraform raised the cluster).
     enum class SpawnBackend : uint8_t
     {
         SPAWN_LOCAL     = 0,
@@ -68,8 +72,8 @@ namespace DGS
         SPAWN_TERRAFORM = 2
     };
 
-    // Resuelve el backend una sola vez. Precedencia: env DGS_SPAWN_BACKEND (local/k8s/terraform);
-    // si no está, K8S si corre in-cluster (hay ServiceAccount), si no LOCAL (portable/standalone).
+    // Resolves the backend exactly once. Precedence: env DGS_SPAWN_BACKEND (local/k8s/terraform);
+    // failing that, K8S if running in-cluster (a ServiceAccount exists), otherwise LOCAL (portable).
     static SpawnBackend resolveSpawnBackend()
     {
         const char* v = std::getenv("DGS_SPAWN_BACKEND");
@@ -91,13 +95,13 @@ namespace DGS
                 : socket(s), currentReplicas(1), backend(resolveSpawnBackend()) {}
             std::vector<ZoneInfo> activeZones;
 
-            // §3.8 (P8): acceso al backend activo (el head lo expone para el CLI `dgs status`).
+            // §3.8 (P8): access to the active backend (the head exposes it for the `dgs status` CLI).
             SpawnBackend spawnBackend() const { return backend; }
             void setSpawnBackend(SpawnBackend b) { backend = b; }
 
             void updateNodeTopology(int fd, const ServerMetrics& m)
             {
-                lastSeenMs[fd] = steadyMs();   // §3.9: lease/evicción por estancamiento
+                lastSeenMs[fd] = steadyMs();   // §3.9: lease/eviction on staleness
 
                 for (auto& zone : activeZones)
                 {
@@ -112,7 +116,7 @@ namespace DGS
                     }
                 }
 
-                if (!isRoutable(fd)) return;   // §3.9: zona cesando/muerta no se re-registra
+                if (!isRoutable(fd)) return;   // §3.9: a retiring/dead zone is not re-registered
 
                 ZoneInfo info{};
                 info.fd        = fd;
@@ -123,9 +127,9 @@ namespace DGS
                 info.port = m.node.port;
                 activeZones.push_back(info);
 
-                // §3.9 gap 2: el zone-node BASE no pasa por spawnZoneNode, así que `portToName` no
-                // conoce su deployment (port 42425 → "zone-node"). Registrarlo aquí para que la
-                // evicción por lease / el drain puedan borrar SU pod también (no fuga réplicas).
+                // §3.9 gap 2: the BASE zone-node never goes through spawnZoneNode, so `portToName`
+                // does not know its deployment (port 42425 → "zone-node"). Register it here so lease
+                // eviction and draining can delete ITS pod too (no leaked replicas).
                 if (!portToName.count(info.port))
                 {
                     const int basePort = (int)evalCfg("ZONE_BASE_PORT", 42425);
@@ -137,7 +141,7 @@ namespace DGS
             {
                 for (const auto& zone : activeZones)
                 {
-                    if (!isRoutable(zone.fd)) continue;   // §3.9: DRAINING/DEAD no recibe nada
+                    if (!isRoutable(zone.fd)) continue;   // §3.9: DRAINING/DEAD receives nothing
                     if (chunkX >= zone.chunkXMin && chunkX <= zone.chunkXMax &&
                         chunkY >= zone.chunkYMin && chunkY <= zone.chunkYMax &&
                         chunkZ >= zone.chunkZMin && chunkZ <= zone.chunkZMax) return zone.fd;
@@ -176,7 +180,7 @@ namespace DGS
                 for (const auto& z : activeZones)
                 {
                     if (z.fd == fd) continue;
-                    if (!isRoutable(z.fd)) continue;   // §3.9: no contar zonas drenadas/vencidas como vecinas
+                    if (!isRoutable(z.fd)) continue;   // §3.9: do not count drained/expired zones as neighbours
 
                     bool adjX = origin->chunkXMin <= z.chunkXMax + 1 && z.chunkXMin <= origin->chunkXMax + 1;
                     bool adjY = origin->chunkYMin <= z.chunkYMax + 1 && z.chunkYMin <= origin->chunkYMax + 1;
@@ -215,8 +219,8 @@ namespace DGS
                 static const int    sweepEveryMs = (int)evalCfg("EVAL_SWEEP_MS", 10000);
                 static const uint32_t mergeMinEntities = (uint32_t)evalCfg("EVAL_MERGE_ENTITIES", 1);
 
-                // §3.9 fail-safe del drain: si el nodo no ack dentro del timeout, volver a READY
-                // (nunca dejar la región vacía).
+                // §3.9 drain fail-safe: if the node does not ack within the timeout, go back to READY
+                // (never leave the region empty).
                 if (zoneState(nodeFD) == ZoneState::DRAINING)
                 {
                     auto dl = drainDeadlineMs.find(nodeFD);
@@ -231,7 +235,7 @@ namespace DGS
                     }
                 }
 
-                // Evicción de pods zombies (crash / lease vencido) cada ~sweepEveryMs.
+                // Eviction of zombie pods (crash / expired lease) every ~sweepEveryMs.
                 uint64_t nowMs = steadyMs();
                 if (nowMs - lastSweepMs > (uint64_t)sweepEveryMs)
                 {
@@ -239,10 +243,11 @@ namespace DGS
                     sweepStaleZones();
                 }
 
-                // Rastrea la ventana "bajo carga" para la fusión (histéresis §3.9). La fusión no solo se
-                // dispara por RAM baja: una zona con POCAS ENTIDADES activas (jugadores visitando, sin
-                // vecindad) es candidata a ceder su rango aunque tenga RAM media — es el "remove zone_nodes
-                // based on players count" del TODO. Umbral configurable (EVAL_MERGE_ENTITIES, def 1).
+                // Tracks the "under load" window for merging (hysteresis §3.9). A merge is not only
+                // triggered by low RAM: a zone with FEW active entities (visiting players, no
+                // neighbourhood) is a candidate to give up its range even at medium RAM — this is the
+                // TODO's "remove zone_nodes based on players count". Threshold configurable
+                // (EVAL_MERGE_ENTITIES, default 1).
                 auto lowIt = lowSinceMs.find(nodeFD);
                 bool idleEntities = m.activeEntities <= mergeMinEntities;
                 if (m.ramUsage < mergeLoad || idleEntities)
@@ -252,7 +257,7 @@ namespace DGS
                 else
                     lowSinceMs.erase(nodeFD);
 
-                // --- Estado EWMA por nodo (tasas de banda). Contadores acumulados → Δ libre de ventana.
+                // --- Per-node EWMA state (bandwidth rates). Accumulated counters → window-free Δ.
                 MetricsRate& r = metricRates[nodeFD];
 
                 if (!r.haveBaseline)
@@ -261,27 +266,27 @@ namespace DGS
                     r.lastBytesTx = m.bytesTx;
                     r.lastStartTimeS = m.startTimeS;
                     r.haveBaseline = true;
-                    processLifecycleQueue();   // P9b: drenar ops ya pendientes aunque esta sea baseline
-                    return;   // primera muestra: solo baseline, no decide
+                    processLifecycleQueue();   // P9b: drain pending ops even though this is a baseline
+                    return;   // first sample: baseline only, decides nothing
                 }
 
-                // Nodo REINICIADO (startTimeS cambio): descartar baseline viejo de contadores.
+                // RESTARTED node (startTimeS changed): drop the stale counter baseline.
                 if (r.lastStartTimeS != 0 && m.startTimeS != 0 && m.startTimeS != r.lastStartTimeS)
                 {
                     r.lastBytesRx = m.bytesRx;
                     r.lastBytesTx = m.bytesTx;
                     r.lastStartTimeS = m.startTimeS;
-                    processLifecycleQueue();   // P9b: no dejar de drenar la cola
+                    processLifecycleQueue();   // P9b: keep draining the queue
                     return;
                 }
 
-                // Δ sin signo (resta modular, inmune a reinicio de contador uint64).
+                // Unsigned Δ (modular subtraction, immune to a uint64 counter wrapping).
                 uint64_t dRx = m.bytesRx - r.lastBytesRx;
                 uint64_t dTx = m.bytesTx - r.lastBytesTx;
                 r.lastBytesRx = m.bytesRx;
                 r.lastBytesTx = m.bytesTx;
 
-                // EWMA de la tasa en bytes/s (el tiempo real entre muestras es ~100ms del tick de zona).
+                // EWMA of the rate in bytes/s (real inter-sample time is the zone's ~100 ms tick).
                 double rxRate = (double)dRx / dtEst;
                 double txRate = (double)dTx / dtEst;
                 if (!r.haveEwma)
@@ -296,20 +301,20 @@ namespace DGS
                     r.txEWMA = alpha * txRate + (1.0 - alpha) * r.txEWMA;
                 }
 
-                // --- Decisión: tres señales independientes, UNA cola de vida (§4.2, P6/P9b) ---
-                // Ninguna señal muta el clúster aquí: encola su operación y `processLifecycleQueue()`
-                // (abajo) ejecuta UNA por tick por prioridad. El cooldown del split, la ventana del
-                // merge y la disponibilidad de vecino en el traspaso se comprueban al ejecutar.
+                // --- Decision: three independent signals, ONE lifecycle queue (§4.2, P6/P9b) ---
+                // No signal mutates the cluster here: each enqueues its operation and
+                // `processLifecycleQueue()` (below) runs ONE per tick by priority. The split cooldown,
+                // the merge window and neighbour availability for a handoff are checked at execution.
                 bool load          = m.ramUsage     >  loadTh && m.performance < perfTh;
                 bool netSaturated  = r.txEWMA > 0 &&
-                                     r.txEWMA / (r.rxEWMA + 1.0) > asymmTh;   // manda mucho mas de lo que recibe
+                                     r.txEWMA / (r.rxEWMA + 1.0) > asymmTh;   // sends far more than it receives
                 bool failureProne  = m.failedTransfers > (uint32_t)failTh;    // validador/traspaso va mal
 
                 if (failureProne)
                 {
-                    // P6 (P2+O5, F1): el nodo está fallando (timeouts de validación / traspasos rotos).
-                    // No se escala hacia arriba: se REASIGNA su región a un vecino sano (traspaso por
-                    // métrica fallida). Prioridad 2 (tras crash, antes que merge/split).
+                    // P6 (P2+O5, F1): the node is failing (validation timeouts / broken handoffs).
+                    // It is not scaled up: its region is REASSIGNED to a healthy neighbour (handoff on a
+                    // failed metric). Priority 2 (after crash, before merge/split).
                     std::cout << "[Orchestrator] fallo fd=" << nodeFD
                               << " failedTransfers=" << m.failedTransfers
                               << " -> encolado REASSIGN" << std::endl;
@@ -322,19 +327,19 @@ namespace DGS
                               << ") -> encolado SPLIT" << std::endl;
                     enqueueLifecycle(nodeFD, LifecycleOp::LIFECYCLE_SPLIT);
                 }
-                // §3.9 Escalado DOWN (fusión): solo si el nodo está bajo de carga de forma consistente
-                // (ventana + histéresis) y hay vecina menor que drenar. Al encolar MERGE, la cola lo
-                // ordena detrás de un crash/lease pendiente y nunca en el mismo tick que un split.
+                // §3.9 scaling DOWN (merge): only if the node is consistently under load (window +
+                // hysteresis) and there is a smaller neighbour to drain. Enqueuing MERGE puts it behind
+                // any pending crash/lease and never in the same tick as a split.
                 else if (lowSinceMs.count(nodeFD))
                     enqueueLifecycle(nodeFD, LifecycleOp::LIFECYCLE_MERGE);
 
-                // P9b: drenar la cola de vida (a lo sumo UNA operación por evaluación).
+                // P9b: drain the lifecycle queue (at most ONE operation per evaluation).
                 processLifecycleQueue();
             }
 
             // ---------------------------------------------------------------------------------------
-            // §3.9 CICLO DE VIDA de zonas: fusión/escalado down, destrucción ordenada, evicción de
-            // zombies y fail-safe del drain. Estados: PROVISIONING → READY → DRAINING → DESTROYED (+ DEAD).
+            // §3.9 zone LIFECYCLE: merge/scale-down, orderly destruction, zombie eviction and the drain
+            // fail-safe. States: PROVISIONING → READY → DRAINING → DESTROYED (+ DEAD).
             // ---------------------------------------------------------------------------------------
 
             void markZoneState(int fd, ZoneState s) { zoneStates[fd] = s; }
@@ -351,7 +356,30 @@ namespace DGS
                 return s != ZoneState::DRAINING && s != ZoneState::DEAD && s != ZoneState::DESTROYED;
             }
 
-            // Procesa el ACK de un PKT_DRAIN (aceptado por el nodo) → confirma destrucción.
+            /// How many zones are actually SERVING right now — derived from the topology, so it cannot
+            /// drift.
+            ///
+            /// ⚠️ THIS EXISTS BECAUSE `currentReplicas` LIES, AND LYING ONE WAY IS PERMANENT.
+            /// `currentReplicas` is only incremented by zones the orchestrator SPAWNED itself, but it is
+            /// decremented for EVERY zone that leaves — and a zone can join on its own (the base
+            /// zone-node, or a replica deployed by hand: they simply connect and register through
+            /// `updateNodeTopology`). So the counter drifts downwards and never recovers. Measured with
+            /// a probe: three self-registered zones evicted took it from 1 to **-2**, and it stayed at
+            /// -2 while two healthy zones rejoined. Since `tryMergeDown` and `tryReassign` both guard on
+            /// `currentReplicas <= EVAL_MIN_REPLICAS` (default 1), that silently disabled merging AND
+            /// the handoff-on-failure for the whole cluster, for the life of the process — the exact
+            /// moment a failing zone most needs to be handed over.
+            ///
+            /// The guards want to know "how many zones would still be serving if I gave this one up".
+            /// That is this number, and it is computed from `activeZones`, so no bookkeeping can rot.
+            int routableZoneCount() const
+            {
+                int n = 0;
+                for (const auto& z : activeZones) if (isRoutable(z.fd)) ++n;
+                return n;
+            }
+
+            // Processes the ACK of a PKT_DRAIN (accepted by the node) → confirms destruction.
             void handleZoneLifecycle(int fd, const ZoneLifecycle& lc)
             {
                 if (zoneState(fd) != ZoneState::DRAINING)
@@ -367,30 +395,30 @@ namespace DGS
                     return;
                 }
 
-                std::cout << "[Orchestrator] Drain OK fd=" << fd << " -> destruyo la zona" << std::endl;
+                std::cout << "[Orchestrator] Drain OK fd=" << fd << " -> destroying the zone" << std::endl;
 
-                // 1) El superviviente ya absorbió el rango en la topología (absorbRegion al pedir el
-                //    drain). 2) Borrar el pod (deployment+service) para no fugar réplicas/zombies.
+                // 1) The survivor already absorbed the range in the topology (absorbRegion when the
+                //    drain was requested). 2) Delete the pod (deployment+service) so no replicas leak.
                 deleteZoneNode(fd);
 
-                // 3) Retirar de activeZones, decrementar réplicas, marcar DESTROYED.
+                // 3) Remove from activeZones, decrement replicas, mark DESTROYED.
                 removeFromActiveZones(fd);
-                --currentReplicas;
+                if (currentReplicas > 0) --currentReplicas;   // never report a negative replica count
                 markZoneState(fd, ZoneState::DESTROYED);
                 drainDeadlineMs.erase(fd);
                 drainRequestId.erase(fd);
                 drainTarget.erase(fd);
                 lastLifecycleMs[fd] = steadyMs();   // anti-flappy: asentamiento
 
-                // 4) Confirmar al nodo su salida (puede no haber recibido el borrado del pod).
+                // 4) Confirm its exit to the node (it may not have seen the pod deletion).
                 DGS::ZoneLifecycle del{ lc.requestId, 0 };
                 DGS::Packet pDel; pDel.packDelete(del);
                 socket.send(fd, pDel.getRawData(), pDel.getSize());
             }
 
-            // Evicción por estancamiento (lease vencido): el pod zombie (crash sin borrar) se elimina
-            // para no fugar réplicas (§3.9 muerte no planificada, F3/F4). Detecta y ENCOLA la evicción
-            // en la cola de vida (P9b): no borra inline — la prioridad la ordena frente a merge/split.
+            // Eviction on staleness (expired lease): the zombie pod (crashed without deletion) is
+            // removed so replicas do not leak (§3.9 unplanned death, F3/F4). It detects and ENQUEUES the
+            // eviction (P9b): it does not delete inline — priority orders it against merge/split.
             void sweepStaleZones()
             {
                 uint64_t now = steadyMs();
@@ -411,8 +439,8 @@ namespace DGS
                 }
             }
 
-            // P9b: encola una operación de vida para `fd`. Si ya hay otra pendiente para la misma zona,
-            // se queda la de MAYOR prioridad (crash>merge>split).
+            // P9b: enqueues a lifecycle operation for `fd`. If another is already pending for the same
+            // zone, the HIGHER priority one wins (crash>merge>split).
             void enqueueLifecycle(int fd, LifecycleOp op)
             {
                 auto it = pendingLifecycle.find(fd);
@@ -420,11 +448,11 @@ namespace DGS
                     pendingLifecycle[fd] = op;
             }
 
-            // P6 (F1): el head llama esto al recibir PKT_VALIDATOR_STATUS con state=DOWN/OPEN (circuito
-            // abierto del validador). El nodo `fd` está sirviendo sin veredicto → el master reasigna su
-            // región a un vecino sano (traspaso por métrica fallida). El `failedTransfers` acumulado del
-            // status también alimenta el trigger de evaluateServer; aquí el disparo es EXPLÍCITO y
-            // priorizado por encima de merge/split (LIFECYCLE_REASSIGN).
+            // P6 (F1): the head calls this on receiving PKT_VALIDATOR_STATUS with state=DOWN/OPEN (the
+            // validator's breaker open). Node `fd` is serving without verdicts → the master reassigns its
+            // region to a healthy neighbour (handoff on a failed metric). The status's accumulated
+            // `failedTransfers` also feeds evaluateServer's trigger; here the trip is EXPLICIT and
+            // prioritised above merge/split (LIFECYCLE_REASSIGN).
             void notifyValidatorDown(int fd, const DGS::ValidatorStatus& st)
             {
                 std::cout << "[Orchestrator] Validador DOWN/OPEN en fd=" << fd
@@ -435,38 +463,38 @@ namespace DGS
                 processLifecycleQueue();
             }
 
-            // P9b: procesa la cola de vida. Ejecuta UNA operación por llamada —la de mayor prioridad de
-            // todo el sistema que NO esté en asentamiento anti-flappy por zona (EVAL_LIFECYCLE_SETTLE_S).
-            // Devuelve true si ejecutó una operación (para no ejecutar dos en el mismo tick).
+            // P9b: processes the lifecycle queue. Runs ONE operation per call — the highest priority in
+            // the whole system that is NOT inside its zone's anti-flapping settle window
+            // (EVAL_LIFECYCLE_SETTLE_S). Returns true if an operation ran (so two never run in one tick).
             bool processLifecycleQueue()
             {
                 if (pendingLifecycle.empty()) return false;
 
                 static const uint64_t settleMs = (uint64_t)evalCfg("EVAL_LIFECYCLE_SETTLE_S", 30.0f) * 1000;
 
-                // Iterar en orden de prioridad descendente (crash>merge>split); ejecutar la primera cuya
-                // zona ya se asentó. Si la de mayor prioridad está en settle, saltar a la siguiente — una
-                // zona en asentamiento NO bloquea las operaciones de las demás.
+                // Iterate in descending priority (crash>merge>split); run the first whose zone has
+                // already settled. If the highest priority one is settling, skip to the next — a settling
+                // zone does NOT block the other zones' operations.
                 int         bestFd  = -1;
                 LifecycleOp bestOp  = LifecycleOp::LIFECYCLE_SPLIT;
                 int         bestPri = -1;
                 for (const auto& kv : pendingLifecycle)
                 {
-                    if ((int)kv.second < bestPri) continue;   // prioridad no supera la mejor candidata
+                    if ((int)kv.second < bestPri) continue;   // priority does not beat the best candidate
                     if ((int)kv.second == bestPri && bestFd >= 0) continue;   // igual prioridad: cualquiera
 
                     auto lc = lastLifecycleMs.find(kv.first);
                     if (lc != lastLifecycleMs.end() && steadyMs() - lc->second < settleMs)
                     {
-                        std::cout << "[Orchestrator] Asentamiento anti-flappy fd=" << kv.first
-                                  << " (queda " << (settleMs - (steadyMs() - lc->second)) / 1000
-                                  << "s) -> pospongo op " << (int)kv.second << std::endl;
-                        continue;   // esta zona no; probar la siguiente en prioridad
+                        std::cout << "[Orchestrator] anti-flapping settle fd=" << kv.first
+                                  << " (" << (settleMs - (steadyMs() - lc->second)) / 1000
+                                  << "s left) -> postponing op " << (int)kv.second << std::endl;
+                        continue;   // not this zone; try the next by priority
                     }
 
                     bestFd = kv.first; bestOp = kv.second; bestPri = (int)kv.second;
                 }
-                if (bestFd < 0) return false;   // todas en asentamiento: reintentar en el próximo tick
+                if (bestFd < 0) return false;   // all settling: retry on the next tick
 
                 pendingLifecycle.erase(bestFd);
 
@@ -485,20 +513,20 @@ namespace DGS
             std::map<int, MetricsRate> metricRates;
             int currentReplicas;
             int nextNodePort { 30426 };
-            SpawnBackend backend;   // §3.8 (P8): backend de spawn activo (LOCAL/K8S/TERRAFORM)
-            std::map<std::string, pid_t> localPids;   // LOCAL: nombre zone-node → pid (para SIGTERM)
+            SpawnBackend backend;   // §3.8 (P8): active spawn backend (LOCAL/K8S/TERRAFORM)
+            std::map<std::string, pid_t> localPids;   // LOCAL: zone-node name → pid (for SIGTERM)
             std::map<int, std::chrono::steady_clock::time_point> lastScaleTime;
 
-            // --- Estado de vida por zona (§3.9) ---
+            // --- Per-zone lifecycle state (§3.9) ---
             std::map<int, ZoneState>       zoneStates;
-            std::map<int, uint64_t>        lastSeenMs;      // lease/evicción por estancamiento
-            std::map<int, uint64_t>        lowSinceMs;      // desde cuándo está bajo el umbral de fusión
-            std::map<int, uint64_t>        lastLifecycleMs; // anti-flappy: asentamiento entre ops
-            std::map<int, uint64_t>        drainDeadlineMs; // fail-safe del drain
+            std::map<int, uint64_t>        lastSeenMs;      // lease/eviction on staleness
+            std::map<int, uint64_t>        lowSinceMs;      // since when it has been below the merge threshold
+            std::map<int, uint64_t>        lastLifecycleMs; // anti-flapping: settle time between ops
+            std::map<int, uint64_t>        drainDeadlineMs; // drain fail-safe
             std::map<int, uint32_t>        drainRequestId;
-            std::map<int, int>             drainTarget;     // superviviente que absorbe
-            std::map<int, std::string>     portToName;      // NodePort UDP → nombre del deployment
-            std::map<int, LifecycleOp>     pendingLifecycle;// P9b: cola de vida con prioridad
+            std::map<int, int>             drainTarget;     // the survivor absorbing it
+            std::map<int, std::string>     portToName;      // UDP NodePort → deployment name
+            std::map<int, LifecycleOp>     pendingLifecycle;// P9b: priority lifecycle queue
             uint64_t                       lastSweepMs = 0;
             uint32_t                       lcSeq = 1;
 
@@ -521,14 +549,14 @@ namespace DGS
                 return nullptr;
             }
 
-            // Expande la topología del superviviente para cubrir la unión (así findTargetNode enruta al
-            // superviviente mientras el drenado cede). El nodo aplica el nuevo rango vía su env (la
-            // zona relee CHUNK_* cada tick) — la resección del deployment es operación del backend (§3.8).
+            // Expands the survivor's topology to cover the union (so findTargetNode routes to the
+            // survivor while the draining node gives up). The node applies the new range through its env
+            // (the zone re-reads CHUNK_* every tick) — resizing the deployment is a backend job (§3.8).
             void absorbRegion(int survivorFD, int victimFD)
             {
                 const ZoneInfo* s = findZoneInfo(survivorFD);
                 const ZoneInfo* v = findZoneInfo(victimFD);
-                if (!s || !v) { std::cout << "[Orchestrator] absorbRegion: zona no en topologia" << std::endl; return; }
+                if (!s || !v) { std::cout << "[Orchestrator] absorbRegion: zone not in the topology" << std::endl; return; }
                 int32_t nXMin = std::min(s->chunkXMin, v->chunkXMin), nXMax = std::max(s->chunkXMax, v->chunkXMax);
                 int32_t nYMin = std::min(s->chunkYMin, v->chunkYMin), nYMax = std::max(s->chunkYMax, v->chunkYMax);
                 int32_t nZMin = std::min(s->chunkZMin, v->chunkZMin), nZMax = std::max(s->chunkZMax, v->chunkZMax);
@@ -543,7 +571,7 @@ namespace DGS
                           << " X[" << nXMin << "-" << nXMax << "]" << std::endl;
             }
 
-            // Nº de chunks de una zona (heurística de "cuál es la más pequeña").
+            // Number of chunks in a zone (the "which is smallest" heuristic).
             static int64_t zoneVolume(const ZoneInfo& z)
             {
                 return (int64_t)(z.chunkXMax - z.chunkXMin + 1) *
@@ -551,9 +579,9 @@ namespace DGS
                        (z.chunkZMax - z.chunkZMin + 1);
             }
 
-            // §3.9 (P9b): ejecución de la evicción por lease/crash (prioridad máx: crash>merge>split).
-            // El pod zombie se borra y la zona se retira de la topología (mismo cuerpo que el antiguo
-            // inline de sweepStaleZones, ahora serializado por la cola de vida).
+            // §3.9 (P9b): executes the lease/crash eviction (top priority: crash>merge>split).
+            // The zombie pod is deleted and the zone removed from the topology (the same body as the old
+            // inline path in sweepStaleZones, now serialised through the lifecycle queue).
             void evictStaleZone(int fd)
             {
                 std::cout << "[Orchestrator] EVICT fd=" << fd << " (pod zombie)" << std::endl;
@@ -562,13 +590,13 @@ namespace DGS
                 drainDeadlineMs.erase(fd);
                 drainRequestId.erase(fd);
                 drainTarget.erase(fd);
-                --currentReplicas;
+                if (currentReplicas > 0) --currentReplicas;   // never report a negative replica count
                 removeFromActiveZones(fd);
             }
 
-            // §3.9 (P9b): ejecución del SPLIT (escalado up) serializado por la cola de vida. Antes vivía
-            // inline en evaluateServer; ahora es una operación de la cola con prioridad SPLIT (la menor,
-            // tras crash y merge) y el cooldown sigue aplicándose por zona (lastScaleTime).
+            // §3.9 (P9b): executes the SPLIT (scale up), serialised through the lifecycle queue. It used
+            // to live inline in evaluateServer; it is now a queue operation with SPLIT priority (the
+            // lowest, after crash and merge) and the cooldown still applies per zone (lastScaleTime).
             void trySplitDown(int fd)
             {
                 static const int cooldown = (int)evalCfg("EVAL_COOLDOWN_S", 30.0f);
@@ -604,26 +632,26 @@ namespace DGS
                 }
             }
 
-            // Fusión (escalado down): elige la vecina más pequeña como víctima, pide drain, y deja que
-            // el superviviente la absorba en topología. Requiere histéresis + ventana + anti-flappy.
+            // Merge (scale down): picks the smallest neighbour as the victim, requests a drain, and lets
+            // the survivor absorb it in the topology. Needs hysteresis + window + anti-flapping.
             bool tryMergeDown(int fd)
             {
                 static const int    mergeWindowS  = (int)evalCfg("EVAL_MERGE_WINDOW_S", 120);
                 static const int    drainTimeoutS = (int)evalCfg("EVAL_DRAIN_TIMEOUT_S", 15);
                 static const int    minReplicas   = (int)evalCfg("EVAL_MIN_REPLICAS", 1);
 
-                if (currentReplicas <= minReplicas) return false;
+                if (routableZoneCount() <= minReplicas) return false;
                 if (zoneState(fd) != ZoneState::READY) return false;
 
                 const ZoneInfo* me = findZoneInfo(fd);
                 if (!me) return false;
 
-                // Anti-flappy: no iniciar nada si acabamos de hacer una operación de vida en esta zona.
+                // Anti-flapping: start nothing if we have just run a lifecycle operation on this zone.
                 auto lc = lastLifecycleMs.find(fd);
                 if (lc != lastLifecycleMs.end() &&
                     steadyMs() - lc->second < (uint64_t)mergeWindowS * 1000) return false;
 
-                // Elegir la vecina (cara) más pequeña como víctima.
+                // Pick the smallest (face) neighbour as the victim.
                 auto neighs = findNeighbors(fd, NeighborMode::FACE);
                 const ZoneInfo* victim = nullptr;
                 for (int nfd : neighs)
@@ -634,16 +662,16 @@ namespace DGS
                 }
                 if (!victim)
                 {
-                    lowSinceMs.erase(fd);   // sin pareja viable → reiniciar la ventana
+                    lowSinceMs.erase(fd);   // no viable partner → restart the window
                     return false;
                 }
 
-                // ventana de carga baja consistente (histéresis: no tras una sola métrica).
+                // a consistent low-load window (hysteresis: never off a single metric).
                 auto lowIt = lowSinceMs.find(fd);
                 if (lowIt == lowSinceMs.end()) { lowSinceMs[fd] = steadyMs(); return false; }
                 if (steadyMs() - lowIt->second < (uint64_t)mergeWindowS * 1000) return false;
 
-                // INICIO del drain.
+                // START of the drain.
                 int victimFD = victim->fd;
                 uint32_t req = lcSeq++;
                 drainRequestId[victimFD] = req;
@@ -652,7 +680,7 @@ namespace DGS
                 markZoneState(victimFD, ZoneState::DRAINING);
                 markZoneState(fd, ZoneState::READY);
                 lastLifecycleMs[victimFD] = steadyMs();
-                lastLifecycleMs[fd]       = steadyMs();   // el superviviente tampoco escala hasta asentar
+                lastLifecycleMs[fd]       = steadyMs();   // the survivor does not scale until it settles
                 lowSinceMs.erase(fd);
 
                 absorbRegion(fd, victimFD);
@@ -667,23 +695,23 @@ namespace DGS
                 return true;
             }
 
-            // P6 (P2+O5, F1): TRASPASO POR MÉTRICA FALLIDA. El nodo `fd` está fallando (timeouts de
-            // validación / traspasos rotos / validador caído) → cede SU región a un vecino sano y
-            // entra en DRAINING; el vecino absorbe el rango en topología (absorbRegion) y el fd se
-            // drena (vía el mismo camino que el merge: PKT_DRAIN → ack → DELETE_ZONE). Es el espejo
-            // de tryMergeDown: allí el fd ocioso es superviviente; aquí el fd fallido es la VÍCTIMA.
+            // P6 (P2+O5, F1): HANDOFF ON A FAILED METRIC. Node `fd` is failing (validation timeouts /
+            // broken handoffs / validator down) → it cedes ITS region to a healthy neighbour and enters
+            // DRAINING; the neighbour absorbs the range in the topology (absorbRegion) and the fd is
+            // drained (through the same path as a merge: PKT_DRAIN → ack → DELETE_ZONE). It mirrors
+            // tryMergeDown: there the idle fd is the survivor; here the failing fd is the VICTIM.
             bool tryReassign(int fd)
             {
                 static const int    drainTimeoutS = (int)evalCfg("EVAL_DRAIN_TIMEOUT_S", 15);
                 static const int    minReplicas   = (int)evalCfg("EVAL_MIN_REPLICAS", 1);
 
-                if (currentReplicas <= minReplicas) return false;
+                if (routableZoneCount() <= minReplicas) return false;
                 if (zoneState(fd) != ZoneState::READY) return false;
 
                 const ZoneInfo* me = findZoneInfo(fd);
                 if (!me) return false;
 
-                // Vecino sano (cara) que absorba la región; preferir el de mayor volumen (más capacidad).
+                // A healthy (face) neighbour to absorb the region; prefer the largest volume (most capacity).
                 auto neighs = findNeighbors(fd, NeighborMode::FACE);
                 const ZoneInfo* survivor = nullptr;
                 for (int nfd : neighs)
@@ -695,11 +723,11 @@ namespace DGS
                 if (!survivor)
                 {
                     std::cout << "[Orchestrator] REASSIGN fd=" << fd
-                              << " sin vecino sano -> mantengo la zona" << std::endl;
+                              << " no healthy neighbour -> keeping the zone" << std::endl;
                     return false;
                 }
 
-                // INICIO del traspaso: fd cede, el vecino absorbe.
+                // START of the handoff: fd cedes, the neighbour absorbs.
                 int survivorFD = survivor->fd;
                 uint32_t req = lcSeq++;
                 drainRequestId[fd] = req;
@@ -729,8 +757,8 @@ namespace DGS
                 auto it = portToName.find(z->port);
                 if (it == portToName.end())
                 {
-                    std::cout << "[Orchestrator] Sin nombre de deployment para fd=" << fd
-                              << " (port " << z->port << ") -> solo topologia" << std::endl;
+                    std::cout << "[Orchestrator] No deployment name for fd=" << fd
+                              << " (port " << z->port << ") -> topology only" << std::endl;
                     return;
                 }
                 const std::string name = it->second;
@@ -744,7 +772,7 @@ namespace DGS
                 portToName.erase(z->port);
             }
 
-            // §3.8 (P8) LOCAL: el pod es un proceso forkeado en el mismo nodo → se termina con SIGTERM.
+            // §3.8 (P8) LOCAL: the pod is a forked process on this machine → terminated with SIGTERM.
             void deleteLocalNode(const std::string& name)
             {
                 auto it = localPids.find(name);
@@ -764,7 +792,7 @@ namespace DGS
             }
 
             // §3.8 (P8) K8S/TERRAFORM: borra Deployment+Service. Con TERRAFORM usa `kubectl delete -f`
-            // (el clúster lo provisionó terraform); con K8S llama a la API desde el ServiceAccount.
+            // (terraform provisioned the cluster); with K8S it calls the API from the ServiceAccount.
             void deleteK8sNode(const std::string& name, bool viaKubectl)
             {
                 if (viaKubectl)
@@ -805,7 +833,7 @@ namespace DGS
                                    std::istreambuf_iterator<char>());
             }
 
-            // §3.8 (P8): directorio de manifests para el backend TERRAFORM (kubectl apply -f).
+            // §3.8 (P8): manifest directory for the TERRAFORM backend (kubectl apply -f).
             static std::string k8sManifestPath(const std::string& name)
             {
                 const char* dir = std::getenv("DGS_MANIFEST_DIR");
@@ -837,7 +865,7 @@ namespace DGS
                                int32_t yMin, int32_t yMax,
                                int32_t zMin, int32_t zMax)
             {
-                // §3.8 (P8): el backend de spawn es abstracto — la lógica de ciclo de vida NO cambia.
+                // §3.8 (P8): the spawn backend is abstract — the lifecycle logic does NOT change.
                 switch (backend)
                 {
                     case SpawnBackend::SPAWN_LOCAL:     return spawnLocalNode(xMin, xMax, yMin, yMax, zMin, zMax);
@@ -846,10 +874,10 @@ namespace DGS
                 }
             }
 
-            // §3.8 (P8): lista de env de topología de una zona (KEY=VALUE), la MISMA para todos los
-            // backends (LOCAL via putenv, K8S/TERRAFORM como env del container en el manifest). Así la
-            // paridad de comportamiento es por CONSTRUCCIÓN: cualquier diferencia entre modos estaría
-            // aquí y fallaría el test de paridad (tests/spawn_parity_test.cpp).
+            // §3.8 (P8): a zone's topology env list (KEY=VALUE), the SAME for every backend (LOCAL via
+            // putenv, K8S/TERRAFORM as the container's env in the manifest). Behavioural parity is thus
+            // by CONSTRUCTION: any difference between modes would live here and would fail the parity
+            // test (tests/spawn_parity_test.cpp).
         public:
             static std::vector<std::string> zoneSpawnEnv(int32_t xMin, int32_t xMax,
                                                          int32_t yMin, int32_t yMax,
@@ -874,11 +902,11 @@ namespace DGS
                 };
             }
 
-            // §3.8 (P8) LOCAL: el "pod" es un proceso forkeado con el MISMO env de topología que el
+            // §3.8 (P8) LOCAL: the "pod" is a forked process with the SAME topology env as the
             // manifest k8s (CHUNK_*, ZONE_UDP_PORT, HEAD_SERVER_HOST, VALIDATOR_HOST, SOCIAL_HOST).
-            // El binario a ejecutar se toma de DGS_ZONE_BIN (def "zone_node"); se registra el pid por
-            // nombre para `deleteLocalNode` (SIGTERM + waitpid). Paridad de comportamiento: mismo env,
-            // misma secuencia de ciclo de vida — solo cambia la materialización.
+            // The binary comes from DGS_ZONE_BIN (default "zone_node"); the pid is registered by name
+            // for `deleteLocalNode` (SIGTERM + waitpid). Behavioural parity: same env, same lifecycle
+            // sequence — only the materialisation differs.
             bool spawnLocalNode(int32_t xMin, int32_t xMax,
                                 int32_t yMin, int32_t yMax,
                                 int32_t zMin, int32_t zMax)
@@ -897,7 +925,7 @@ namespace DGS
                 if (pid < 0) { std::cerr << "[Orchestrator] fork LOCAL fallo" << std::endl; --nextNodePort; return false; }
                 if (pid == 0)
                 {
-                    // Hijo: se convierte en el zone_node con el env de topología (mismo que k8s).
+                    // Child: becomes the zone_node with the topology env (the same one k8s gets).
                     auto env = zoneSpawnEnv(xMin, xMax, yMin, yMax, zMin, zMax, udpPort,
                                             headHost, headPort, podIP);
                     for (const auto& kv : env) putenv(const_cast<char*>(kv.c_str()));
@@ -914,9 +942,9 @@ namespace DGS
                 return true;
             }
 
-            // §3.8 (P8) K8S (in-cluster vía API) / TERRAFORM (vía `kubectl apply -f` del MISMO manifest).
-            // El manifest se genera igual en ambos: TERRAFORM solo cambia el MECANISMO de aplicar
-            // (kubectl contra el clúster que provisionó terraform) — el contenido es idéntico.
+            // §3.8 (P8) K8S (in-cluster via the API) / TERRAFORM (via `kubectl apply -f` of the SAME
+            // manifest). The manifest is generated identically in both: TERRAFORM only changes the
+            // MECHANISM of applying it (kubectl against the terraform-provisioned cluster).
             bool spawnK8sNode(int32_t xMin, int32_t xMax,
                               int32_t yMin, int32_t yMax,
                               int32_t zMin, int32_t zMax, bool viaKubectl)
@@ -973,7 +1001,7 @@ namespace DGS
 
                 if (viaKubectl)
                 {
-                    // TERRAFORM: mismo manifest, aplicado con kubectl (infra provisionada por terraform).
+                    // TERRAFORM: same manifest, applied with kubectl (infra provisioned by terraform).
                     const std::string file = k8sManifestPath(name);
                     std::ofstream f(file);
                     if (!f) { std::cerr << "[Orchestrator] No puedo escribir " << file << std::endl; --nextNodePort; return false; }
@@ -1008,7 +1036,7 @@ namespace DGS
                 if (depRes && depRes->status == 201)
                 {
                     ++currentReplicas;
-                    portToName[udpPort] = name;   // §3.9: para borrar el pod al drenar/eviccionar
+                    portToName[udpPort] = name;   // §3.9: so the pod can be deleted on drain/eviction
                     std::cout << "[Orchestrator] ZoneNode " << name
                               << " creado  chunks X[" << xMin << "-" << xMax << "]"
                               << "  NodePort=" << udpPort << std::endl;

@@ -1,5 +1,6 @@
 #include "include/dgs/client.h"
 
+#include <chrono>
 #include <cmath>
 #include <httplib.h>
 #include <iostream>
@@ -16,14 +17,14 @@ namespace DGS
 
         if (!res || res->status != 200)
         {
-            std::cerr << "[Client] Login fallido" << std::endl;
+            std::cerr << "[Client] Login failed" << std::endl;
             return false;
         }
         std::cout << "[Client] Login OK" << std::endl;
 
         if (!m_tcp.connect(headHost, headPort))
         {
-            std::cerr << "[Client] Error conectando HeadServer" << std::endl;
+            std::cerr << "[Client] Failed to connect to HeadServer" << std::endl;
             return false;
         }
 
@@ -50,6 +51,16 @@ namespace DGS
             m_recvThread.join();
     }
 
+    void Client::applyZone(const ZoneResponse& zone)
+    {
+        // ⚠️ The `strncpy(&m_zoneAddr[0], zone.addr, 16)` that used to be here wrote 16 bytes into a
+        // `std::string` whose buffer held 9 ("127.0.0.1") — straight past its capacity, undefined
+        // behaviour, and pointless: the very next line assigned the value properly anyway.
+        m_zoneAddr = zone.addr;
+        m_zonePort = zone.port;
+        std::cout << "[Client] ZoneNode: " << m_zoneAddr << ":" << m_zonePort << std::endl;
+    }
+
     bool Client::queryZone(uint32_t uuid, int32_t chunkX, int32_t chunkY, int32_t chunkZ)
     {
         ZoneQuery query{};
@@ -60,25 +71,40 @@ namespace DGS
 
         Packet qp;
         qp.pack(query);
+
+        // With the receive thread running, IT owns the descriptor: ask, then wait for it to hand the
+        // answer over. Reading here as well is what used to lose the response (see client.h).
+        if (m_running.load())
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            m_zoneAnswered = false;
+            m_tcp.send(m_tcp.getSocketFD(), qp.getRawData(), qp.getSize());
+
+            if (!m_zoneCv.wait_for(lk, std::chrono::seconds(3), [this] { return m_zoneAnswered; }))
+            {
+                std::cerr << "[Client] No ZoneResponse received" << std::endl;
+                return false;
+            }
+            const ZoneResponse zone = m_zoneResp;
+            lk.unlock();
+            applyZone(zone);
+            return true;
+        }
+
+        // Before the receive thread exists (during `connect`) this thread is the only reader.
         m_tcp.send(m_tcp.getSocketFD(), qp.getRawData(), qp.getSize());
 
         uint8_t buf[256];
         int bytes = m_tcp.receive(m_tcp.getSocketFD(), buf, sizeof(buf));
         if (bytes <= 0)
         {
-            std::cerr << "[Client] No se recibio ZoneResponse" << std::endl;
+            std::cerr << "[Client] No ZoneResponse received" << std::endl;
             return false;
         }
 
         Packet rp;
         rp.setBuffer(buf, bytes);
-        ZoneResponse zone = rp.unpackZoneResponse();
-
-        std::strncpy(&m_zoneAddr[0], zone.addr, 16);
-        m_zoneAddr = zone.addr;
-        m_zonePort = zone.port;
-
-        std::cout << "[Client] ZoneNode: " << m_zoneAddr << ":" << m_zonePort << std::endl;
+        applyZone(rp.unpackZoneResponse());
         return true;
     }
 
@@ -92,7 +118,11 @@ namespace DGS
     {
         if (chunkX != m_lastChunkX || chunkY != m_lastChunkY || chunkZ != m_lastChunkZ)
         {
-            queryZone(uuid, chunkX, chunkY, chunkZ);
+            // ⚠️ ONLY cache the chunk if the query actually SUCCEEDED. It used to be cached either way,
+            // so a failed query was remembered as done: the client kept the previous zone's address and
+            // never asked again for that chunk. A player crossing a border went on talking to the zone
+            // they had just left, permanently — invisible to the one that now owned them.
+            if (!queryZone(uuid, chunkX, chunkY, chunkZ)) return;
             m_lastChunkX = chunkX;
             m_lastChunkY = chunkY;
             m_lastChunkZ = chunkZ;
@@ -197,6 +227,12 @@ namespace DGS
                     break;
                 case PKT_CHAT:
                     m_incomingChats.push_back(p.unpackChatMessage());
+                    break;
+                case PKT_ZONE_RESPONSE:
+                    // The answer belongs to whoever is waiting in `queryZone`, not to this loop.
+                    m_zoneResp     = p.unpackZoneResponse();
+                    m_zoneAnswered = true;
+                    m_zoneCv.notify_all();
                     break;
                 default: break;
             }

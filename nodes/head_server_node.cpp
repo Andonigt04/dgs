@@ -2,6 +2,7 @@
 #include "include/dgs/packet.h"
 #include "include/dgs/orchestrator.h"
 #include "include/dgs/logger.h"
+#include <csignal>
 
 #include <map>
 #include <sys/epoll.h>
@@ -10,6 +11,15 @@
 
 int main()
 {
+    // ⚠️ A NODE MUST NOT DIE BECAUSE A PEER HUNG UP. Writing to a socket whose other end has closed
+    // raises SIGPIPE, and its default action is to KILL the process. No node installed this, and the
+    // whole suite stayed green anyway: every test calls `signal(SIGPIPE, SIG_IGN)` before `fork()`, and
+    // a child INHERITS an ignored disposition — so under CTest the nodes survived, and started from a
+    // shell, systemd, Docker or `dgs run` they died the first time a peer disconnected.
+    // Measured with the same binary and the same environment: parent ignoring SIGPIPE -> ran the full
+    // 6 s; ordinary parent -> exit 141 (128 + SIGPIPE) within seconds of the head closing.
+    // A closed peer is an ordinary event: `send` returns EPIPE and the reconnect paths handle it.
+    std::signal(SIGPIPE, SIG_IGN);
     DGS::TCPSocket serverSocket;
     DGS::Orchestrator orchestrator(serverSocket);
     DGS::PacketDispatcher dispatcher;
@@ -54,7 +64,7 @@ int main()
     dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p)
     {
         auto m = p.unpackServerMetrics();
-        std::cout << "[HeadServer] PKT_METRICS fd=" << fd << " zonas=" << orchestrator.activeZones.size() << std::endl;
+        std::cout << "[HeadServer] PKT_METRICS fd=" << fd << " zones=" << orchestrator.activeZones.size() << std::endl;
         orchestrator.updateNodeTopology(fd, m);
         orchestrator.evaluateServer(m, fd);
 
@@ -79,13 +89,13 @@ int main()
     {
         auto st = p.unpackValidatorStatus();
         std::cout << "[HeadServer] PKT_VALIDATOR_STATUS fd=" << fd
-                  << " estado=" << (int)st.state
+                  << " state=" << (int)st.state
                   << " req=" << st.reqSent
                   << " timeouts=" << st.reqTimeout
                   << " viol=" << st.failedTransfers << std::endl;
 
-        // P6 (F1): state=2 = validador caído / circuito abierto en esa zona → el master reasigna su
-        // región a un vecino sano (traspaso por métrica fallida) para no servir sin veredicto.
+        // P6 (F1): state=2 = validator down / breaker open in that zone → the master reassigns its
+        // region to a healthy neighbour (handoff on a failed metric) so nothing is served unvalidated.
         if (st.state == 2)
             orchestrator.notifyValidatorDown(fd, st);
 
@@ -93,7 +103,7 @@ int main()
         entry.time_stamp  = (uint64_t)std::time(nullptr);
         entry.type        = DGS::LOG_METRICS;
         entry.fd          = fd;
-        entry.ramUsage    = st.state == 2 ? 1.0f : 0.0f;   // circuito abierto → carga crítica
+        entry.ramUsage    = st.state == 2 ? 1.0f : 0.0f;   // breaker open → critical load
         entry.performance = st.state == 2 ? 0.0f : 1.0f;
         logger.log(entry);
     });
@@ -109,8 +119,8 @@ int main()
     {
         auto ra = p.unpackEntityReassign();
 
-        // §3.6 handoff: reasignar la autoridad de una entidad a la zona que cubre su chunk. La
-        // autoridad la resuelve el orquestador por chunk (no confiar en ids lógicos del remitente).
+        // §3.6 handoff: reassign an entity's authority to the zone covering its chunk. Authority is
+        // resolved by the orchestrator per chunk (never trust the sender's logical ids).
         int targetFD = orchestrator.findTargetNode(ra.chunkX, ra.chunkY, ra.chunkZ);
 
         std::cout << "[HeadServer] PKT_REASSIGN uuid=" << ra.entityUuid
@@ -123,8 +133,8 @@ int main()
 
         dispatcher.registerHandler(DGS::PKT_ZONE_REGION, [&](int fd, DGS::Packet& p)
     {
-        // §3.9 Fusión/traspaso: la zona que cede serializó su región; la enrutamos por ancla a la zona
-        // que cubre ese chunk (que la incorporará con mergeRegion).
+        // §3.9 Merge/handoff: the ceding zone serialised its region; we route it by anchor to the zone
+        // covering that chunk (which folds it in with mergeRegion).
         auto reg = p.unpackZoneRegion();
         int targetFD = orchestrator.findTargetNode(reg.chunkX, reg.chunkY, reg.chunkZ);
         std::cout << "[HeadServer] PKT_ZONE_REGION src=" << reg.srcZone
@@ -135,9 +145,9 @@ int main()
 
     dispatcher.registerHandler(DGS::PKT_DRAIN, [&](int fd, DGS::Packet& p)
     {
-        // §3.9: el zone_node confirma su drenado (ack=1). El orquestador destruye la zona (pod +
-        // topología + réplicas) y le manda PKT_DELETE_ZONE. Las peticiones (ack=0) salen del
-        // orquestador → zona y nunca llegan aquí.
+        // §3.9: the zone_node confirms its drain (ack=1). The orchestrator destroys the zone (pod +
+        // topology + replicas) and sends it PKT_DELETE_ZONE. Requests (ack=0) go orchestrator → zone
+        // and never arrive here.
         auto lc = p.unpackZoneLifecycle();
         if (lc.ack == 1)
         {
@@ -149,11 +159,11 @@ int main()
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p)
     {
         auto e = p.unpackEntityTransfer();
-        std::cout << "[HeadServer] Entidad recibida uuid=" << e.uuid
-                  << " chunk=(" << e.chunkX << "," << e.chunkY << ") desde fd=" << fd << std::endl;
+        std::cout << "[HeadServer] Entity received uuid=" << e.uuid
+                  << " chunk=(" << e.chunkX << "," << e.chunkY << ") from fd=" << fd << std::endl;
 
         int targetFD = orchestrator.findTargetNode(e.chunkX, e.chunkY, e.chunkZ);
-        std::cout << "[HeadServer] Zonas activas: " << orchestrator.activeZones.size()
+        std::cout << "[HeadServer] active zones: " << orchestrator.activeZones.size()
                   << " targetFD=" << targetFD << std::endl;
 
         if (targetFD != -1)
@@ -171,15 +181,15 @@ int main()
             logger.log(entry);
         }
         else
-            std::cout << "[HeadServer] No se encontro destino valido para la entidad" << std::endl;
+            std::cout << "[HeadServer] No valid destination found for the entity" << std::endl;
     });
 
     if (!serverSocket.listen(42424))
     {
-        std::cerr << "[HeadServer] Error al iniciar el servidor. ¿Puerto en uso?" << std::endl;
+        std::cerr << "[HeadServer] Failed to start the server. Port already in use?" << std::endl;
         return 1;
     }
-    std::cout << "[HeadServer] Escuchando..." << std::endl;
+    std::cout << "[HeadServer] Listening..." << std::endl;
 
     int epollFD = epoll_create1(0);
 
@@ -205,7 +215,7 @@ int main()
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
                 nodeClients.push_back(newFD);
-                std::cout << "[HeadServer] Nueva zona conectada! FD: " << newFD << std::endl;
+                std::cout << "[HeadServer] New zone connected. FD: " << newFD << std::endl;
             }
             else
             {

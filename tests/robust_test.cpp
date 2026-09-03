@@ -1,18 +1,18 @@
 // ================================================================================================
-// robust_test — tests de DETERMINISMO del módulo de reglas + CONCURRENCIA de contadores (P5b, §4.3).
+// robust_test — DETERMINISM tests for the rules module + counter CONCURRENCY (P5b, §4.3).
 //
-// 1) DETERMINISMO: el módulo del proyecto se carga DOS veces (dos dlopen → dos instancias del .so,
-//    estado totalmente separado). Con el MISMO seed/WorldQuery y la MISMA secuencia de MoveSample/
-//    acciones, ambas deben emitir: (a) los MISMOS veredictos, y (b) los MISMOS bytes de
-//    `serializeRegion`. Si el módulo usara rand()/reloj de pared o estado global, esto explotaría.
-//    Si no hay .so disponible (GAME_MODULE_SO) → SKIP, no fallo.
+// 1) DETERMINISM: the project's module is loaded TWICE (two dlopens → two instances of the .so, with
+//    entirely separate state). Given the SAME seed/WorldQuery and the SAME sequence of MoveSample /
+//    actions, both must emit: (a) the SAME verdicts, and (b) the SAME bytes from `serializeRegion`. If
+//    the module used rand()/wall clock or global state, this would blow up. If no .so is available
+//    (GAME_MODULE_SO) → SKIP, not a failure.
 //
-// 2) CONCURRENCIA: N hilos incrementan contadores compartidos (`bytesTx`, `failedTransfers`, patrón
-//    exacto de zone_node). Con semántica atómica el total es EXACTO. Correr con -fsanitize=thread
-//    para que un `+=` no atómico sobre esos contadores falle aquí mismo (la regla §4.3: los contadores
-//    son atómicos o viven en el hilo único de métricas).
+// 2) CONCURRENCY: N threads increment shared counters (`bytesTx`, `failedTransfers`, zone_node's exact
+//    pattern). With atomic semantics the total is EXACT. Run under -fsanitize=thread so a non-atomic
+//    `+=` on those counters fails right here (the §4.3 rule: counters are atomic or they live on the
+//    single metrics thread).
 //
-// Se enlaza contra src/packet.cpp + dl (para el dlopen). Igual patrón que wire_test.
+// Linked against src/packet.cpp + dl (for the dlopen). Same pattern as wire_test.
 // ================================================================================================
 #include "include/dgs/game_module.h"
 #include "include/dgs/packet.h"
@@ -36,7 +36,7 @@ static int g_checks   = 0;
     } while (0)
 
 // ------------------------------------------------------------------------------------------------
-// 1) Determinismo del módulo (§3.5, §4.3)
+// 1) Module determinism (§3.5, §4.3)
 // ------------------------------------------------------------------------------------------------
 
 struct LoadedModule
@@ -66,11 +66,11 @@ static void determinismTest()
     std::printf("[robust_test] determinismo del modulo (2 cargas del .so, mismo seed)\n");
 
     LoadedModule A = loadModuleOnce();
-    if (!A.ok) { CHECK(A.handle == nullptr, "módulo ausente → skip limpio"); return; }
+    if (!A.ok) { CHECK(A.handle == nullptr, "module absent → clean skip"); return; }
     LoadedModule B = loadModuleOnce();
     if (!B.ok) { dlclose(A.handle); CHECK(B.handle == nullptr, "2ª carga disponible"); return; }
 
-    // Planeta PEQUEÑO (5 km): pos[] en float con precisión; mismo seed en ambas cargas.
+    // A SMALL planet (5 km): pos[] in float keeps precision; the same seed in both loads.
     const double R = 5000.0; const uint32_t seed = 424242u;
 
     DGS::WorldQuery wA{}; DGS::WorldQuery wB{};
@@ -83,9 +83,9 @@ static void determinismTest()
 
     DGS::ZoneHandle zA = A.mod->createZone(&wA);
     DGS::ZoneHandle zB = B.mod->createZone(&wB);
-    CHECK(zA && zB, "ambas cargas crean zona");
+    CHECK(zA && zB, "both loads create a zone");
 
-    // Misma secuencia de MoveSample en ambas → mismos veredictos.
+    // The same MoveSample sequence in both → the same verdicts.
     auto mkSample = [](DGS::EntityTransfer* e, float gx, float gy, float gz,
                        float lastX, float lastY, float lastZ) {
         DGS::MoveSample s{};
@@ -94,20 +94,20 @@ static void determinismTest()
         return s;
     };
 
-    const double dir[3] = { 0.3, 0.9, 0.2 };   // dirección no normalizada: solo importa el signo/pendiente
+    const double dir[3] = { 0.3, 0.9, 0.2 };   // un-normalised direction: only the sign/slope matters
 
     bool verdictsSame = true;
     for (int i = 0; i < 200 && verdictsSame; ++i)
     {
         const float frac = (float)i / 199.0f;
-        const double onSurf = R + 1.0 + frac * 3.0;   // 1..4 m sobre el suelo, variando
+        const double onSurf = R + 1.0 + frac * 3.0;   // 1..4 m above the ground, varying
         DGS::EntityTransfer eA{}; DGS::EntityTransfer eB{};
         eA.uuid = eB.uuid = (uint32_t)i;
         eA.pos[0] = (float)(dir[0] * onSurf); eA.pos[1] = (float)(dir[1] * onSurf); eA.pos[2] = (float)(dir[2] * onSurf);
         eB.pos[0] = eA.pos[0]; eB.pos[1] = eA.pos[1]; eB.pos[2] = eA.pos[2];
         eA.stats.speed[0] = eB.stats.speed[0] = 5.0f;
 
-        const float lastS = 0.2f;   // paso corto desde ~200 mm atrás (dentro de maxSpeed·dt)
+        const float lastS = 0.2f;   // a short step from ~200 mm back (within maxSpeed·dt)
         DGS::MoveSample sA = mkSample(&eA, 0, 0, 0, (float)(dir[0]*onSurf - dir[0]*lastS),
                                       (float)(dir[1]*onSurf - dir[1]*lastS),
                                       (float)(dir[2]*onSurf - dir[2]*lastS));
@@ -117,9 +117,9 @@ static void determinismTest()
         int vB = B.mod->validateMove(zB, &sB, &wB);
         if (vA != vB) { verdictsSame = false; std::printf("    divergencia en muestra %d: %d vs %d\n", i, vA, vB); }
     }
-    CHECK(verdictsSame, "misma secuencia de MoveSample → mismos veredictos en las 2 cargas");
+    CHECK(verdictsSame, "the same MoveSample sequence → the same verdicts in both loads");
 
-    // serializeRegion con el MISMO centro/radio → bytes IDÉNTICOS (formato determinista, byte a byte).
+    // serializeRegion with the SAME centre/radius → IDENTICAL bytes (deterministic format, byte for byte).
     bool regionSame = true;
     if (zA && zB)
     {
@@ -140,10 +140,10 @@ static void determinismTest()
         else
         {
             regionSame = false;
-            std::printf("    region tamaños distintos: %zu vs %zu\n", needA, needB);
+            std::printf("    region sizes differ: %zu vs %zu\n", needA, needB);
         }
     }
-    CHECK(regionSame, "serializeRegion → bytes IDÉNTICOS en las 2 cargas (formato determinista)");
+    CHECK(regionSame, "serializeRegion → IDENTICAL bytes in both loads (deterministic format)");
 
     if (zA && A.mod->destroyZone) A.mod->destroyZone(zA);
     if (zB && B.mod->destroyZone) B.mod->destroyZone(zB);
@@ -152,18 +152,18 @@ static void determinismTest()
 }
 
 // ------------------------------------------------------------------------------------------------
-// 2) Concurrencia de contadores (§4.3): total EXACTO bajo N hilos con semántica atómica.
+// 2) Counter concurrency (§4.3): an EXACT total under N threads with atomic semantics.
 // ------------------------------------------------------------------------------------------------
 static void concurrencyTest()
 {
-    std::printf("[robust_test] concurrencia de contadores (%d hilos x %d iteraciones)\n", 8, 100000);
+    std::printf("[robust_test] counter concurrency (%d threads x %d iterations)\n", 8, 100000);
 
     std::atomic<uint64_t> bytesTx{0};
     std::atomic<uint32_t> failedTransfers{0};
 
     constexpr int THREADS = 8;
     constexpr int ITERS   = 100000;
-    constexpr uint64_t BYTES_PER_OP = 64;   // un paquete típico
+    constexpr uint64_t BYTES_PER_OP = 64;   // a typical packet
 
     std::vector<std::thread> threads;
     for (int t = 0; t < THREADS; ++t)
@@ -182,9 +182,9 @@ static void concurrencyTest()
     const uint32_t expectedFail  = (uint32_t)((ITERS + 6) / 7) * THREADS;
 
     CHECK(bytesTx.load(std::memory_order_relaxed) == expectedBytes,
-          "bytesTx total EXACTO con N hilos (contadores atómicos)");
+          "bytesTx total is EXACT under N threads (atomic counters)");
     CHECK(failedTransfers.load(std::memory_order_relaxed) == expectedFail,
-          "failedTransfers total EXACTO con N hilos (contadores atómicos)");
+          "failedTransfers total is EXACT under N threads (atomic counters)");
     std::printf("    bytesTx=%llu (esperado %llu)  failedTransfers=%u (esperado %u)\n",
                 (unsigned long long)bytesTx.load(), (unsigned long long)expectedBytes,
                 failedTransfers.load(), expectedFail);
@@ -192,9 +192,9 @@ static void concurrencyTest()
 
 int main()
 {
-    std::printf("[robust_test] determinismo + concurrencia de contadores (P5b)\n");
+    std::printf("[robust_test] determinism + counter concurrency (P5b)\n");
     determinismTest();
     concurrencyTest();
-    std::printf("[robust_test] %d checks, %d fallos\n", g_checks, g_failures);
+    std::printf("[robust_test] %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
