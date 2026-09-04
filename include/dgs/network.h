@@ -1,6 +1,7 @@
 #ifndef DGS_NETWORK_H
 #define DGS_NETWORK_H
 
+#include <map>
 #include <string>
 #include <vector>
 #include <netinet/in.h>
@@ -28,6 +29,13 @@ namespace DGS
             bool bind(int port);
 
             bool send(const std::string& address, int port, const uint8_t* data, size_t size);
+            /// Sends bytes that are ALREADY sealed (or that must not be sealed at all).
+            ///
+            /// A zone's broadcast is one payload to N recipients. Sealing inside `send` would encrypt
+            /// the same frame once per recipient — measured at +37 % of loop time at 256 players —
+            /// and would throw away the serialise-once-per-tick property the capacity figures rest on.
+            /// So the zone seals each frame once with `sealForUdp` and sends the result to everybody.
+            bool sendRaw(const std::string& address, int port, const uint8_t* data, size_t size);
             int receive(uint8_t* buffer, size_t size, std::string& outAddress, int& outPort);
 
             int getSocketFD() { return socketFD; }
@@ -75,9 +83,46 @@ namespace DGS
             void closeClient(int fd);
 
             int getSocketFD() { return socketFD; }
+
+            // ── TLS ──────────────────────────────────────────────────────────────────────────────
+            // Node authentication decided WHO may connect. This decides what anyone on the path can
+            // read or change, which was: everything. Every packet on every link travelled in clear —
+            // player positions, verdicts, bans, the entity state a zone hands to its neighbour.
+            //
+            // Enabled per process by the environment, and OFF by default for the same reason node auth
+            // is: a transport change that bricks every existing deployment on upgrade is an outage.
+            //   DGS_TLS_CERT / DGS_TLS_KEY   this node's certificate and key
+            //   DGS_TLS_CA                   the CA both ends are verified against (mutual TLS)
+            // With all three set, a listener REQUIRES a client certificate signed by that CA and a
+            // connector verifies the server against it, so the encryption comes with mutual identity
+            // rather than with a stranger.
+            //
+            // ⚠️ `poll`/`epoll` ON THE RAW DESCRIPTOR IS NOT ENOUGH ONCE TLS IS ON. A TLS record can
+            // carry several messages, so OpenSSL may hold decrypted bytes that the kernel no longer
+            // reports as readable — the classic way a TLS port goes quiet under load. `pending(fd)`
+            // exposes that, and every readiness gate in this repository asks it too.
+            bool tlsEnabled() const;
+            bool pending(int fd) const;
+
         private:
             int socketFD;
+            void*                        m_ctx = nullptr;   // SSL_CTX*
+            std::map<int, void*>         m_ssl;             // fd -> SSL*
+            bool ensureContext(bool server);
+            void dropTls(int fd);
     };
+
+    /// Is the UDP game plane encrypted in this process? (`DGS_UDP_KEY`)
+    bool udpCryptoEnabled();
+
+    /// Seals one datagram for the UDP game plane. @return false when no key is configured (and `out`
+    /// is then a copy of the input, so a caller can always send `out` and be correct either way).
+    bool sealForUdp(const uint8_t* data, size_t size, std::vector<uint8_t>& out);
+
+    /// What `size` bytes of payload actually cost on the wire. The node's own `bytesTx` used to count
+    /// the PLAINTEXT, so once encryption was switched on its bandwidth metric under-reported by 28
+    /// bytes per datagram — a capacity number quietly measuring something other than the wire.
+    size_t udpWireSize(size_t size);
 
     /// Was this `receive` truncated? (§4.6 bug 6)
     ///

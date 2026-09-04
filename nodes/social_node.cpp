@@ -17,8 +17,14 @@
 // ================================================================================================
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "include/dgs/auth.h"
 #include "include/dgs/types.h"
 #include <csignal>
+#include <poll.h>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <memory>
 
 #include <sys/epoll.h>
 #include <map>
@@ -57,6 +63,58 @@ static void broadcast(int fd, DGS::TCPSocket& s, const std::set<int>& subscriber
 {
     for (int sub : subscribers)
         if (sub != fd) s.send(sub, raw, n);
+}
+
+// ⚠️ A SUBSCRIBER THAT CONNECTS LATE USED TO LEARN NOTHING. Bans and guild changes were broadcast at
+// the moment they happened and never again, so a zone that started afterwards — or reconnected, or was
+// scaled up — served a banned account happily, and restoring this node's state from the database would
+// have changed nothing in the world for the same reason. State has to be replayed to whoever arrives.
+//
+// Only the DURABLE plane is replayed (bans, permissions, guild membership, friendships). Chat is not
+// state and parties are session-scoped. It goes to that one subscriber, not to everybody.
+static void sendStateTo(DGS::TCPSocket& s, int fd, const SocialState& st)
+{
+    int sent = 0;
+    for (const auto& [uuid, ban] : st.banned)
+    {
+        // A ban whose deadline has already passed is not replayed: the clock released it.
+        if (ban.first != 0 && nowMs() >= ban.first) continue;
+        DGS::AccountAction a{};
+        a.targetUuid = uuid;
+        a.action     = DGS::ACC_BAN;
+        a.durationS  = ban.first == 0 ? 0u : (uint32_t)((ban.first - nowMs()) / 1000 + 1);
+        std::snprintf(a.reason, sizeof(a.reason), "%s", ban.second.c_str());
+        DGS::Packet p; p.pack(a);
+        s.send(fd, p.getRawData(), p.getSize());
+        ++sent;
+    }
+    for (const auto& [uuid, flags] : st.perms)
+    {
+        DGS::AccountAction a{};
+        a.targetUuid = uuid; a.action = DGS::ACC_SET_PERM; a.permFlags = flags;
+        DGS::Packet p; p.pack(a);
+        s.send(fd, p.getRawData(), p.getSize());
+        ++sent;
+    }
+    for (const auto& [guildId, members] : st.guilds)
+        for (const auto& [uuid, rank] : members)
+        {
+            DGS::SocialDelta d{};
+            d.scopeUuid = guildId; d.targetUuid = uuid;
+            d.kind = DGS::SOCIAL_GUILD_JOIN;
+            { DGS::Packet p; p.pack(d); s.send(fd, p.getRawData(), p.getSize()); ++sent; }
+            d.kind = DGS::SOCIAL_GUILD_RANK; d.rank = rank;
+            { DGS::Packet p; p.pack(d); s.send(fd, p.getRawData(), p.getSize()); ++sent; }
+        }
+    for (const auto& [uuid, fr] : st.friends)
+        for (uint32_t other : fr)
+        {
+            DGS::SocialDelta d{};
+            d.targetUuid = uuid; d.scopeUuid = other; d.kind = DGS::SOCIAL_FRIEND_ADD;
+            DGS::Packet p; p.pack(d); s.send(fd, p.getRawData(), p.getSize()); ++sent;
+        }
+    if (sent > 0)
+        std::cout << "[Social] replayed " << sent << " state records to FD=" << fd << std::endl;
 }
 
 // Applies a social delta to the state and broadcasts it with a seq (§3.7).
@@ -169,13 +227,79 @@ int main()
     }
     std::cout << "[Social] Listening on TCP:42430 (social/account plane + chat)" << std::endl;
 
-    // Optional write-through to persistence (MongoDB) — source of truth for bans/guilds.
+    // Write-through to persistence, and — the half that did not exist — the RESTORE.
+    //
+    // ⚠️ `SocialState` IS A PLAIN LOCAL VARIABLE. Every guild, ban, friendship and permission lived
+    // only in this process, and the write-through it performed was being discarded by a persistence
+    // node that understood nothing but entities. So restarting this node **unbanned every account**:
+    // a moderator's decision undone by an operator restarting a service. Both halves are fixed now —
+    // that node stores the social plane, and this one asks for it back on start-up.
+    //
+    // The connect happens on a WORKER, and with a deadline. It used to be a blocking `connect` with no
+    // timeout on the path to the epoll loop: `connect` bounds the TCP handshake and not the name
+    // resolution before it, and an unresolvable `PERSISTENCE_HOST` cost 11.2 seconds on this machine —
+    // a social node that listens but accepts nobody. The zone node has this same note twice, for the
+    // same reason.
     DGS::TCPSocket persistence;
     const char* persHost = std::getenv("PERSISTENCE_HOST") ? std::getenv("PERSISTENCE_HOST") : "persistence";
     int         persPort = std::atoi(std::getenv("PERSISTENCE_PORT") ? std::getenv("PERSISTENCE_PORT") : "42429");
-    if (!persistence.connect(persHost, persPort))
-        std::cout << "[Social] Persistence unavailable at " << persHost << ":" << persPort
-                  << " -> in-memory state only" << std::endl;
+
+    std::mutex                     linkMtx;
+    std::unique_ptr<DGS::TCPSocket> linkReady;
+    std::vector<DGS::Packet>       restorePackets;
+    std::atomic<bool>              linkPending{true};
+    bool                           restoreMerged = false;
+
+    const uint64_t startedMs = nowMs();
+    const int restoreDeadlineMs = std::atoi(std::getenv("SOCIAL_RESTORE_MS")
+                                            ? std::getenv("SOCIAL_RESTORE_MS") : "2000") + 1500;
+
+    std::thread linkThread([&]{
+        auto sock = std::unique_ptr<DGS::TCPSocket>(new DGS::TCPSocket());
+        if (sock->connect(persHost, persPort, 500)) DGS::sendAuth(*sock);
+        else
+        {
+            std::cout << "[Social] Persistence unavailable at " << persHost << ":" << persPort
+                      << " -> in-memory state only" << std::endl;
+            linkPending = false;
+            return;
+        }
+
+        std::vector<DGS::Packet> got;
+        if (!(std::getenv("SOCIAL_RESTORE") && std::string(std::getenv("SOCIAL_RESTORE")) == "0"))
+        {
+            DGS::Packet q; q.pack(DGS::PKT_SOCIAL_QUERY);
+            sock->send(sock->getSocketFD(), q.getRawData(), q.getSize());
+
+            const int restoreMs = std::atoi(std::getenv("SOCIAL_RESTORE_MS")
+                                            ? std::getenv("SOCIAL_RESTORE_MS") : "2000");
+            const uint64_t deadline = nowMs() + (uint64_t)restoreMs;
+            uint8_t buf[8192];
+            bool done = false;
+            while (!done && nowMs() < deadline)
+            {
+                pollfd pfd{ sock->getSocketFD(), POLLIN, 0 };
+                if (::poll(&pfd, 1, 50) <= 0 || !(pfd.revents & POLLIN)) continue;
+                const int n = sock->receive(sock->getSocketFD(), buf, sizeof(buf));
+                if (n <= 0) break;
+                DGS::Packet p; p.setBuffer(buf, (size_t)n);
+                if (p.getType() == DGS::PKT_NONE) { done = true; break; }
+                got.push_back(p);
+            }
+            std::cout << "[Social] restored " << got.size() << " social records"
+                      << (done ? "" : " (answer incomplete)") << std::endl;
+        }
+
+        { std::lock_guard<std::mutex> lk(linkMtx);
+          restorePackets = std::move(got);
+          linkReady = std::move(sock); }
+        linkPending = false;
+    });
+
+    // NODE-ONLY PORT: zones subscribe here to learn bans and guild changes, and a subscriber can also
+    // ISSUE a ban. Unauthenticated, anyone who could reach it could ban any account in the world.
+    DGS::AuthGate gate("Social");
+    gate.announce();
 
     int epollFD = epoll_create1(0);
     epoll_event ev;
@@ -189,22 +313,99 @@ int main()
 
     while (true)
     {
-        int n = epoll_wait(epollFD, events, 64, -1);
+        // ⚠️ A BOUNDED WAIT, not the infinite one this had. The restored state arrives on a worker and
+        // has to be merged here, on the thread that owns `st` — with `-1` the node would sit blocked
+        // until somebody happened to connect, so a node nobody talks to would never restore at all.
+        int n = epoll_wait(epollFD, events, 64, 200);
+
+        // The restored social plane, applied exactly once, through the SAME handlers that apply a live
+        // delta. Replaying it any other way would be a second implementation of the rules, free to
+        // disagree with the first.
+        // ⚠️ DO NOT SERVE STATE YOU HAVE NOT LOADED. Accepting a subscriber before the restore has
+        // landed means replaying an EMPTY state to it — telling a zone "nobody is banned" — and it
+        // also means applying live deltas with a persistence socket that is not connected yet, so
+        // those writes are lost. Both were measured: the ban made it neither into the database nor
+        // into the subscriber. Connections wait in the listen backlog, which is what a backlog is for.
+        //
+        // Bounded, though: a database that never answers must not keep the social plane offline for
+        // ever. Past the deadline the node starts serving and says plainly that its state may be
+        // incomplete, rather than pretending.
+        if (!restoreMerged && linkPending.load() && nowMs() - startedMs > (uint64_t)restoreDeadlineMs)
+        {
+            std::cerr << "[Social] persistence did not answer in " << restoreDeadlineMs
+                      << " ms -> serving WITHOUT restored state (bans may be missing)" << std::endl;
+            restoreMerged = true;
+        }
+
+        if (!restoreMerged && !linkPending.load())
+        {
+            restoreMerged = true;
+            std::vector<DGS::Packet> pending;
+            { std::lock_guard<std::mutex> lk(linkMtx);
+              pending = std::move(restorePackets);
+              if (linkReady) { persistence = std::move(*linkReady); linkReady.reset(); } }
+
+            int applied = 0;
+            for (auto& p : pending)
+            {
+                // Applied to the local state only: this is state coming BACK, not new decisions, so it
+                // is neither re-broadcast nor written through again.
+                try {
+                    if (p.getType() == DGS::PKT_SOCIAL_DELTA)
+                    {
+                        const DGS::SocialDelta d = p.unpackSocialDelta();
+                        switch (d.kind)
+                        {
+                            case DGS::SOCIAL_GUILD_JOIN:  st.guilds[d.scopeUuid][d.targetUuid] = 0; break;
+                            case DGS::SOCIAL_GUILD_RANK:
+                                if (st.guilds[d.scopeUuid].count(d.targetUuid))
+                                    st.guilds[d.scopeUuid][d.targetUuid] = d.rank;
+                                break;
+                            case DGS::SOCIAL_FRIEND_ADD:  st.friends[d.targetUuid].insert(d.scopeUuid); break;
+                            default: break;
+                        }
+                        ++applied;
+                    }
+                    else if (p.getType() == DGS::PKT_ACCOUNT)
+                    {
+                        const DGS::AccountAction a = p.unpackAccountAction();
+                        if (a.action == DGS::ACC_BAN)
+                            st.banned[a.targetUuid] = { a.durationS ? nowMs() + (uint64_t)a.durationS * 1000 : 0,
+                                                        std::string(a.reason) };
+                        else if (a.action == DGS::ACC_SET_PERM)
+                            st.perms[a.targetUuid] = a.permFlags;
+                        ++applied;
+                    }
+                } catch (const std::exception&) { /* malformed record: skip it, stay up */ }
+            }
+            if (applied > 0)
+                std::cout << "[Social] applied " << applied << " restored records ("
+                          << st.banned.size() << " bans, " << st.guilds.size() << " guilds)" << std::endl;
+        }
+
         for (int i = 0; i < n; i++)
         {
             int fd = events[i].data.fd;
 
             if (fd == socialSocket.getSocketFD())
             {
+                // Not ready yet: leave it in the backlog rather than answer with an empty world.
+                if (!restoreMerged) continue;
                 int newFD = socialSocket.accept();
                 if (newFD < 0) continue;
                 subscribers.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
                 std::cout << "[Social] Subscriber connected FD=" << newFD << std::endl;
+                sendStateTo(socialSocket, newFD, st);   // what it missed before it arrived
             }
             else if (subscribers.count(fd))
             {
+                // An epoll wake-up is not proof of application data once TLS is on: the handshake's
+                // trailing records (a TLS 1.3 `NewSessionTicket`, say) wake it too, and the blocking
+                // read below would then wait for a message nobody sent. See `TCPSocket::pending`.
+                if (socialSocket.tlsEnabled() && !socialSocket.pending(fd)) continue;
+
                 uint8_t buffer[8192];
                 int bytes = socialSocket.receive(fd, buffer, sizeof(buffer));
                 if (bytes <= 0)
@@ -212,11 +413,15 @@ int main()
                     epoll_ctl(epollFD, EPOLL_CTL_DEL, fd, nullptr);
                     socialSocket.closeClient(fd);
                     subscribers.erase(fd);
+                    gate.forget(fd);
                     continue;
                 }
 
                 DGS::Packet p;
                 p.setBuffer(buffer, bytes);
+
+                if (gate.consume(fd, p)) continue;
+                if (!gate.allows(fd)) { gate.refuse(fd, (int)p.getType()); continue; }
                 switch (p.getType())
                 {
                     case DGS::PKT_SOCIAL_DELTA: applySocialDelta(socialSocket, subscribers, fd, p, st, persistence); break;

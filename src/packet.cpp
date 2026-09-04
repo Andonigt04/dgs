@@ -29,7 +29,7 @@ namespace DGS
     EntityTransfer Packet::unpackEntityTransfer()
     {
         readPos = 1;
-        EntityTransfer data;
+        EntityTransfer data{};
         data.type = read<EntityType>();
         data.uuid = read<uint32_t>();
         data.chunkX = read<int32_t>();
@@ -40,11 +40,34 @@ namespace DGS
         data.pos[2] = read<float>();
         data.angle = read<uint16_t>();
         data.dataSize = read<uint16_t>();
+
+        // ⚠️ `dataSize` COMES OFF THE WIRE AND `data` IS THE LAST MEMBER OF THE STRUCT. It used to be
+        // handed straight to `readRaw`, whose only guard is that the SOURCE has that many bytes — it
+        // never knew the destination is 4096 bytes long. `MAX_PACKET_SIZE` is 65536, so one crafted
+        // packet declaring `dataSize = 60000` and carrying the bytes to back it up wrote 60000 bytes
+        // past a stack `EntityTransfer`. Measured, not deduced: AddressSanitizer reports
+        // "stack-buffer-overflow ... WRITE of size 60000" through this exact line. Reachable over TCP
+        // (zone↔zone entity handoff) and over UDP (a zone's client ingest) — that is remote code
+        // execution territory, from an unauthenticated sender.
+        if (data.dataSize > MAX_ENTITY_DATA)
+            throw std::runtime_error("EntityTransfer dataSize out of range");
+
         readRaw(data.data, data.dataSize);
         data.state = read<EntityState>();
         data.stats = read<Stats>();
-        
+
         return data;
+    }
+
+    // The same decode for callers who must not die on a malformed input. A NODE must survive a bad
+    // datagram: it costs that datagram, never the process. The throwing form above stays for the
+    // internal paths that build the packet themselves.
+    bool Packet::tryUnpackEntityTransfer(EntityTransfer& out)
+    {
+        if (getType() != PKT_ENTITY_TRANSFER) return false;
+        try { out = unpackEntityTransfer(); }
+        catch (const std::exception&) { return false; }
+        return true;
     }
 
     void Packet::pack(const Command& data)
@@ -376,6 +399,7 @@ namespace DGS
         write<int32_t>(data.chunkZ);
         write<uint32_t>(data.fromZone);
         write<uint32_t>(data.toZone);
+        write<uint8_t>(data.ack);
     }
 
     EntityReassign Packet::unpackEntityReassign()
@@ -388,6 +412,7 @@ namespace DGS
         data.chunkZ = read<int32_t>();
         data.fromZone = read<uint32_t>();
         data.toZone = read<uint32_t>();
+        data.ack = read<uint8_t>();
         return data;
     }
 
@@ -442,7 +467,7 @@ namespace DGS
         write<uint8_t>(data.ack);
     }
 
-    // §3.7: delta social de guild/party (PKT_SOCIAL_DELTA).
+    // §3.7: guild/party social delta (PKT_SOCIAL_DELTA).
     void Packet::pack(const SocialDelta& data)
     {
         clear();

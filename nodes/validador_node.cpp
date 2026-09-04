@@ -1,9 +1,11 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "include/dgs/auth.h"
 #include "include/dgs/types.h"
 #include "include/dgs/game_module.h"   // ABI of the per-project RULES MODULE (dlopen)
 
 #include <sys/epoll.h>
+#include <poll.h>
 #include <cstring>
 #include <cmath>
 #include <map>
@@ -250,25 +252,63 @@ int main()
     if (!udpSocket.bind(udpPort))           { std::cerr << "[Validator] UDP error on port "  << udpPort  << std::endl; return 1; }
     if (!tcpSocket.listen(tcpPort))         { std::cerr << "[Validator] TCP error on port "  << tcpPort  << std::endl; return 1; }
     if (!headServer.connect(headHost, headPort))  { std::cerr << "[Validator] Failed to connect to HeadServer" << std::endl; return 1; }
+    DGS::sendAuth(headServer);
     if (!persistence.connect(persHost, persPort)) { std::cerr << "[Validator] Failed to connect to Persistence" << std::endl; return 1; }
+    DGS::sendAuth(persistence);
 
-    uint8_t cmdBuf[512];
-    int cmdBytes = headServer.receive(headServer.getSocketFD(), cmdBuf, sizeof(cmdBuf));
-    if (cmdBytes <= 0) { std::cerr << "[Validator] No initial Command received" << std::endl; return 1; }
+    // ⚠️ THIS NODE USED TO REFUSE TO START. It did a BLOCKING read here for an initial `Command` and
+    // `return 1` if it did not arrive — and the head does not send one to an ordinary connection. The
+    // only `Command` anywhere in the system is `Orchestrator::sendResizeCommand`, on a resize, and it
+    // does not even carry chunk sizes. So in a real cluster the validator never came up: it sat
+    // blocked on that read and its log stayed empty, which is exactly how it looked while I was
+    // probing something else.
+    //
+    // The chunk size comes from the ENVIRONMENT, like it does in every other node, and a `Command`
+    // that does arrive may still override it. A node must not depend on a message nobody sends.
+    float csX = (float)std::atof(std::getenv("CHUNK_SIZE_X") ? std::getenv("CHUNK_SIZE_X") : "1.0");
+    float csY = (float)std::atof(std::getenv("CHUNK_SIZE_Y") ? std::getenv("CHUNK_SIZE_Y") : "1.0");
+    float csZ = (float)std::atof(std::getenv("CHUNK_SIZE_Z") ? std::getenv("CHUNK_SIZE_Z") : "1.0");
 
-    DGS::Packet cmdPacket;
-    cmdPacket.setBuffer(cmdBuf, cmdBytes);
-    DGS::Command cmd = cmdPacket.unpackCommand();
-
-    float csX = cmd.chunkSizeX;
-    float csY = cmd.chunkSizeY;
-    float csZ = cmd.chunkSizeZ;
+    {
+        // A bounded look for one, so the intended design still works where it is implemented, without
+        // making start-up depend on it.
+        const int waitMs = std::atoi(std::getenv("VALIDATOR_COMMAND_MS")
+                                     ? std::getenv("VALIDATOR_COMMAND_MS") : "500");
+        pollfd pfd{ headServer.getSocketFD(), POLLIN, 0 };
+        const bool ready = ::poll(&pfd, 1, waitMs) > 0 && (pfd.revents & POLLIN) &&
+                           (!headServer.tlsEnabled() || headServer.pending(headServer.getSocketFD()));
+        if (ready)
+        {
+            uint8_t cmdBuf[512];
+            const int cmdBytes = headServer.receive(headServer.getSocketFD(), cmdBuf, sizeof(cmdBuf));
+            if (cmdBytes > 0)
+            {
+                DGS::Packet cmdPacket;
+                cmdPacket.setBuffer(cmdBuf, (size_t)cmdBytes);
+                if (cmdPacket.getType() == DGS::PKT_COMMAND)
+                {
+                    const DGS::Command cmd = cmdPacket.unpackCommand();
+                    // Only if it actually carries sizes: `sendResizeCommand` leaves them unset.
+                    if (cmd.chunkSizeX > 0 && cmd.chunkSizeY > 0 && cmd.chunkSizeZ > 0)
+                    { csX = cmd.chunkSizeX; csY = cmd.chunkSizeY; csZ = cmd.chunkSizeZ; }
+                }
+            }
+        }
+        else
+        {
+            std::cout << "[Validator] no initial Command in " << waitMs
+                      << " ms -> chunk size from the environment" << std::endl;
+        }
+    }
 
     std::cout << "[Validator] ChunkSize=(" << csX << ", " << csY << ", " << csZ << ") m" << std::endl;
     std::cout << "[Validator] UDP:42427  TCP:42428  Persistence:42429" << std::endl;
 
     installCrashGuard();                  // crash containment for the .so (§3.5)
     loadGameModule(csX, csY, csZ);        // the project's rules (same code as the client) or fallback
+
+    DGS::AuthGate gate("Validator");
+    gate.announce();
 
     int epollFD = epoll_create1(0);
     epoll_event ev;
@@ -281,7 +321,10 @@ int main()
     epoll_ctl(epollFD, EPOLL_CTL_ADD, tcpSocket.getSocketFD(), &ev);
 
     epoll_event events[64];
-    std::set<int> cacheFDs;
+    // The zones that ask this validator for verdicts. It was called `cacheFDs` back when a `cache_node`
+    // was meant to sit in between; nothing ever connected to that node and it is gone, so the name now
+    // says what actually connects.
+    std::set<int> zoneFDs;
     std::map<uint32_t, LastKnown> lastKnown;
 
     while (true)
@@ -296,10 +339,17 @@ int main()
                 uint8_t buffer[sizeof(DGS::EntityTransfer)];
                 std::string ip; int port;
                 int bytes = udpSocket.receive(buffer, sizeof(buffer), ip, port);
-                if (bytes != sizeof(DGS::EntityTransfer)) continue;
+                if (bytes <= 0) continue;
 
+                // ⚠️ THIS USED TO REQUIRE AN EXACT SIZE MATCH, and that is how it once discarded an
+                // entire experiment in silence: a proxy truncating at 2048 produced datagrams that no
+                // longer matched, so they were dropped without a word while every counter upstream
+                // reported success (`net_degraded`). Recognition is by TYPE BYTE now, and a decode
+                // that fails says so instead of vanishing.
                 DGS::EntityTransfer e{};
-                std::memcpy(&e, buffer, sizeof(e));
+                DGS::Packet ep;
+                ep.setBuffer(buffer, (size_t)bytes);
+                if (!ep.tryUnpackEntityTransfer(e)) continue;
 
                 auto it = lastKnown.find(e.uuid);
                 if (it != lastKnown.end())
@@ -342,25 +392,36 @@ int main()
             {
                 int newFD = tcpSocket.accept();
                 if (newFD < 0) continue;
-                cacheFDs.insert(newFD);
+                zoneFDs.insert(newFD);
                 ev.data.fd = newFD;
                 epoll_ctl(epollFD, EPOLL_CTL_ADD, newFD, &ev);
-                std::cout << "[Validator] Cache connected FD=" << newFD << std::endl;
+                std::cout << "[Validator] Zone connected FD=" << newFD << std::endl;
             }
-            else if (cacheFDs.count(fd))
+            else if (zoneFDs.count(fd))
             {
+                // An epoll wake-up is not proof of application data once TLS is on: the handshake's
+                // trailing records (a TLS 1.3 `NewSessionTicket`, say) wake it too, and the blocking
+                // read below would then wait for a message nobody sent. See `TCPSocket::pending`.
+                if (tcpSocket.tlsEnabled() && !tcpSocket.pending(fd)) continue;
+
                 uint8_t buffer[8192];
                 int bytes = tcpSocket.receive(fd, buffer, sizeof(buffer));
                 if (bytes <= 0)
                 {
                     epoll_ctl(epollFD, EPOLL_CTL_DEL, fd, nullptr);
                     tcpSocket.closeClient(fd);
-                    cacheFDs.erase(fd);
+                    zoneFDs.erase(fd);
+                    gate.forget(fd);
                     continue;
                 }
 
                 DGS::Packet p;
                 p.setBuffer(buffer, bytes);
+
+                // NODE-ONLY PORT: only zones ask for verdicts here. Unauthenticated, anyone could ask
+                // this node to bless a movement — or watch other people's state go past in the request.
+                if (gate.consume(fd, p)) continue;
+                if (!gate.allows(fd)) { gate.refuse(fd, (int)p.getType()); continue; }
 
                 if (p.getType() == DGS::PKT_VALIDATE_REQ)
                 {
@@ -388,7 +449,8 @@ int main()
                     continue;
                 }
 
-                auto e = p.unpackEntityTransfer();
+                DGS::EntityTransfer e{};
+                if (!p.tryUnpackEntityTransfer(e)) continue;   // malformed: drop it, stay up
 
                 auto it = lastKnown.find(e.uuid);
                 if (it != lastKnown.end() && !validateMoveDGS(e, it->second, csX, csY, csZ))

@@ -129,9 +129,10 @@ static void fakeZone(int port, ZoneSink* sink, std::atomic<bool>& ready, std::at
     std::string ip; int p = 0;
     while (!g_done) {
         const int n = u.receive(buf, sizeof(buf), ip, p);
-        if (n != (int)sizeof(DGS::EntityTransfer)) continue;
-        DGS::EntityTransfer e;
-        std::memcpy(&e, buf, sizeof(e));
+        if (n <= 0 || buf[0] != DGS::PKT_ENTITY_TRANSFER) continue;
+        DGS::EntityTransfer e{};
+        DGS::Packet ep; ep.setBuffer(buf, (size_t)n);
+        if (!ep.tryUnpackEntityTransfer(e)) continue;
         sink->lastUuid     = e.uuid;
         sink->lastAngle    = e.angle;
         sink->lastChunkX   = e.chunkX;

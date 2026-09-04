@@ -8,11 +8,17 @@
 // There was no way to watch, either. The head routes each entity to the zone that covers it and to
 // nobody else, and a zone only broadcasts to clients that registered by SENDING a position — so the
 // only way in was to inject a fake player into the world. Now there is a read-only subscription
-// (`PKT_OBSERVE`, one byte, over UDP): the zone adds the sender to its own observer registry, feeds it
-// the SAME snapshot its players get, and expires it on a lease. An observer never becomes an entity.
+// (`PKT_OBSERVE`, over UDP): the zone adds the sender to its own observer registry, feeds it the SAME
+// snapshot its players get, and expires it on a lease. An observer never becomes an entity.
+//
+// It is AUTHENTICATED. This feed is every entity's position ten times a second — a wallhack asks for
+// exactly this — and it began life as one unauthenticated byte anyone who could reach the port could
+// send. The zone now requires a shared secret and refuses everything when it has none configured, so
+// set DGS_OBSERVE_TOKEN to the same value here and on the zones. The token travels in clear in the
+// datagram: it closes "anyone who can reach the port", not "anyone who can read the wire".
 //
 //     [head] --ZoneListResponse (TCP)--> [viewer]   the boxes: who serves what
-//     [zone] <--PKT_OBSERVE (UDP)-------- [viewer]   "add me to your broadcast"
+//     [zone] <--PKT_OBSERVE + token (UDP)- [viewer]   "add me to your broadcast"
 //     [zone] --EntityTransfer / GhostDelta--> [viewer]   the moving objects
 //
 // What is on screen, and why each distinction is worth pixels:
@@ -27,6 +33,7 @@
 // matches the cluster; what is left here is drawing it.
 //
 // Usage:  dgs_viewer [head-host] [head-port]      env: DGS_CHUNK_SIZE (default 1000)
+//                                                      DGS_OBSERVE_TOKEN (required by the zones)
 // Keys:   0 all six views · 1..6 one view · G toggle ghosts · TAB entity list
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/types.h"
@@ -166,7 +173,17 @@ int main(int argc, char* argv[])
         { struct timeval tv { 0, 100000 };
           setsockopt(udp.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 
-        DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE);
+        // The subscription carries the zone's shared secret. Without it the zone refuses — which is
+        // the point: this feed is every entity's position ten times a second, and it used to be handed
+        // to anyone who asked. If it is missing, say so here rather than leaving an empty window and
+        // letting the operator guess.
+        const char* tokenEnv = std::getenv("DGS_OBSERVE_TOKEN");
+        const std::string token = tokenEnv ? tokenEnv : "";
+        if (token.empty())
+            std::cerr << "[Viewer] DGS_OBSERVE_TOKEN is not set: the zones will refuse the "
+                         "subscription and nothing will move on screen." << std::endl;
+
+        DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE); hello.writeString(token);
         uint64_t lastHello = 0;
         uint8_t  buf[sizeof(DGS::EntityTransfer) * 2];
         std::string from; int port = 0;

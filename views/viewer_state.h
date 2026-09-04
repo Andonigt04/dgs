@@ -11,8 +11,9 @@
 //
 // It consumes two feeds:
 //   · the head's `ZoneListResponse` over TCP → the boxes (who serves what);
-//   · each zone's UDP broadcast → the moving objects. A zone sends its clients raw `EntityTransfer`
-//     structs and `Packet`-wrapped `GhostDelta`s; subscribing with PKT_OBSERVE gets that same stream.
+//   · each zone's UDP broadcast → the moving objects. Every datagram is a `Packet`: an entity carries
+//     PKT_ENTITY_TRANSFER and only the payload it declares, a projection carries PKT_GHOST_DELTA.
+//     Subscribing with PKT_OBSERVE (and the zone's token) gets that same stream.
 //
 // Two things it must get right, and both are about NOT lying:
 //   · entities EXPIRE. UDP has no goodbye: a zone that dies, an entity that is evicted for cheating or
@@ -62,12 +63,18 @@ namespace DGS
         {
             if (!data || n <= 0) return false;
 
-            // A raw `EntityTransfer` is recognised by its exact size — that is how the zone sends it and
-            // how the nodes themselves recognise it. Anything else goes through the Packet decoder.
-            if (n == (int)sizeof(EntityTransfer))
+            // ⚠️ THIS USED TO RECOGNISE AN ENTITY BY ITS EXACT SIZE, because the zone broadcast the raw
+            // struct. It no longer does: it honours `dataSize`, so an entity's datagram is 62 bytes
+            // plus whatever payload it actually carries, and a size rule cannot express that. Every
+            // datagram is now a `Packet` and byte 0 is its `PacketType` — the same discriminator the
+            // rest of the protocol has always used.
+            Packet p;
+            p.setBuffer(data, (size_t)n);
+
+            if (p.getType() == PKT_ENTITY_TRANSFER)
             {
-                EntityTransfer e;
-                std::memcpy(&e, data, sizeof(e));
+                EntityTransfer e{};
+                if (!p.tryUnpackEntityTransfer(e)) return false;
                 ViewedEntity& v = m_entities[e.uuid];
                 v.uuid   = e.uuid;
                 v.chunkX = e.chunkX; v.chunkY = e.chunkY; v.chunkZ = e.chunkZ;
@@ -80,11 +87,11 @@ namespace DGS
                 return true;
             }
 
-            Packet p;
-            p.setBuffer(data, (size_t)n);
             if (p.getType() != PKT_GHOST_DELTA) return false;
 
-            const GhostDelta g = p.unpackGhostDelta();
+            GhostDelta g{};
+            try { g = p.unpackGhostDelta(); }
+            catch (const std::exception&) { return false; }
             ViewedEntity& v = m_entities[(uint32_t)g.uuid];
             v.uuid   = (uint32_t)g.uuid;
             v.chunkX = g.chunkX; v.chunkY = g.chunkY; v.chunkZ = g.chunkZ;

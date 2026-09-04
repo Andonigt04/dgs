@@ -46,7 +46,7 @@ static void roundTripEntity()
     fillEntity(a, 0xDEADBEEF);
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ENTITY_TRANSFER, "EntityTransfer: primer byte = PKT_ENTITY_TRANSFER");
+    CHECK(p.getType() == DGS::PKT_ENTITY_TRANSFER, "EntityTransfer: first byte = PKT_ENTITY_TRANSFER");
     b = p.unpackEntityTransfer();
     CHECK(b.uuid == a.uuid && b.chunkX == a.chunkX && b.chunkY == a.chunkY && b.chunkZ == a.chunkZ,
           "EntityTransfer: uuid/bounds");
@@ -59,6 +59,80 @@ static void roundTripEntity()
     CHECK(dataOk, "EntityTransfer: opaque payload intact");
 }
 
+// ── The SIZE on the wire, pinned ────────────────────────────────────────────────────────────────
+// A round trip proves the bytes survive, not that there are few of them. The UDP paths used to send
+// `sizeof(EntityTransfer)` — the whole 4160-byte struct, 4096 of it the `data[]` blob that is empty
+// for a player who is only moving — and nothing in the suite would have noticed if they went back to
+// it. The fan-out is N x N, so this number IS the capacity of a zone.
+static void entityWireSizeHonoursDataSize()
+{
+    DGS::EntityTransfer bare{};
+    bare.uuid = 1; bare.dataSize = 0;
+    DGS::Packet p; p.pack(bare);
+    const size_t bareBytes = p.getSize();
+
+    std::printf("    entity on the wire: %zu B with no payload, the struct is %zu B (%.1fx)\n",
+                bareBytes, sizeof(DGS::EntityTransfer),
+                (double)sizeof(DGS::EntityTransfer) / (double)bareBytes);
+    CHECK(bareBytes < sizeof(DGS::EntityTransfer) / 10,
+          "an entity with no payload costs less than a tenth of the raw struct");
+
+    // And it must GROW with the payload, or "small" would just mean "truncated".
+    DGS::EntityTransfer full{};
+    full.uuid = 1; full.dataSize = 256;
+    for (uint32_t i = 0; i < full.dataSize; ++i) full.data[i] = patternByte(i);
+    DGS::Packet q; q.pack(full);
+    CHECK(q.getSize() == bareBytes + 256,
+          "the wire size grows by EXACTLY the declared payload (it is not truncating)");
+
+    DGS::EntityTransfer back{};
+    const bool ok = q.tryUnpackEntityTransfer(back);
+    bool intact = ok && back.dataSize == 256;
+    for (uint32_t i = 0; intact && i < 256; ++i) intact = (back.data[i] == patternByte(i));
+    CHECK(intact, "a 256-byte payload survives the smaller wire intact");
+}
+
+// ── A `dataSize` that LIES ──────────────────────────────────────────────────────────────────────
+// `dataSize` is a uint16 read straight off the network, `data` is 4096 bytes and it is the LAST member
+// of the struct, and MAX_PACKET_SIZE is 65536. `readRaw` only ever checked that the SOURCE had that
+// many bytes. AddressSanitizer on a crafted packet declaring 60000: "stack-buffer-overflow ... WRITE
+// of size 60000". Unauthenticated, over UDP and over TCP. This is the regression test for it.
+static void entityRejectsLyingDataSize()
+{
+    std::vector<uint8_t> w;
+    auto put = [&](const void* v, size_t n) {
+        const uint8_t* b = (const uint8_t*)v; w.insert(w.end(), b, b + n);
+    };
+    uint8_t  t = DGS::PKT_ENTITY_TRANSFER; put(&t, 1);
+    uint8_t  et = 0;                       put(&et, 1);
+    uint32_t uuid = 1;                     put(&uuid, 4);
+    int32_t  c = 0;                        put(&c, 4); put(&c, 4); put(&c, 4);
+    float    f = 0;                        put(&f, 4); put(&f, 4); put(&f, 4);
+    uint16_t ang = 0;                      put(&ang, 2);
+    uint16_t lie = 60000;                  put(&lie, 2);
+    w.resize(w.size() + 60000 + 64, 0x41);   // enough bytes that the source-side check passes
+
+    DGS::Packet p; p.setBuffer(w.data(), w.size());
+    DGS::EntityTransfer out{};
+    const bool accepted = p.tryUnpackEntityTransfer(out);
+    CHECK(!accepted, "a packet whose dataSize exceeds data[] is REJECTED, not written past the array");
+
+    bool threw = false;
+    try { (void)p.unpackEntityTransfer(); } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "the throwing decode refuses it too (both entry points are closed)");
+
+    // Counter-proof: the same shape with an HONEST dataSize must be accepted, or the check above
+    // would pass for a decoder that rejects everything.
+    DGS::EntityTransfer honest{};
+    honest.uuid = 1; honest.dataSize = 64;
+    for (uint32_t i = 0; i < 64; ++i) honest.data[i] = patternByte(i);
+    DGS::Packet hp; hp.pack(honest);
+    DGS::EntityTransfer hb{};
+    const bool honestOk = hp.tryUnpackEntityTransfer(hb);
+    CHECK(honestOk && hb.dataSize == 64,
+          "and an honest payload of the same shape still goes through");
+}
+
 static void roundTripCommand()
 {
     DGS::Command a{}, b{};
@@ -69,7 +143,7 @@ static void roundTripCommand()
     a.chunkSizeX = 1.5f; a.chunkSizeY = 2.5f; a.chunkSizeZ = 3.5f;
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_COMMAND, "Command: primer byte = PKT_COMMAND");
+    CHECK(p.getType() == DGS::PKT_COMMAND, "Command: first byte = PKT_COMMAND");
     b = p.unpackCommand();
     CHECK(b.purpose == a.purpose && b.chunkX == a.chunkX && b.chunkY == a.chunkY, "Command: purpose/bounds");
     CHECK(std::strcmp(b.addr, a.addr) == 0 && b.port == a.port, "Command: addr/port");
@@ -91,7 +165,7 @@ static void roundTripMetrics()
     a.failedTransfers = 7; a.activeEntities = 250;
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_METRICS, "ServerMetrics: primer byte = PKT_METRICS");
+    CHECK(p.getType() == DGS::PKT_METRICS, "ServerMetrics: first byte = PKT_METRICS");
     b = p.unpackServerMetrics();
     CHECK(b.ramUsage == a.ramUsage && b.performance == a.performance, "ServerMetrics: ram/perf");
     CHECK(b.node.chunkXMin == a.node.chunkXMin && b.node.chunkXMax == a.node.chunkXMax, "ServerMetrics: X");
@@ -109,7 +183,7 @@ static void roundTripZoneQuery()
     DGS::ZoneQuery a{}, b{};
     a.uuid = 999; a.chunkX = 1; a.chunkY = 2; a.chunkZ = 3;
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ZONE_QUERY, "ZoneQuery: primer byte");
+    CHECK(p.getType() == DGS::PKT_ZONE_QUERY, "ZoneQuery: first byte");
     b = p.unpackZoneQuery();
     CHECK(b.uuid == a.uuid && b.chunkX == a.chunkX && b.chunkY == a.chunkY && b.chunkZ == a.chunkZ,
           "ZoneQuery: campos");
@@ -121,7 +195,7 @@ static void roundTripZoneResponse()
     std::strncpy(a.addr, "10.1.2.3", sizeof(a.addr) - 1);
     a.port = 31337;
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ZONE_RESPONSE, "ZoneResponse: primer byte");
+    CHECK(p.getType() == DGS::PKT_ZONE_RESPONSE, "ZoneResponse: first byte");
     b = p.unpackZoneResponse();
     CHECK(std::strcmp(b.addr, a.addr) == 0 && b.port == a.port, "ZoneResponse: addr/port");
 }
@@ -139,7 +213,7 @@ static void roundTripZoneList()
         a.zones[i].port = 42425 + i;
     }
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ZONE_LIST, "ZoneListResponse: primer byte");
+    CHECK(p.getType() == DGS::PKT_ZONE_LIST, "ZoneListResponse: first byte");
     b = p.unpackZoneListResponse();
     CHECK(b.count == a.count, "ZoneListResponse: count");
     bool ok = true;
@@ -162,7 +236,7 @@ static void roundTripGhost()
     for (uint16_t i = 0; i < a.dataSize; i++) a.data[i] = patternByte(i);
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_GHOST_DELTA, "GhostDelta: primer byte");
+    CHECK(p.getType() == DGS::PKT_GHOST_DELTA, "GhostDelta: first byte");
     b = p.unpackGhostDelta();
     CHECK(b.uuid == a.uuid && b.chunkX == a.chunkX && b.chunkY == a.chunkY && b.chunkZ == a.chunkZ,
           "GhostDelta: uuid/bounds");
@@ -183,7 +257,7 @@ static void roundTripChat()
     a.seq = 42;
     a.timestampMs = 1234567890;
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_CHAT, "ChatMessage: primer byte");
+    CHECK(p.getType() == DGS::PKT_CHAT, "ChatMessage: first byte");
     b = p.unpackChatMessage();
     CHECK(b.uuid == a.uuid && std::strcmp(b.username, a.username) == 0 && std::strcmp(b.text, a.text) == 0,
           "ChatMessage: campos");
@@ -197,7 +271,7 @@ static void roundTripSocial()
     a.targetUuid = 1001; a.scopeUuid = 7; a.kind = DGS::SOCIAL_GUILD_RANK;
     a.rank = 3; a.zoneId = 5; a.seq = 9;
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_SOCIAL_DELTA, "SocialDelta: primer byte");
+    CHECK(p.getType() == DGS::PKT_SOCIAL_DELTA, "SocialDelta: first byte");
     b = p.unpackSocialDelta();
     CHECK(b.targetUuid == a.targetUuid && b.scopeUuid == a.scopeUuid && b.kind == a.kind &&
           b.rank == a.rank && b.zoneId == a.zoneId && b.seq == a.seq,
@@ -211,7 +285,7 @@ static void roundTripAccount()
     a.permFlags = 0; a.durationS = 86400;
     std::strncpy(a.reason, "trampa de velocidad", sizeof(a.reason) - 1);
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ACCOUNT, "AccountAction: primer byte");
+    CHECK(p.getType() == DGS::PKT_ACCOUNT, "AccountAction: first byte");
     b = p.unpackAccountAction();
     CHECK(b.actorUuid == a.actorUuid && b.targetUuid == a.targetUuid && b.action == a.action &&
           b.permFlags == a.permFlags && b.durationS == a.durationS &&
@@ -228,7 +302,7 @@ static void roundTripValidate()
     a.maxSpeed = 8.0f; a.dtSeconds = 0.1f;
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_VALIDATE_REQ, "ValidateRequest: primer byte");
+    CHECK(p.getType() == DGS::PKT_VALIDATE_REQ, "ValidateRequest: first byte");
     b = p.unpackValidateRequest();
     CHECK(b.requestId == a.requestId && b.entityUuid == a.entityUuid, "ValidateRequest: ids");
     CHECK(b.ownerZone == a.ownerZone && b.moduleId == a.moduleId && b.kind == a.kind, "ValidateRequest: meta");
@@ -239,7 +313,7 @@ static void roundTripValidate()
     DGS::ValidateAck ac{}, acB{};
     ac.requestId = 9; ac.verdict = 0; ac.weight = 12;
     DGS::Packet pa; pa.pack(ac);
-    CHECK(pa.getType() == DGS::PKT_VALIDATE_ACK, "ValidateAck: primer byte");
+    CHECK(pa.getType() == DGS::PKT_VALIDATE_ACK, "ValidateAck: first byte");
     acB = pa.unpackValidateAck();
     CHECK(acB.requestId == ac.requestId && acB.verdict == ac.verdict && acB.weight == ac.weight,
           "ValidateAck: campos");
@@ -252,7 +326,7 @@ static void roundTripValidatorStatus()
     a.bytesRecv = 12345; a.failedTransfers = 2; a.activeEntities = 88; a.timestampMs = 1700000000000ull;
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_VALIDATOR_STATUS, "ValidatorStatus: primer byte");
+    CHECK(p.getType() == DGS::PKT_VALIDATOR_STATUS, "ValidatorStatus: first byte");
     b = p.unpackValidatorStatus();
     CHECK(b.state == a.state && b.reqSent == a.reqSent && b.reqTimeout == a.reqTimeout,
           "ValidatorStatus: state/req");
@@ -268,7 +342,7 @@ static void roundTripReassign()
     a.fromZone = 1; a.toZone = 4;
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_REASSIGN, "EntityReassign: primer byte");
+    CHECK(p.getType() == DGS::PKT_REASSIGN, "EntityReassign: first byte");
     b = p.unpackEntityReassign();
     CHECK(b.entityUuid == a.entityUuid && b.chunkX == a.chunkX && b.chunkY == a.chunkY &&
           b.chunkZ == a.chunkZ && b.fromZone == a.fromZone && b.toZone == a.toZone,
@@ -280,7 +354,7 @@ static void roundTripLifecycle()
     DGS::ZoneLifecycle a{}, b{};
     a.requestId = 4242; a.ack = 1;   // the node's ack (DRAIN)
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_DRAIN, "ZoneLifecycle(pack): primer byte = PKT_DRAIN");
+    CHECK(p.getType() == DGS::PKT_DRAIN, "ZoneLifecycle(pack): first byte = PKT_DRAIN");
     b = p.unpackZoneLifecycle();
     CHECK(b.requestId == a.requestId && b.ack == a.ack, "ZoneLifecycle: requestId/ack");
 
@@ -288,7 +362,7 @@ static void roundTripLifecycle()
     DGS::ZoneLifecycle del{}, delB{};
     del.requestId = 7; del.ack = 0;
     DGS::Packet pd; pd.packDelete(del);
-    CHECK(pd.getType() == DGS::PKT_DELETE_ZONE, "ZoneLifecycle(packDelete): primer byte = PKT_DELETE_ZONE");
+    CHECK(pd.getType() == DGS::PKT_DELETE_ZONE, "ZoneLifecycle(packDelete): first byte = PKT_DELETE_ZONE");
     delB = pd.unpackZoneLifecycle();
     CHECK(delB.requestId == del.requestId && delB.ack == del.ack, "packDelete: requestId/ack");
 }
@@ -302,7 +376,7 @@ static void roundTripZoneRegion()
     for (uint32_t i = 0; i < a.size; i++) a.data[i] = patternByte(i);
 
     DGS::Packet p; p.pack(a);
-    CHECK(p.getType() == DGS::PKT_ZONE_REGION, "ZoneRegion: primer byte");
+    CHECK(p.getType() == DGS::PKT_ZONE_REGION, "ZoneRegion: first byte");
     b = p.unpackZoneRegion();
     CHECK(b.chunkX == a.chunkX && b.chunkY == a.chunkY && b.chunkZ == a.chunkZ, "ZoneRegion: ancla");
     CHECK(b.srcZone == a.srcZone && b.size == a.size, "ZoneRegion: srcZone/size");
@@ -313,8 +387,10 @@ static void roundTripZoneRegion()
 
 int main()
 {
-    std::printf("[wire_test] round-trip de pack/unpack de los packets del DGS\n");
+    std::printf("[wire_test] pack/unpack round trip for every DGS packet\n");
     roundTripEntity();
+    entityWireSizeHonoursDataSize();
+    entityRejectsLyingDataSize();
     roundTripCommand();
     roundTripMetrics();
     roundTripZoneQuery();

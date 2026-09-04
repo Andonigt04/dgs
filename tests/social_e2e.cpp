@@ -30,6 +30,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 static int g_pass = 0, g_fail = 0;
 static void check(bool ok, const char* msg)
@@ -65,6 +66,15 @@ static void fakePersistence(std::atomic<bool>& ready)
             DGS::Packet r; r.setBuffer(buf, n);
             if (r.getType() == DGS::PKT_CHAT)              ++g_persChats;
             else if (r.getType() == DGS::PKT_SOCIAL_DELTA) ++g_persDeltas;
+            else if (r.getType() == DGS::PKT_SOCIAL_QUERY) {
+                // ⚠️ THE FAKE HAS TO ANSWER. The social node asks for its stored state on start-up and
+                // does not accept subscribers until it has it — serving during that window would mean
+                // telling a zone "nobody is banned". A stub that stays silent is a database that never
+                // answers, so the node quite correctly waited out its deadline and this test's 1.5 s
+                // expectations expired first. An empty answer is still an answer: a bare PKT_NONE.
+                DGS::Packet end; end.pack(DGS::PKT_NONE);
+                s.send(fd, end.getRawData(), end.getSize());
+            }
         }
         s.closeClient(fd);
     }
@@ -132,8 +142,12 @@ int main(int argc, char** argv)
 
         // (1) A speaks on the guild channel -> B receives it.
         sendChat(A, 1, DGS::CHAT_GUILD, "hello");
-        check(receiveType(B, 1500, rec) == DGS::PKT_CHAT, "a chat from A reaches B");
-        const uint64_t seq1 = rec.unpackChatMessage().seq;
+        const bool gotFirst = receiveType(B, 1500, rec) == DGS::PKT_CHAT;
+        check(gotFirst, "a chat from A reaches B");
+        // ⚠️ ONLY UNPACK WHAT ARRIVED. This used to unpack unconditionally, so the FIRST failure threw
+        // `Packet read overflow` out of `main` and the process ABORTED — every later check silently
+        // never ran, and the output ended in a core dump instead of a verdict.
+        const uint64_t seq1 = gotFirst ? rec.unpackChatMessage().seq : 0;
 
         // (1b) ...and it does NOT come back to A.
         // ⚠️ A SHORT DEADLINE, ON PURPOSE. Waiting here burns clock, and case (2) measures a 500 ms

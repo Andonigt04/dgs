@@ -34,12 +34,39 @@ namespace DGS
         PKT_DELETE_ZONE     = 15,  // lifecycle: confirm zone destruction (§3.9)
         PKT_REASSIGN        = 16,  // authority handoff: zone → head → new owning zone (§3.6)
         PKT_ZONE_REGION     = 17,  // region state blob (serializeRegion/mergeRegion, §3.9)
-        // READ-ONLY OBSERVER (viewer/ops). Sent by UDP to a zone: "add me to your broadcast". It is a
-        // 1-byte packet and carries nothing else on purpose — an observer must be unable to introduce
-        // anything into the world. The zone answers with the SAME stream it already sends its clients
-        // (entities + ghosts), keeps observers in their own registry, and expires them on a lease so a
-        // viewer that goes away stops being fed.
+        // READ-ONLY OBSERVER (viewer/ops). Sent by UDP to a zone: "add me to your broadcast". It
+        // carries the zone's shared secret and NOTHING else on purpose — an observer must be unable to
+        // introduce anything into the world. The zone answers with the SAME stream it already sends its
+        // clients (entities + ghosts), keeps observers in their own registry, and expires them on a
+        // lease so a viewer that goes away stops being fed. With no token configured the zone refuses
+        // every observer: this feed is every entity's position ten times a second.
         PKT_OBSERVE         = 18,
+        // Ask the persistence node for an entity's LAST STORED STATE (payload: uuid). It answers with a
+        // PKT_ENTITY_TRANSFER carrying the state, or a bare PKT_NONE when it has never seen that uuid.
+        // Persistence was write-only until this existed: entities went into Mongo and nothing in the
+        // system could ever read one back, so "persistence" could not restore anything.
+        PKT_PERSIST_QUERY   = 19,
+        // Ask persistence for EVERY entity stored inside a chunk range (payload: the six bounds plus a
+        // cap). This is what a zone needs at start-up: it knows the region it serves and not a single
+        // uuid in it. The answer is a stream of PKT_ENTITY_TRANSFER terminated by a bare PKT_NONE, so
+        // "no entities" and "the answer has ended" are the same well-formed thing.
+        PKT_PERSIST_RANGE   = 20,
+        // Ask persistence for the whole DURABLE social plane: guild memberships, friendships and
+        // account state (bans, permissions). The answer is a stream of PKT_SOCIAL_DELTA and
+        // PKT_ACCOUNT, terminated by a bare PKT_NONE.
+        //
+        // The social node holds all of it in memory and had no way to get any of it back, so a restart
+        // UNBANNED EVERY ACCOUNT, dissolved every guild and forgot every friendship — and its own
+        // write-through was being dropped on the floor by a persistence node that only understood
+        // entities. Parties are deliberately NOT in here: they are session-scoped, and pretending they
+        // survive a restart would be worse than losing them.
+        PKT_SOCIAL_QUERY    = 21,
+        // A node proving it holds the cluster secret, sent as the first thing after connecting:
+        // nonce + timestamp + HMAC-SHA256(secret, nonce||timestamp). Nothing between the nodes was
+        // authenticated at all — anyone who could reach the head could register as a zone and have
+        // entities routed to them. See `auth.h` for what this does and, more importantly, what it
+        // does not (it is not TLS, and the rest of the connection is still in clear).
+        PKT_AUTH            = 22,
         PKT_DISCONNECT      = 255
     };
     
@@ -113,6 +140,17 @@ namespace DGS
         float       chunkSizeX, chunkSizeY, chunkSizeZ;
     };
 
+    // Payload of PKT_PERSIST_RANGE: "every entity you have stored inside these chunks". `limit` caps
+    // the answer so one query can never turn into an unbounded stream — a zone covering a large region
+    // of a populated world must not be able to ask for more than it can take.
+    struct PersistRange
+    {
+        int32_t  chunkXMin, chunkXMax;
+        int32_t  chunkYMin, chunkYMax;
+        int32_t  chunkZMin, chunkZMax;
+        uint32_t limit;
+    };
+
     struct ZoneInfoPublic {
         int32_t chunkXMin, chunkXMax;
         int32_t chunkYMin, chunkYMax;
@@ -173,6 +211,16 @@ namespace DGS
         int32_t  chunkX, chunkY, chunkZ;
         uint32_t fromZone;      // zone that gave it up (debug/audit)
         uint32_t toZone;        // destination zone (0 = let the head resolve it by chunk)
+        // ⚠️ THE HANDOFF USED TO BE FIRE-AND-FORGET, AND IT LOST ENTITIES. The ceding zone sent the
+        // reassign plus the state and erased the entity IMMEDIATELY — ignoring both send results — so
+        // a head that was down, reconnecting, or simply unable to route the chunk (`targetFD = -1`,
+        // which it drops in silence) meant the entity ceased to exist anywhere. Nobody owned it, no
+        // counter moved, and nothing in the logs said so.
+        //   0 = REQUEST   zone -> head    "take this entity off my hands"
+        //   1 = ACCEPTED  head -> zone    "it is routed to its new owner; you may let go"
+        //   2 = NO OWNER  head -> zone    "no zone covers that chunk; KEEP it"
+        // The ceding zone holds the entity until it is told 1, and re-sends until then.
+        uint8_t  ack;
     };
 
     // Zone lifecycle (§3.9). The same struct carries BOTH signals:
@@ -329,7 +377,7 @@ namespace DGS
         uint32_t actorUuid;    // who performs it (admin/moderator, permission-checked)
         uint32_t targetUuid;   // affected account
         uint8_t  action;       // AccountActionKind
-        uint32_t permFlags;    // permisos (ACC_SET_PERM)
+        uint32_t permFlags;    // permissions (ACC_SET_PERM)
         uint32_t durationS;    // 0 = permanent (ACC_BAN)
         char     reason[64];   // reason (moderation/log)
     };

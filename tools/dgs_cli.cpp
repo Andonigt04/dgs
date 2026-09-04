@@ -3,7 +3,7 @@
 // A single binary decides the mode:
 //   dgs run                  — portable: starts the DGS standalone (every node local, fork/exec) from
 //                              wherever it sits, installing nothing. LOCAL spawn backend.
-//   dgs install [--systemd]  — instala binarios en /opt/dgs y opcionalmente unidades systemd.
+//   dgs install [--systemd]  — installs binaries into /opt/dgs and optionally systemd units.
 //   dgs uninstall            — revierte `dgs install`.
 //   dgs up [--terraform]     — cluster: applies k8s (or provisions infra with terraform, then k8s).
 //   dgs down                 — stops the DGS (local: SIGTERM to the processes; cluster: kubectl delete).
@@ -29,27 +29,52 @@
 
 static const char* INSTALL_DIR = "/opt/dgs";
 static const char* SYSTEMD_DIR = "/etc/systemd/system";
-static const std::vector<std::string> NODOS =
-    { "head_server_node", "persistance_node", "cache_node",
+static const std::vector<std::string> NODES =
+    { "head_server_node", "persistance_node",
       "validador_node",   "social_node",      "zone_node" };
 
 // Ports/roles for messages (informational only in the CLI).
-static const std::vector<std::string> NODO_PUERTO =
-    { "TCP:42424", "TCP:42429", "TCP:42425/42426", "UDP:42427/TCP:42428", "TCP:42430", "UDP:42425" };
+//
+// ⚠️ THIS IS INDEXED BY POSITION AGAINST `NODES`, which is exactly why it went wrong: when
+// `cache_node` was removed its entry stayed here, so every node from the validator onwards printed the
+// PREVIOUS one's ports — the validator claimed the cache's, the social node claimed the validator's.
+// A parallel array with no link to what it describes drifts the moment either side changes. Kept as a
+// pair now, so it cannot say TCP:42430 about a node it does not name.
+struct NodePort { const char* node; const char* ports; };
+static const std::vector<NodePort> NODE_PORTS = {
+    { "head_server_node", "TCP:42424"            },
+    { "persistance_node", "TCP:42429"            },
+    { "validador_node",   "UDP:42427/TCP:42428"  },
+    { "social_node",      "TCP:42430"            },
+    { "zone_node",        "UDP:42425"            },
+};
+
+static std::string portsOf(const std::string& node)
+{
+    for (const auto& np : NODE_PORTS) if (node == np.node) return np.ports;
+    return "?";
+}
+
+/// Is this one of ours? Every path that would otherwise put a caller's string into a shell goes
+/// through here first.
+static bool isKnownNode(const std::string& name)
+{
+    return std::find(NODES.begin(), NODES.end(), name) != NODES.end();
+}
 
 static void usage()
 {
-    std::cout << "uso: dgs <comando> [opciones]\n"
+    std::cout << "usage: dgs <command> [options]\n"
               << "  run                    portable standalone (every node local, nothing installed)\n"
-              << "  install [--systemd]    instala binarios en " << INSTALL_DIR << " [+ unidades systemd]\n"
+              << "  install [--systemd]    installs binaries into " << INSTALL_DIR << " [+ systemd units]\n"
               << "  uninstall              reverts the installation\n"
-              << "  up [--terraform]       cluster: aplica k8s (y opcionalmente provisiona terraform)\n"
+              << "  up [--terraform]       cluster: applies k8s (and optionally provisions terraform)\n"
               << "  down                   stops the DGS (local or cluster)\n"
               << "  status                 DGS status\n"
               << "  logs [node]            logs for one node or all of them\n";
 }
 
-// --- utilidades ----------------------------------------------------------------------------------
+// --- utilities ----------------------------------------------------------------------------------
 
 static std::string envOr(const char* name, const std::string& def)
 {
@@ -78,7 +103,7 @@ static void runCmd(const std::string& cmd)
 {
     std::cout << "[dgs] $ " << cmd << std::endl;
     int rc = system(cmd.c_str());
-    if (rc != 0) std::cerr << "[dgs] advertencia: comando fallo (rc=" << rc << ")" << std::endl;
+    if (rc != 0) std::cerr << "[dgs] warning: command failed (rc=" << rc << ")" << std::endl;
 }
 
 // --- run (standalone portable) -------------------------------------------------------------------
@@ -108,22 +133,22 @@ static int cmdRun(const std::vector<std::string>& args)
     std::string socialHost = envOr("SOCIAL_HOST", "127.0.0.1");
     std::string socialPort = envOr("SOCIAL_TCP_PORT", "42430");
 
-    std::cout << "[dgs] run: standalone en " << binDir << " (logs en " << logDir << ")" << std::endl;
+    std::cout << "[dgs] run: standalone in " << binDir << " (logs in " << logDir << ")" << std::endl;
 
     // Order: head first (the others connect to it), then the rest; the base zone starts last.
-    std::vector<std::string> orden = NODOS;   // head, persistance, cache, validador, social, zone
+    std::vector<std::string> order = NODES;   // head, persistance, validador, social, zone
 
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
-    for (size_t i = 0; i < orden.size(); ++i)
+    for (size_t i = 0; i < order.size(); ++i)
     {
-        const std::string& bin  = orden[i];
+        const std::string& bin  = order[i];
         std::string path = binDir + "/" + bin;
         std::string log  = logDir + "/" + bin + ".log";
 
         pid_t pid = fork();
-        if (pid < 0) { std::cerr << "[dgs] fork fallo para " << bin << std::endl; continue; }
+        if (pid < 0) { std::cerr << "[dgs] fork failed for " << bin << std::endl; continue; }
 
         if (pid == 0)
         {
@@ -145,12 +170,33 @@ static int cmdRun(const std::vector<std::string>& args)
         }
 
         g_children[g_nchildren++] = pid;
-        std::cout << "[dgs] " << bin << " pid=" << pid << " " << NODO_PUERTO[i]
+        std::cout << "[dgs] " << bin << " pid=" << pid << " " << portsOf(bin)
                   << "  log=" << log << std::endl;
         usleep(300000);   // give each node time to bind before the next one (connection ordering)
     }
 
-    std::cout << "[dgs] standalone arriba. Ctrl-C para detener." << std::endl;
+    // ⚠️ IT USED TO SAY "UP" AND RETURN 0 EVEN WHEN NOTHING STARTED. With a wrong `DGS_BIN_DIR` every
+    // child failed its `execl`, exited 127, and the CLI still announced a running standalone and left
+    // with a success code — so a script driving it could not tell a cluster from an empty room.
+    // A short grace, then the children that survived are counted.
+    usleep(400000);
+    int alive = 0;
+    for (int i = 0; i < g_nchildren; ++i)
+    {
+        int st = 0;
+        const pid_t r = waitpid(g_children[i], &st, WNOHANG);
+        if (r == 0) ++alive;                      // still running
+        else if (r > 0) g_children[i] = -1;       // already gone
+    }
+    if (alive == 0)
+    {
+        std::cerr << "[dgs] no node stayed up (is DGS_BIN_DIR right? it is '" << binDir << "')"
+                  << std::endl;
+        return 1;
+    }
+    std::cout << "[dgs] standalone up: " << alive << " of " << g_nchildren
+              << " nodes. Ctrl-C to stop." << std::endl;
+
     while (true)
     {
         int st = 0;
@@ -177,20 +223,20 @@ static int cmdInstall(const std::vector<std::string>& args)
 
     if (!mkdirP(INSTALL_DIR + std::string("/bin"))) { std::cerr << "[dgs] cannot create " << INSTALL_DIR << std::endl; return 1; }
 
-    for (const auto& bin : NODOS)
+    for (const auto& bin : NODES)
     {
         std::string src = binDir + "/" + bin;
         std::string dst = std::string(INSTALL_DIR) + "/bin/" + bin;
         std::string cmd = "install -m 0755 " + src + " " + dst;
         int rc = system(cmd.c_str());
-        if (rc != 0) std::cerr << "[dgs] advertencia: " << cmd << std::endl;
-        else         std::cout << "[dgs] instalado " << dst << std::endl;
+        if (rc != 0) std::cerr << "[dgs] warning: " << cmd << std::endl;
+        else         std::cout << "[dgs] installed " << dst << std::endl;
     }
 
     if (systemd)
     {
-        std::cout << "[dgs] generando unidades systemd en " << SYSTEMD_DIR << std::endl;
-        for (const auto& bin : NODOS)
+        std::cout << "[dgs] generating systemd units in " << SYSTEMD_DIR << std::endl;
+        for (const auto& bin : NODES)
         {
             std::ofstream u(std::string(SYSTEMD_DIR) + "/dgs-" + bin + ".service");
             u << "[Unit]\nDescription=DGS " << bin << "\nAfter=network.target\n\n"
@@ -211,7 +257,7 @@ static int cmdInstall(const std::vector<std::string>& args)
         std::cout << "[dgs] lista: systemctl start dgs-head_server_node dgs-zone_node ..." << std::endl;
     }
     else
-        std::cout << "[dgs] instalado sin systemd (usa `dgs run` o `--systemd` para daemons)" << std::endl;
+        std::cout << "[dgs] installed without systemd (use `dgs run`, or `--systemd`, for daemons)" << std::endl;
 
     return 0;
 }
@@ -220,10 +266,10 @@ static int cmdUninstall()
 {
     std::string cmd = "rm -rf " + std::string(INSTALL_DIR);
     runCmd(cmd);
-    for (const auto& bin : NODOS)
+    for (const auto& bin : NODES)
         runCmd("rm -f " + std::string(SYSTEMD_DIR) + "/dgs-" + bin + ".service");
     runCmd("systemctl daemon-reload");
-    std::cout << "[dgs] desinstalado." << std::endl;
+    std::cout << "[dgs] uninstalled." << std::endl;
     return 0;
 }
 
@@ -244,7 +290,6 @@ static int cmdUp(const std::vector<std::string>& args)
     runCmd("kubectl apply -f k8s/namespace.yaml");
     runCmd("kubectl apply -f k8s/mongodb");
     runCmd("kubectl apply -f k8s/persistence");
-    runCmd("kubectl apply -f k8s/cache");
     runCmd("kubectl apply -f k8s/validador");
     runCmd("kubectl apply -f k8s/head-server");
     runCmd("kubectl apply -f k8s/zone-node");
@@ -257,10 +302,14 @@ static int cmdDown()
     // Local: if standalone processes exist (dgs run), kill them. Cluster: kubectl delete.
     std::string pidfile = envOr("DGS_PIDFILE", "");
     (void)pidfile;
-    for (const auto& bin : NODOS)
-        runCmd("pkill -f " + bin + " 2>/dev/null || true");
+    // ⚠️ `pkill -f` MATCHES THE WHOLE COMMAND LINE, so it kills anything that merely MENTIONS the
+    // name: an editor with the file open, a `tail -f logs/zone_node.log`, another `dgs logs zone_node`
+    // — and, memorably, the shell that ran the pkill, because its own command line contains the
+    // pattern. `-x` matches the process NAME exactly, which is what "stop the node" actually means.
+    for (const auto& bin : NODES)
+        runCmd("pkill -x " + bin + " 2>/dev/null || true");
     runCmd("kubectl delete -f k8s/zone-node -f k8s/head-server -f k8s/validador "
-           "-f k8s/cache -f k8s/persistence -f k8s/mongodb --ignore-not-found 2>/dev/null || true");
+           "-f k8s/persistence -f k8s/mongodb --ignore-not-found 2>/dev/null || true");
     std::cout << "[dgs] down: local nodes stopped / cluster deleted." << std::endl;
     return 0;
 }
@@ -272,9 +321,11 @@ static int cmdStatus()
     bool haveKubectl = system("command -v kubectl >/dev/null 2>&1") == 0;
     std::cout << "[dgs] status:" << std::endl;
 
-    for (const auto& bin : NODOS)
+    for (const auto& bin : NODES)
     {
-        std::string cmd = "pgrep -f '" + bin + "' | head -1";
+        // `-x`, for the same reason as in `down`: with `-f` a `tail -f logs/zone_node.log` was
+        // reported as a RUNNING ZONE. A status that says a dead node is alive is worse than no status.
+        std::string cmd = "pgrep -x '" + bin + "' | head -1";
         FILE* fp = popen(cmd.c_str(), "r");
         std::string pid;
         if (fp) { char buf[64]; if (fgets(buf, sizeof(buf), fp)) pid = buf; pclose(fp); }
@@ -293,7 +344,7 @@ static int cmdLogs(const std::vector<std::string>& args)
     std::string logDir = envOr("DGS_LOG_DIR", "logs");
     if (args.empty())
     {
-        for (const auto& bin : NODOS)
+        for (const auto& bin : NODES)
         {
             std::string log = logDir + "/" + bin + ".log";
             std::ifstream f(log);
@@ -305,8 +356,18 @@ static int cmdLogs(const std::vector<std::string>& args)
         return 0;
     }
 
+    // ⚠️ THIS WAS A COMMAND INJECTION. The argument went straight into `system("tail -f " + ...)`, so
+    // `dgs logs 'x; touch /tmp/pwned'` ran the `touch` — demonstrated, the file appeared. The name is
+    // checked against the nodes we know before it is allowed anywhere near a shell.
+    if (!isKnownNode(args[0]))
+    {
+        std::cerr << "[dgs] unknown node: " << args[0] << "\n       known nodes:";
+        for (const auto& n : NODES) std::cerr << " " << n;
+        std::cerr << std::endl;
+        return 1;
+    }
     std::string log = logDir + "/" + args[0] + ".log";
-    runCmd("tail -f " + log);
+    runCmd("tail -f '" + log + "'");
     return 0;
 }
 
@@ -337,7 +398,7 @@ int main(int argc, char** argv)
     else if (cmd == "logs")      return cmdLogs(args);
     else if (cmd == "--help" || cmd == "-h" || cmd == "help") { usage(); return 0; }
 
-    std::cerr << "[dgs] comando desconocido: " << cmd << std::endl;
+    std::cerr << "[dgs] unknown command: " << cmd << std::endl;
     usage();
     return 1;
 }

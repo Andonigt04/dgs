@@ -49,24 +49,29 @@ endif()
 
 set(COMMON_SRCS src/packet.cpp src/network.cpp)
 
+# `network.cpp` speaks TLS now, so every target that links it needs OpenSSL. Declared once here rather
+# than remembered at each of the twenty-odd targets, which is how one gets forgotten.
+link_libraries(OpenSSL::SSL OpenSSL::Crypto)
+
 add_executable(head_server_node nodes/head_server_node.cpp ${COMMON_SRCS})
-target_link_libraries(head_server_node httplib::httplib)
+target_link_libraries(head_server_node httplib::httplib OpenSSL::Crypto)   # HMAC for node auth
 
 add_executable(zone_node nodes/zone_node.cpp ${COMMON_SRCS})
-target_link_libraries(zone_node ${CMAKE_DL_LIBS})   # dlopen of the per-project rules module (module->step)
+target_link_libraries(zone_node ${CMAKE_DL_LIBS} OpenSSL::Crypto)   # dlopen of the rules module; HMAC for node auth
 
 if (DGS_HAVE_MONGO)
     add_executable(persistance_node nodes/persistance_node.cpp ${COMMON_SRCS})
     target_link_libraries(persistance_node
         mongo::mongocxx_shared
         mongo::bsoncxx_shared
+        OpenSSL::Crypto
     )
 endif()
 
-add_executable(cache_node nodes/cache_node.cpp ${COMMON_SRCS})
 add_executable(social_node nodes/social_node.cpp ${COMMON_SRCS})   # §3.7 social/account plane (P7)
+target_link_libraries(social_node OpenSSL::Crypto)
 add_executable(validador_node nodes/validador_node.cpp ${COMMON_SRCS})
-target_link_libraries(validador_node ${CMAKE_DL_LIBS})   # dlopen of the per-project rules module
+target_link_libraries(validador_node ${CMAKE_DL_LIBS} OpenSSL::Crypto)   # dlopen of the rules module; HMAC for node auth
 
 add_executable(dgs tools/dgs_cli.cpp)   # §3.8 (P8): installer/deployer/CLI (run/install/up/status/logs)
 
@@ -102,6 +107,26 @@ endif()
 add_executable(ping_pong_test tests/ping_pong.cpp ${COMMON_SRCS})
 add_executable(thread_pool_test tests/thread_pool_test.cpp ${COMMON_SRCS})
 add_executable(logger_test tests/logger_test.cpp ${COMMON_SRCS})
+# The transport's own contract: one send is one receive, and a message that does not fit must not take
+# the rest of the connection down with it.
+# Who is allowed to be a node: nothing between them was authenticated at all.
+# `dgs`, the tool an operator types: it had a command injection and a status that lied.
+add_executable(cli_test tests/cli_test.cpp)
+
+# What anyone on the path can read. Needs certificates: `./tools/tls/make_certs.sh /tmp/dgs-tls`.
+# The UDP game plane: positions and the zone's broadcast used to travel in clear.
+add_executable(udp_crypto_test tests/udp_crypto_test.cpp ${COMMON_SRCS})
+target_link_libraries(udp_crypto_test Threads::Threads)
+
+add_executable(tls_test tests/tls_test.cpp ${COMMON_SRCS})
+target_link_libraries(tls_test Threads::Threads)
+
+add_executable(auth_e2e_test tests/auth_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(auth_e2e_test Threads::Threads OpenSSL::Crypto)
+
+add_executable(socket_framing_test tests/socket_framing_test.cpp ${COMMON_SRCS})
+target_link_libraries(socket_framing_test Threads::Threads)
+
 add_executable(wire_test tests/wire_test.cpp ${COMMON_SRCS})
 add_executable(robust_test tests/robust_test.cpp ${COMMON_SRCS})
 target_link_libraries(robust_test ${CMAKE_DL_LIBS})   # dlopen of the rules module (determinism)
@@ -161,12 +186,17 @@ add_executable(action_e2e_test tests/action_e2e.cpp ${COMMON_SRCS})
 target_link_libraries(action_e2e_test Threads::Threads)
 
 # Ghosts and authority handoff between zones: what separates a distributed world from a single server.
+# An entity crossing a border must not be able to vanish: the handoff is at-least-once now.
+# A player is told about what is near them: the zone's egress used to grow as N x N.
+add_executable(interest_e2e_test tests/interest_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(interest_e2e_test Threads::Threads)
+
+add_executable(handoff_e2e_test tests/handoff_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(handoff_e2e_test Threads::Threads)
+
 add_executable(ghost_e2e_test tests/ghost_e2e.cpp ${COMMON_SRCS})
 target_link_libraries(ghost_e2e_test Threads::Threads)
 
-# `cache_node`: the queue between the zones and the validator. 94 lines nothing touched.
-add_executable(cache_e2e_test tests/cache_e2e.cpp ${COMMON_SRCS})
-target_link_libraries(cache_e2e_test Threads::Threads)
 
 # `social_node`: chat, guilds and accounts. 221 lines with no coverage.
 add_executable(social_e2e_test tests/social_e2e.cpp ${COMMON_SRCS})
@@ -192,6 +222,16 @@ target_link_libraries(head_routing_e2e_test Threads::Threads)
 if (DGS_HAVE_MONGO)
     add_executable(persistence_e2e_test tests/persistence_e2e.cpp ${COMMON_SRCS})
     target_link_libraries(persistence_e2e_test Threads::Threads)
+
+    # A zone that comes back with its world still in it: players -> zone A -> persistence -> Mongo ->
+    # [zone A killed] -> zone B. Lives under the mongo guard because it needs a real database; it skips
+    # loudly without one, and DGS_REQUIRE_MONGO turns that skip into a failure where CI provides it.
+    add_executable(restore_e2e_test tests/restore_e2e.cpp ${COMMON_SRCS})
+    target_link_libraries(restore_e2e_test Threads::Threads)
+
+    # A ban must survive a restart of the social node: it used to be undone by restarting a process.
+    add_executable(social_persist_e2e_test tests/social_persist_e2e.cpp ${COMMON_SRCS})
+    target_link_libraries(social_persist_e2e_test Threads::Threads)
 endif()
 
 # ── TESTS ────────────────────────────────────────────────────────────────────────────────────────
@@ -203,6 +243,18 @@ endif()
 # haya construido antes.
 enable_testing()
 
+add_test(NAME cli COMMAND cli_test $<TARGET_FILE:dgs>)
+set_tests_properties(cli PROPERTIES TIMEOUT 60)
+
+add_test(NAME udp_crypto COMMAND udp_crypto_test)
+set_tests_properties(udp_crypto PROPERTIES TIMEOUT 60)
+
+add_test(NAME tls COMMAND tls_test)
+set_tests_properties(tls PROPERTIES TIMEOUT 90)
+
+add_test(NAME auth_e2e COMMAND auth_e2e_test $<TARGET_FILE:head_server_node>)
+set_tests_properties(auth_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+add_test(NAME socket_framing COMMAND socket_framing_test)
 add_test(NAME wire        COMMAND wire_test)
 add_test(NAME robust      COMMAND robust_test)
 add_test(NAME thread_pool COMMAND thread_pool_test)
@@ -224,9 +276,14 @@ add_test(NAME reconnect_e2e COMMAND reconnect_e2e_test
 add_test(NAME action_e2e COMMAND action_e2e_test
          $<TARGET_FILE:validador_node> $<TARGET_FILE:stub_rules>
          $<TARGET_FILE:stub_rules_actions>)
+add_test(NAME interest_e2e COMMAND interest_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(interest_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
+add_test(NAME handoff_e2e COMMAND handoff_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(handoff_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
 add_test(NAME ghost_e2e COMMAND ghost_e2e_test
          $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules>)
-add_test(NAME cache_e2e COMMAND cache_e2e_test $<TARGET_FILE:cache_node>)
 add_test(NAME social_e2e COMMAND social_e2e_test $<TARGET_FILE:social_node>)
 add_test(NAME net_degraded COMMAND net_degraded_test
          $<TARGET_FILE:validador_node> $<TARGET_FILE:stub_rules>)
@@ -236,10 +293,18 @@ add_test(NAME head_routing_e2e COMMAND head_routing_e2e_test $<TARGET_FILE:head_
 if (DGS_HAVE_MONGO)
     add_test(NAME persistence_e2e COMMAND persistence_e2e_test $<TARGET_FILE:persistance_node>)
     set_tests_properties(persistence_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
+    add_test(NAME restore_e2e COMMAND restore_e2e_test
+             $<TARGET_FILE:zone_node> $<TARGET_FILE:persistance_node>)
+    set_tests_properties(restore_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+
+    add_test(NAME social_persist_e2e COMMAND social_persist_e2e_test
+             $<TARGET_FILE:social_node> $<TARGET_FILE:persistance_node>)
+    set_tests_properties(social_persist_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 endif()
 
 # The round trip opens a fixed port (42424): two at once would collide. `RUN_SERIAL` prevents it.
 # Both spawn processes that bind fixed ports: in parallel they would collide with each other.
-set_tests_properties(ping_pong validator_e2e zone_e2e reconnect_e2e action_e2e ghost_e2e cache_e2e social_e2e net_degraded zone_policy_e2e head_routing_e2e
+set_tests_properties(ping_pong validator_e2e zone_e2e reconnect_e2e action_e2e ghost_e2e social_e2e net_degraded zone_policy_e2e head_routing_e2e
                      PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
-set_tests_properties(wire robust thread_pool logger spawn_parity PROPERTIES TIMEOUT 60)
+set_tests_properties(wire socket_framing robust thread_pool logger spawn_parity PROPERTIES TIMEOUT 60)

@@ -101,7 +101,18 @@ static void fakeHead(std::atomic<bool>& ready)
                 }
                 case DGS::PKT_REASSIGN: {
                     const DGS::EntityReassign ra = r.unpackEntityReassign();
+                    if (ra.ack != 0) break;          // our own answer bouncing back
                     if (ra.entityUuid == kOutside) ++g_reassignOutside;
+                    // ⚠️ THE ACK IS REQUIRED, and this fake used to be silent. The handoff is
+                    // at-least-once now: a zone HOLDS the entity until the head confirms it was
+                    // routed, precisely so that a head that cannot route it (or is not there) can no
+                    // longer make the entity vanish. A stub that never answers is a head that never
+                    // routes, so the zone kept it and this test read 3 active instead of 2 — the test
+                    // was right to notice, and the fix is to answer like the real head does.
+                    DGS::EntityReassign answer = ra;
+                    answer.ack = 1;                  // routed: the zone may let go
+                    DGS::Packet pa; pa.pack(answer);
+                    s.send(fd, pa.getRawData(), pa.getSize());
                     break;
                 }
                 default: break;
@@ -139,7 +150,8 @@ static void sendEntity(DGS::UDPSocket& udp, uint32_t uuid, int cx, int cy, int c
     e.chunkX = cx; e.chunkY = cy; e.chunkZ = cz;
     e.pos[0] = 10.0f; e.pos[1] = 0.0f; e.pos[2] = 0.0f;
     e.stats.speed[0] = 5.0f;
-    udp.send("127.0.0.1", kZoneUdp, (const uint8_t*)&e, sizeof(e));
+    DGS::Packet p; p.pack(e);
+    udp.send("127.0.0.1", kZoneUdp, p.getRawData(), p.getSize());
 }
 
 static bool waitFor(std::atomic<int>& c, int atLeast, int msLimit)

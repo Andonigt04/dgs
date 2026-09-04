@@ -110,8 +110,13 @@ namespace DGS
 
     void Client::sendEntityUDP(const EntityTransfer& e)
     {
-        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&e);
-        m_udp.send(m_zoneAddr, m_zonePort, raw, sizeof(EntityTransfer));
+        // ⚠️ THIS USED TO memcpy THE WHOLE STRUCT: 4160 bytes per update, at 20 Hz, 83 KB/s of UPLOAD
+        // per player — of which 4096 bytes were the `data[]` blob, empty for a player who is only
+        // moving. `Packet::pack` honours `dataSize` and tags the datagram with its type, which is also
+        // what lets the zone recognise it without comparing sizes.
+        Packet p;
+        p.pack(e);
+        m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize());
     }
 
     void Client::sendTransform(uint32_t uuid, int32_t chunkX, int32_t chunkY, int32_t chunkZ, const float pos[3], const float rot[4])
@@ -220,8 +225,12 @@ namespace DGS
             switch (p.getType())
             {
                 case PKT_ENTITY_TRANSFER:
-                    m_incomingEntities.push_back(p.unpackEntityTransfer());
+                {
+                    // A malformed datagram must not take the game down with it.
+                    EntityTransfer inc{};
+                    if (p.tryUnpackEntityTransfer(inc)) m_incomingEntities.push_back(inc);
                     break;
+                }
                 case PKT_GHOST_DELTA:
                     m_incomingGhosts.push_back(p.unpackGhostDelta());
                     break;

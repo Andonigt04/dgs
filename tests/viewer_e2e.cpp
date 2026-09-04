@@ -133,7 +133,8 @@ static void sendPlayer(DGS::UDPSocket& udp, uint32_t uuid, int32_t cx, float x)
     e.chunkX = cx; e.chunkY = 50; e.chunkZ = 50;
     e.pos[0] = x;
     e.stats.speed[0] = 200.0f;   // a vehicle: the steps below stay under it
-    udp.send("127.0.0.1", kZoneUdp, (const uint8_t*)&e, sizeof(e));
+    DGS::Packet p; p.pack(e);
+    udp.send("127.0.0.1", kZoneUdp, p.getRawData(), p.getSize());
 }
 
 /// Throws away whatever is already queued on the socket. @return how many were dropped.
@@ -146,9 +147,11 @@ static int drain(DGS::UDPSocket& udp)
     return n;
 }
 
-static void subscribe(DGS::UDPSocket& udp)
+static const char* kObserveToken = "s3cr3t-observe-token";
+
+static void subscribe(DGS::UDPSocket& udp, const char* token = kObserveToken)
 {
-    DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE);
+    DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE); hello.writeString(token);
     udp.send("127.0.0.1", kZoneUdp, hello.getRawData(), hello.getSize());
 }
 
@@ -211,6 +214,7 @@ int main(int argc, char** argv)
         setenv("CHUNK_SIZE_Z", "1000.0", 1);
         setenv("ENTITY_LEASE_MS", "1500", 1);
         setenv("OBSERVER_LEASE_MS", "1500", 1);
+        setenv("DGS_OBSERVE_TOKEN", kObserveToken, 1);
         setenv("GAME_MODULE_SO", stubPath, 1);
         char tmpl[] = "/tmp/dgs_viewer_XXXXXX";
         if (const char* d = mkdtemp(tmpl)) { if (chdir(d) != 0) {} }
@@ -254,6 +258,19 @@ int main(int argc, char** argv)
         check(state.entityCount() == 0,
               "without subscribing, the viewer receives NOTHING (the feed is not open to all)");
 
+        // ══ (0b) A WRONG TOKEN IS STILL NOTHING ═══════════════════════════════════════════════
+        // The observer feed is every entity's position, ten times a second — the exact thing a
+        // wallhack wants — and it used to be handed to anyone who sent one byte. Asking with the
+        // wrong secret must be worth exactly as much as not asking at all. Phase (1) below, which
+        // asks with the RIGHT one and does see the world, is this check's positive control: without
+        // it, "sees nothing" would also pass on a zone whose broadcast was simply broken.
+        for (int i = 0; i < 4; ++i) { subscribe(viewer, "wrong-token");
+                                      sendPlayer(player, 9001, 10, 100.0f);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(80)); }
+        pump(viewer, state, 500, /*keepAlive*/ false);
+        check(state.entityCount() == 0,
+              "subscribing with the WRONG token gets nothing: the feed is authenticated");
+
         // ══ (1) Subscribing shows the world ═══════════════════════════════════════════════════
         subscribe(viewer);
         for (int i = 0; i < 8; ++i) { sendPlayer(player, 9001, 10, 100.0f);
@@ -293,6 +310,49 @@ int main(int argc, char** argv)
         std::printf("    the position advanced %d times · %.3f -> %.3f (chunk space)\n",
                     moves, x0, xPrev);
         check(moves >= 4, "the position ADVANCES as the player moves (it is not a frozen frame)");
+
+        // ══ (3b) THE TICK RATE, pinned ════════════════════════════════════════════════════════
+        // The zone promises a 100 ms tick, and for a long time it delivered 4.6 Hz — its per-tick
+        // blocking waits stacked to ~220 ms — while its own `performance` metric reported 211 us of
+        // work. NOTHING in the node's telemetry could show it; it took an external harness
+        // (`tools/load_zone`) to see it, and a player felt it as 142 ms of latency instead of 44.
+        // A number that only an external tool can see is a number that will rot, so it is pinned here.
+        {
+            drain(viewer);
+            subscribe(viewer);
+            const auto tr0 = std::chrono::steady_clock::now();
+            int snapshots = 0;
+            uint64_t rxBytes = 0;
+            uint8_t rb[sizeof(DGS::EntityTransfer) * 2];
+            std::string rfrom; int rport = 0;
+            while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - tr0).count() < 2000)
+            {
+                sendPlayer(player, 9001, 10, 220.0f);
+                subscribe(viewer);   // the lease is shorter than this window: renew, as the viewer does
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                int r;
+                while ((r = viewer.receive(rb, sizeof(rb), rfrom, rport)) > 0)
+                    { ++snapshots; rxBytes += (uint64_t)r; }
+            }
+            const double secs = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - tr0).count();
+            const double hz = snapshots / secs;
+            std::printf("    broadcast rate with ONE entity: %.1f Hz (the tick promises 10)\n", hz);
+            check(hz > 8.0,
+                  "the zone broadcasts at its nominal 10 Hz, not at whatever its blocking waits allow");
+
+            // ── And what each of those datagrams COSTS ──────────────────────────────────────────
+            // Measured at the far end of a real zone, not on a struct in this process. The broadcast
+            // used to send `sizeof(EntityTransfer)` — 4160 B, of which 4096 was the empty `data[]` —
+            // to every client, every tick, with an N x N fan-out. `wire_test` pins the encoder; this
+            // pins the thing that actually leaves the socket, which is what a player's line pays for.
+            const double avg = snapshots > 0 ? (double)rxBytes / snapshots : 0.0;
+            std::printf("    average datagram from the zone: %.0f B (the raw struct is %zu B)\n",
+                        avg, sizeof(DGS::EntityTransfer));
+            check(snapshots > 0 && avg < 256.0,
+                  "the zone broadcasts the DECLARED payload, not the whole 4160-byte struct");
+        }
 
         // ══ (4) What leaves DISAPPEARS ════════════════════════════════════════════════════════
         // The player stops reporting. Its lease expires at the node, the broadcast stops carrying it,

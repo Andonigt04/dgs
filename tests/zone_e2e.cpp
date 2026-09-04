@@ -158,8 +158,9 @@ static void fakeSocial(std::atomic<bool>& ready)
     s.closeClient(fd);
 }
 
-/** @brief Sends the entity over UDP the way a client does: the RAW struct, not wrapped in a Packet
- *  (the zone compares `udpBytes == sizeof(EntityTransfer)`). */
+/** @brief Sends the entity over UDP the way a client does: a PKT_ENTITY_TRANSFER honouring
+ *  `dataSize`. It used to be the RAW struct, recognised by the zone through an exact size comparison —
+ *  4160 B per update where 62 will do, and a rule that could not survive the payload being variable. */
 static void sendEntity(DGS::UDPSocket& udp, uint32_t uuid, float x, float maxSpeed)
 {
     DGS::EntityTransfer e{};
@@ -167,7 +168,8 @@ static void sendEntity(DGS::UDPSocket& udp, uint32_t uuid, float x, float maxSpe
     e.chunkX = 0; e.chunkY = 0; e.chunkZ = 0;
     e.pos[0] = x; e.pos[1] = 0.0f; e.pos[2] = 0.0f;
     e.stats.speed[0] = maxSpeed;
-    udp.send("127.0.0.1", kZoneUdp, (const uint8_t*)&e, sizeof(e));
+    DGS::Packet p; p.pack(e);
+    udp.send("127.0.0.1", kZoneUdp, p.getRawData(), p.getSize());
 }
 
 /** @brief Waits up to `msLimit` for `activeEntities` to equal `target`. Polling with a deadline is the

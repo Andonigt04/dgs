@@ -3,7 +3,7 @@
 //
 // A cluster with no players is a correct but empty picture, so there was no way to tell a working
 // viewer from a broken one by looking at it. This walks N entities around a zone at a plausible speed,
-// sending exactly what a real client sends: the raw `EntityTransfer` over UDP, at 20 Hz.
+// sending exactly what a real client sends: a PKT_ENTITY_TRANSFER over UDP, at 20 Hz.
 //
 // It is a client, not a test hook: it goes through the same door as a player and gets the same
 // treatment — the zone's S1 filter, the validator, the lease. If it moved faster than the speed it
@@ -16,6 +16,7 @@
 //      DEMO_CHUNK_SIZE                             metres per chunk (default 1000)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/network.h"
+#include "include/dgs/packet.h"
 #include "include/dgs/types.h"
 
 #include <csignal>
@@ -80,7 +81,8 @@ int main(int argc, char** argv)
             e.stats.speed[0] = speed;
             e.stats.health   = 100.0f;
 
-            udp.send(host, port, (const uint8_t*)&e, sizeof(e));
+            DGS::Packet p; p.pack(e);   // honours dataSize; tagged PKT_ENTITY_TRANSFER
+            udp.send(host, port, p.getRawData(), p.getSize());
         }
 
         t += dt;

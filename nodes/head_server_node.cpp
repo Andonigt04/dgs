@@ -1,5 +1,6 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "include/dgs/auth.h"
 #include "include/dgs/orchestrator.h"
 #include "include/dgs/logger.h"
 #include <csignal>
@@ -127,8 +128,22 @@ int main()
                   << " chunk=(" << ra.chunkX << "," << ra.chunkY << "," << ra.chunkZ << ")"
                   << " targetFD=" << targetFD << std::endl;
 
+        // ⚠️ ANSWER THE ZONE THAT GAVE IT UP. Without this the handoff was fire-and-forget: the ceding
+        // zone erased the entity the moment it wrote the packet, so a chunk this head cannot route
+        // (`targetFD == -1`, dropped right here in silence) or a forward that fails made the entity
+        // cease to exist anywhere at all. The ack is what lets the zone hold on until it is safe.
+        bool routed = false;
         if (targetFD != -1 && targetFD != fd)
-            serverSocket.send(targetFD, p.getRawData(), p.getSize());
+            routed = serverSocket.send(targetFD, p.getRawData(), p.getSize());
+
+        DGS::EntityReassign answer = ra;
+        answer.ack    = routed ? 1 : 2;
+        answer.toZone = routed ? (uint32_t)targetFD : 0u;
+        DGS::Packet pa; pa.pack(answer);
+        serverSocket.send(fd, pa.getRawData(), pa.getSize());
+        if (!routed)
+            std::cout << "[HeadServer] PKT_REASSIGN uuid=" << ra.entityUuid
+                      << " NOT routed -> telling fd=" << fd << " to keep it" << std::endl;
     });
 
         dispatcher.registerHandler(DGS::PKT_ZONE_REGION, [&](int fd, DGS::Packet& p)
@@ -158,7 +173,8 @@ int main()
 
     dispatcher.registerHandler(DGS::PKT_ENTITY_TRANSFER, [&](int fd, DGS::Packet& p)
     {
-        auto e = p.unpackEntityTransfer();
+        DGS::EntityTransfer e{};
+        if (!p.tryUnpackEntityTransfer(e)) return;   // malformed: drop it, stay up
         std::cout << "[HeadServer] Entity received uuid=" << e.uuid
                   << " chunk=(" << e.chunkX << "," << e.chunkY << ") from fd=" << fd << std::endl;
 
@@ -169,7 +185,7 @@ int main()
         if (targetFD != -1)
         {
             bool ok = serverSocket.send(targetFD, p.getRawData(), p.getSize());
-            std::cout << "[HeadServer] Echo enviado a fd=" << targetFD << " ok=" << ok << std::endl;
+            std::cout << "[HeadServer] Echo sent to fd=" << targetFD << " ok=" << ok << std::endl;
 
             DGS::LogEntry entry{};
             entry.time_stamp = (uint64_t)std::time(nullptr);
@@ -184,12 +200,20 @@ int main()
             std::cout << "[HeadServer] No valid destination found for the entity" << std::endl;
     });
 
+    // ⚠️ THIS PORT SERVES BOTH NODES AND CLIENTS, so it cannot be closed wholesale: a player's client
+    // asks it which zone covers a chunk and has no business holding the cluster secret. What is gated
+    // is the PRIVILEGED half — registering as a zone, moving authority, draining, region blobs — which
+    // is what an unauthenticated stranger could do here: send one `PKT_METRICS` and have the head
+    // start routing other people's entities to them.
+    DGS::AuthGate gate("HeadServer");
+
     if (!serverSocket.listen(42424))
     {
         std::cerr << "[HeadServer] Failed to start the server. Port already in use?" << std::endl;
         return 1;
     }
     std::cout << "[HeadServer] Listening..." << std::endl;
+    gate.announce();
 
     int epollFD = epoll_create1(0);
 
@@ -219,21 +243,46 @@ int main()
             }
             else
             {
+                // ⚠️ DRAINED, not read once. `epoll` reports the KERNEL's buffer; with TLS on, OpenSSL
+                // can be holding decrypted bytes the kernel no longer has, so a packet would sit
+                // unread until the peer happened to send another one. `pending()` is that question.
+                // An epoll wake-up is not proof of application data once TLS is on: the handshake's
+                // trailing records (a TLS 1.3 `NewSessionTicket`, say) wake it too, and the blocking
+                // read below would then wait for a message nobody sent. See `TCPSocket::pending`.
+                if (serverSocket.tlsEnabled() && !serverSocket.pending(fd)) continue;
+
                 uint8_t buffer[8192];
+                bool peerGone = false;
+                do {
                 int bytesRead = serverSocket.receive(fd, buffer, 8192);
 
                 if (bytesRead <= 0)
                 {
+                    peerGone = true;
                     epoll_ctl(epollFD, EPOLL_CTL_DEL, fd, nullptr);
                     serverSocket.closeClient(fd);
+                    gate.forget(fd);
                     nodeClients.erase(std::find(nodeClients.begin(), nodeClients.end(), fd));
                 }
                 else
                 {
                     DGS::Packet p;
                     p.setBuffer(buffer, bytesRead);
+
+                    if (gate.consume(fd, p)) continue;   // it was the credential, not a request
+
+                    // The privileged half. A client's zone query and zone list stay open: clients
+                    // authenticate against the login API, not against this.
+                    const DGS::PacketType t = p.getType();
+                    const bool privileged = t == DGS::PKT_METRICS       || t == DGS::PKT_REASSIGN ||
+                                            t == DGS::PKT_ZONE_REGION   || t == DGS::PKT_DRAIN    ||
+                                            t == DGS::PKT_DELETE_ZONE   || t == DGS::PKT_VALIDATOR_STATUS ||
+                                            t == DGS::PKT_ENTITY_TRANSFER;
+                    if (privileged && !gate.allows(fd)) { gate.refuse(fd, (int)t); continue; }
+
                     dispatcher.dispatch(fd, p); 
                 }
+                } while (!peerGone && serverSocket.pending(fd));
             }
         }
     }

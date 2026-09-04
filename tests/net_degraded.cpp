@@ -169,12 +169,18 @@ static void udpProxy(const Degradation d, std::atomic<bool>& ready)
     std::vector<uint8_t> held;                    // the one released out of order
     int releaseIn = 0;
 
-    // ⚠️ THE BUFFER SIZE WAS THE BUG. At 2048 bytes `recvfrom` TRUNCATED every datagram
-    // (`sizeof(EntityTransfer)` is larger) and the proxy forwarded exactly 2048 bytes. The validator
-    // discards anything that is not EXACTLY `sizeof(EntityTransfer)`, so it silently dropped
-    // everything: the proxy counted happy sends, `sendto` reported success, and nothing arrived at the
-    // other end. The positive control uncovered it; without it this would have been published as "the
-    // validator withstands a bad network".
+    // ⚠️ THE BUFFER SIZE WAS THE BUG. At 2048 bytes `recvfrom` TRUNCATED every datagram (the raw
+    // `EntityTransfer` the client then sent is larger) and the proxy forwarded exactly 2048 bytes. The
+    // validator discarded anything that was not EXACTLY `sizeof(EntityTransfer)`, so it dropped
+    // everything in silence: the proxy counted happy sends, `sendto` reported success, and nothing
+    // arrived at the other end. The positive control uncovered it; without it this would have been
+    // published as "the validator withstands a bad network".
+    //
+    // Both halves of that have since been fixed at the source. The datagram is now a Packet honouring
+    // `dataSize` (62 B for a moving player, not 4160), and the validator recognises it by its TYPE
+    // BYTE and reports a decode failure instead of vanishing — a truncated datagram is now visible as
+    // a truncated datagram. The buffer stays generous anyway: a receive buffer that is too small is a
+    // bug that hides itself, and this file is the record of it.
     uint8_t buf[sizeof(DGS::EntityTransfer) * 2];
     std::string ip; int port = 0;
     while (!g_proxyDone) {
@@ -219,7 +225,8 @@ static void sendSample(DGS::UDPSocket& udp, int port, uint32_t uuid, double x, f
     e.chunkX = 0; e.chunkY = 0; e.chunkZ = 0;
     e.pos[0] = (float)x; e.pos[1] = 0.0f; e.pos[2] = 0.0f;
     e.stats.speed[0] = vmax;
-    udp.send("127.0.0.1", port, (const uint8_t*)&e, sizeof(e));
+    DGS::Packet p; p.pack(e);
+    udp.send("127.0.0.1", port, p.getRawData(), p.getSize());
 }
 
 static pid_t launchValidator(const char* nodePath, const char* soPath)

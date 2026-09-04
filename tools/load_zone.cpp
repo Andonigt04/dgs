@@ -143,9 +143,11 @@ struct Client
 {
     std::unique_ptr<DGS::UDPSocket> sock;
     uint32_t uuid = 0;
+    int32_t  chunkX = 50;   // where in the world this player is (see LOAD_SPREAD_CHUNKS)
     float    x = 0.0f;
     uint64_t recvCount = 0;
     uint64_t recvBytes = 0;
+    uint64_t selfCount = 0;   // its OWN entity coming back: one per tick, interest radius or not
 };
 
 int main(int argc, char** argv)
@@ -199,7 +201,7 @@ int main(int argc, char** argv)
     std::printf("\n  ONE zone, real clients at 20 Hz, %d s per step.  EntityTransfer = %zu B\n", stepSecs, E);
     std::printf("  The zone broadcasts EVERY entity to EVERY client once per tick, so what each client\n");
     std::printf("  receives is N entities x the tick rate, and the zone's egress grows as N x N.\n\n");
-    std::printf("  `snap/s` is the rate of complete world snapshots each client actually gets. Nominal is\n");
+    std::printf("  `snap/s` is the tick rate each client experiences: its own entity echoed back, once\n");
     std::printf("  10 (the 100 ms tick). It falling is the zone losing the ability to keep its clients\n");
     std::printf("  current, which is the thing that matters to a player.\n\n");
     std::printf("  %5s %7s %8s %8s %7s %9s %9s %8s %8s %8s\n",
@@ -228,6 +230,14 @@ int main(int argc, char** argv)
             const int rcvbuf = 8 * 1024 * 1024;
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
             c.uuid = 5000 + (uint32_t)clients.size();
+            // ⚠️ WHERE THE PLAYERS STAND DECIDES WHAT INTEREST MANAGEMENT CAN DO, so it is a knob and
+            // both cases get measured. Default 0 = everybody in one chunk, a scrum, which is the
+            // scenario the original capacity table used and the one interest management cannot help.
+            // LOAD_SPREAD_CHUNKS=N puts them across N chunks, kilometres apart, which is what a world
+            // normally looks like.
+            const int spread = std::atoi(std::getenv("LOAD_SPREAD_CHUNKS")
+                                         ? std::getenv("LOAD_SPREAD_CHUNKS") : "0");
+            c.chunkX = spread > 0 ? (int32_t)(50 + (clients.size() % (size_t)spread)) : 50;
             c.x    = 100.0f + 3.0f * (float)clients.size();
             clients.push_back(std::move(c));
         }
@@ -236,11 +246,12 @@ int main(int argc, char** argv)
             DGS::EntityTransfer e{};
             e.uuid   = c.uuid;
             e.type   = DGS::ENT_PLAYER;
-            e.chunkX = 50; e.chunkY = 50; e.chunkZ = 50;
+            e.chunkX = c.chunkX; e.chunkY = 50; e.chunkZ = 50;
             e.pos[0] = c.x; e.pos[1] = 0.0f; e.pos[2] = 0.0f;
             e.stats.speed[0] = 5000.0f;      // S1 is not the subject: never let it reject a step
             e.stats.baseDMG  = tag;          // echo tag, untouched by the zone and by the rules stub
-            c.sock->send("127.0.0.1", kZoneUdp, (const uint8_t*)&e, sizeof(e));
+            DGS::Packet p; p.pack(e);   // the same wire the real client uses
+            c.sock->send("127.0.0.1", kZoneUdp, p.getRawData(), p.getSize());
         };
 
         // Let the zone register everyone before measuring.
@@ -248,7 +259,7 @@ int main(int argc, char** argv)
             for (auto& c : clients) sendOne(c, 0.0f);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        for (auto& c : clients) { c.recvCount = 0; c.recvBytes = 0; }
+        for (auto& c : clients) { c.recvCount = 0; c.recvBytes = 0; c.selfCount = 0; }
         const uint64_t txBefore = g_bytesTx.load();
 
         // ── The measurement window ──────────────────────────────────────────────────────────────
@@ -282,9 +293,26 @@ int main(int argc, char** argv)
                     const int r = c.sock->receive(buf, sizeof(buf), from, port);
                     if (r <= 0) break;
                     c.recvCount++; c.recvBytes += (uint64_t)r;
-                    if (i == 0 && r == (int)E)
+                    // ⚠️ `snap/s` USED TO ASSUME EVERY CLIENT GETS EVERY ENTITY — it divided the
+                    // datagram count by N twice. That was true when the zone told everybody about
+                    // everything; with interest management a spread-out player receives only what is
+                    // near them, so the old formula read 0.5 Hz and the harness printed "the zone is
+                    // behind" about a zone that was ticking perfectly. A harness that measures a world
+                    // the server no longer implements is worse than no harness.
+                    //
+                    // What is counted now is the client's OWN entity coming back, which is exactly one
+                    // datagram per tick per client whatever the interest radius is.
+                    if (buf[0] == DGS::PKT_ENTITY_TRANSFER)
                     {
-                        DGS::EntityTransfer e; std::memcpy(&e, buf, sizeof(e));
+                        DGS::EntityTransfer self{};
+                        DGS::Packet sp; sp.setBuffer(buf, (size_t)r);
+                        if (sp.tryUnpackEntityTransfer(self) && self.uuid == c.uuid) c.selfCount++;
+                    }
+                    if (i == 0 && buf[0] == DGS::PKT_ENTITY_TRANSFER)
+                    {
+                        DGS::EntityTransfer e{};
+                        DGS::Packet ep; ep.setBuffer(buf, (size_t)r);
+                        if (!ep.tryUnpackEntityTransfer(e)) continue;
                         if (e.uuid == clients[0].uuid && e.stats.baseDMG > 0.0f)
                         {
                             const double lat = (double)nowMs() - (double)e.stats.baseDMG;
@@ -298,14 +326,16 @@ int main(int argc, char** argv)
                                 std::chrono::steady_clock::now() - t0).count();
 
         uint64_t rxBytes = 0, rxCount = 0;
-        for (const auto& c : clients) { rxBytes += c.recvBytes; rxCount += c.recvCount; }
+        uint64_t selfTotal = 0;
+        for (const auto& c : clients) { rxBytes += c.recvBytes; rxCount += c.recvCount; selfTotal += c.selfCount; }
 
         const double sentPerSec = (double)sent / secs;
         const double wantPerSec = 20.0 * n;
         const double measMBs    = (double)rxBytes / secs / 1e6;
         const double perCliMBs  = measMBs / (double)n;
-        // Complete snapshots per second per client: each snapshot is one datagram per entity.
-        const double snapsPerSec = (double)rxCount / secs / (double)n / (double)n;
+        // Ticks per second as each client experiences them: its own entity echoed back, once per
+        // tick. Independent of how many OTHER entities it is told about.
+        const double snapsPerSec = (double)selfTotal / secs / (double)n;
 
         std::sort(latencies.begin(), latencies.end());
         const double p50 = latencies.empty() ? -1.0 : latencies[latencies.size() * 50 / 100];

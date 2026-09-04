@@ -1,5 +1,6 @@
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "include/dgs/auth.h"
 #include "include/dgs/game_module.h"
 
 #include <iostream>
@@ -17,6 +18,10 @@
 #include <csignal>
 #include <csetjmp>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <poll.h>
 #include <sys/socket.h>
 
 static uint64_t nowMs()
@@ -148,8 +153,23 @@ static void angleToQuat(uint16_t angle, float rot[4])
     rot[3] = cosf(halfYaw);
 }
 
+// ⚠️ THE HANDOFF USED TO LOSE ENTITIES, AND IT DID IT IN SILENCE. This function sent the reassign and
+// the state and then erased the entity UNCONDITIONALLY — both `send` results ignored. Three ways for
+// an entity to cease to exist anywhere:
+//   · the head is down or reconnecting: the writes fail, the entity is erased anyway;
+//   · the head cannot route the chunk (`targetFD == -1`): it drops the reassign without a word;
+//   · the forward to the new owner fails: same, nobody is told.
+// Nothing owned it afterwards, no counter moved, and the logs said "Transferring...".
+//
+// It is now AT-LEAST-ONCE: the entity stays here, owned and simulated, until the head answers
+// `ack = 1` ("routed, you may let go"). `ack = 2` means no zone covers that chunk, so keeping it is
+// the only correct thing to do. Un-acked handoffs are re-sent on a throttle. The failure mode changed
+// from "the entity vanishes" to "the entity lingers in the wrong zone for a moment", which is visible,
+// recoverable, and bounded by the ordinary lease.
 void checkAndTransfer(DGS::TCPSocket& tcp, std::vector<DGS::EntityTransfer>& entities,
                       std::map<uint32_t, uint64_t>& ownedUntil,
+                      std::map<uint32_t, uint64_t>& handoffLastTry,
+                      uint64_t retryMs,
                       int32_t xMin, int32_t xMax,
                       int32_t yMin, int32_t yMax,
                       int32_t zMin, int32_t zMax)
@@ -162,7 +182,16 @@ void checkAndTransfer(DGS::TCPSocket& tcp, std::vector<DGS::EntityTransfer>& ent
 
         if (out)
         {
-            std::cout << "[ZoneNode] Entity " << it->uuid << " out of bounds. Transferring..." << std::endl;
+            // Throttle: an un-acked handoff is retried, not spammed once per tick.
+            const uint64_t now = nowMs();
+            auto lt = handoffLastTry.find(it->uuid);
+            if (lt != handoffLastTry.end() && now - lt->second < retryMs) { ++it; continue; }
+            const bool first = (lt == handoffLastTry.end());
+            handoffLastTry[it->uuid] = now;
+
+            std::cout << "[ZoneNode] Entity " << it->uuid
+                      << (first ? " out of bounds. Transferring..." : " handoff not acked yet, re-sending")
+                      << std::endl;
 
             // §3.6 handoff: the entity crosses into a neighbouring zone → we cede AUTHORITY explicitly.
             // The head routes it to the new owner by chunk (PKT_REASSIGN), which promotes it (ghost→real).
@@ -173,19 +202,23 @@ void checkAndTransfer(DGS::TCPSocket& tcp, std::vector<DGS::EntityTransfer>& ent
             ra.chunkZ     = it->chunkZ;
             ra.fromZone   = 0;   // the head fills it in if needed
             ra.toZone     = 0;   // 0 = let the head resolve it by chunk
+            ra.ack = 0;   // a REQUEST; the head answers 1 (routed) or 2 (nobody covers that chunk)
             DGS::Packet pRa; pRa.pack(ra);
-            tcp.send(tcp.getSocketFD(), pRa.getRawData(), pRa.getSize());
+            const bool okRa = tcp.send(tcp.getSocketFD(), pRa.getRawData(), pRa.getSize());
             g_bytesTx += pRa.getSize();
 
             // The full state travels too (the new owner needs the complete EntityTransfer).
             DGS::Packet p;
             p.pack(*it);
-            tcp.send(tcp.getSocketFD(), p.getRawData(), p.getSize());
+            const bool okEnt = okRa && tcp.send(tcp.getSocketFD(), p.getRawData(), p.getSize());
             g_bytesTx += p.getSize();
 
-            // We stop owning it: it is no longer ours.
-            ownedUntil.erase(it->uuid);
-            it = entities.erase(it);
+            if (!okRa || !okEnt)
+                std::cout << "[ZoneNode] handoff WRITE FAILED for uuid=" << it->uuid
+                          << " (keeping it; will retry)" << std::endl;
+
+            // WE KEEP IT. Ownership is only given up when the head says it landed somewhere.
+            ++it;
         }
         else ++it;
     }
@@ -249,25 +282,112 @@ void emitGhostDeltas(DGS::TCPSocket& tcp,
     }
 }
 
-// Sends every entity and ghost to one client
-void broadcastToClient(DGS::UDPSocket& udp,
-                       const std::string& addr, int port,
-                       const std::vector<DGS::EntityTransfer>& entities,
-                       const std::map<uint32_t, DGS::GhostDelta>& ghosts)
+// ⚠️ THE BROADCAST USED TO SEND THE WHOLE STRUCT: `sizeof(EntityTransfer)`, 4160 bytes, of which 4096
+// are the `data[]` blob that is EMPTY for a player who is only moving. `dataSize` exists precisely so
+// that those bytes need not travel, and this path ignored it — while `Packet::pack(EntityTransfer)`,
+// already used on the TCP paths, has always honoured it. The format was not missing; the UDP path was
+// bypassing it with a raw memcpy of the struct.
+//
+// Measured, with `dataSize = 0`: 4160 B → 62 B, **67x less**. It matters because the fan-out is N x N
+// — every client gets every entity, every tick — so the zone's egress at 64 players was 174 MB/s and
+// 21 Mbit/s DOWN PER CLIENT, which rules out 64 players on a domestic line long before the CPU
+// notices. It is the wire, not the simulation, that was the wall.
+//
+// It also removes a fragile rule: the receivers used to recognise an entity BY ITS EXACT SIZE. That
+// is how `net_degraded` once silently dropped everything (a proxy truncated at 2048 and the validator,
+// comparing sizes, discarded in silence). Now every datagram carries its `PacketType` in byte 0, the
+// same discriminator the rest of the protocol uses.
+//
+// Serialising is done ONCE PER TICK, not once per client: the same snapshot goes to everybody, and
+// packing it per recipient made the CPU cost N x N as well, for identical bytes.
+// ⚠️ EVERY CLIENT USED TO GET EVERY ENTITY, so a zone's egress grew as N x N. Measured: at 64 players
+// that was 175 MB/s out of one zone and **21 Mbit/s DOWN PER CLIENT** before `dataSize` was honoured,
+// and 2.6 MB/s after — better, but still quadratic, and the load ramp showed the tick going over
+// budget at 128 because of the sheer NUMBER of datagrams (about 7 us of `sendto` each, 16384 of them
+// per tick). Bytes were the first wall; datagram count is the second, and both are the same mistake:
+// telling everybody about everything.
+//
+// A player is sent what is NEAR them. `INTEREST_RADIUS_M` = 0 keeps the old behaviour, which is what
+// the measurements compare against.
+//
+// It is worth being blunt about what this does NOT fix: a crowd standing in one place still sees each
+// other, so a hundred players in a market square is still a hundred squared. Interest management buys
+// scale for a world that is SPREAD OUT; it buys nothing for a scrum, and any number quoted for it has
+// to say which of the two was measured.
+struct BroadcastFrames
 {
+    struct Frame
+    {
+        std::vector<uint8_t> bytes;
+        uint32_t uuid;
+        float    gx, gy, gz;    // global position, for deciding who is near enough to care
+    };
+    std::vector<Frame> frames;
+};
+
+static BroadcastFrames buildBroadcast(const std::vector<DGS::EntityTransfer>& entities,
+                                      const std::map<uint32_t, DGS::GhostDelta>& ghosts,
+                                      float csX, float csY, float csZ)
+{
+    BroadcastFrames out;
+    out.frames.reserve(entities.size() + ghosts.size());
+
     for (const auto& e : entities)
     {
-        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&e);
-        udp.send(addr, port, raw, sizeof(DGS::EntityTransfer));
-        g_bytesTx += sizeof(DGS::EntityTransfer);
+        DGS::Packet p;
+        p.pack(e);                       // honours dataSize, tags with PKT_ENTITY_TRANSFER
+        // Sealed HERE, once, not once per recipient: the same snapshot goes to everybody, and
+        // encrypting it N times cost +37 % of loop time at 256 players when it was done inside `send`.
+        std::vector<uint8_t> wire;
+        DGS::sealForUdp(p.getRawData(), p.getSize(), wire);
+        out.frames.push_back({ std::move(wire),
+                               e.uuid,
+                               e.chunkX * csX + e.pos[0],
+                               e.chunkY * csY + e.pos[1],
+                               e.chunkZ * csZ + e.pos[2] });
     }
 
     for (const auto& [uuid, ghost] : ghosts)
     {
         DGS::Packet p;
         p.pack(ghost);
-        udp.send(addr, port, p.getRawData(), p.getSize());
-        g_bytesTx += p.getSize();
+        std::vector<uint8_t> wire;
+        DGS::sealForUdp(p.getRawData(), p.getSize(), wire);
+        out.frames.push_back({ std::move(wire),
+                               (uint32_t)ghost.uuid,
+                               ghost.chunkX * csX + ghost.pos[0],
+                               ghost.chunkY * csY + ghost.pos[1],
+                               ghost.chunkZ * csZ + ghost.pos[2] });
+    }
+    return out;
+}
+
+/// Sends the already-serialised snapshot to one recipient.
+///
+/// `radiusM <= 0` means everything — which is what an OBSERVER gets: a viewer exists to see the whole
+/// zone, and one that only saw a corner of it would be a viewer that lies.
+void broadcastToClient(DGS::UDPSocket& udp,
+                       const std::string& addr, int port,
+                       const BroadcastFrames& snapshot,
+                       float radiusM = 0.0f,
+                       bool haveCentre = false,
+                       float cx = 0, float cy = 0, float cz = 0,
+                       uint32_t selfUuid = 0)
+{
+    const bool filtered = radiusM > 0.0f && haveCentre;
+    const float r2 = radiusM * radiusM;
+
+    for (const auto& f : snapshot.frames)
+    {
+        if (filtered && f.uuid != selfUuid)
+        {
+            // Its own entity always goes: a player who stopped being told where THEY are would be
+            // watching someone else's world.
+            const float dx = f.gx - cx, dy = f.gy - cy, dz = f.gz - cz;
+            if (dx * dx + dy * dy + dz * dz > r2) continue;
+        }
+        udp.sendRaw(addr, port, f.bytes.data(), f.bytes.size());
+        g_bytesTx += f.bytes.size();   // already the WIRE size: the frame was sealed when it was built
     }
 }
 
@@ -324,6 +444,7 @@ int main()
     std::map<uint32_t, std::pair<std::string, int>> clientMap; // uuid → {addr, port}
     std::map<uint32_t, uint64_t>              entityOwnedUntil; // uuid → until when I AM the owner (lease §3.6)
     std::map<uint32_t, uint64_t>              lastActiveSeen;   // uuid → last time the client reported (GC)
+    std::map<uint32_t, uint64_t>              handoffLastTry;   // uuid → last handoff attempt (at-least-once)
     uint64_t lastStepMs = 0;
 
     const char* headHost  = std::getenv("HEAD_SERVER_HOST") ? std::getenv("HEAD_SERVER_HOST") : "head-server";
@@ -349,6 +470,7 @@ int main()
         {
             if (tcp_zone_node.connect(headHost, headPort))
             {
+                DGS::sendAuth(tcp_zone_node);   // the head will not register a zone without it
                 struct timeval tvTCP { 0, 100000 };
                 setsockopt(tcp_zone_node.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvTCP, sizeof(tvTCP));
                 std::cout << "[ZoneNode] Connected to HeadServer (attempt " << attempt << ")" << std::endl;
@@ -390,6 +512,7 @@ int main()
         tcp_validator = DGS::TCPSocket();
         if (tcp_validator.connect(validHost, validPort, VALIDATOR_CONNECT_MS))
         {
+            DGS::sendAuth(tcp_validator);   // first thing on the wire, before any request
             struct timeval tvVAL { 0, 5000 };   // 5 ms: does not stall the simulation tick
             setsockopt(tcp_validator.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvVAL, sizeof(tvVAL));
             std::cout << "[ZoneNode] P2: connected to Validator " << validHost << ":" << validPort << std::endl;
@@ -412,6 +535,7 @@ int main()
     DGS::TCPSocket tcp_social;
     if (tcp_social.connect(socialHost, socialPort))
     {
+        DGS::sendAuth(tcp_social);
         struct timeval tvSOC { 0, 5000 };
         setsockopt(tcp_social.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tvSOC, sizeof(tvSOC));
         std::cout << "[ZoneNode] P7: subscribed to the social node " << socialHost << ":" << socialPort << std::endl;
@@ -424,7 +548,7 @@ int main()
     loadZoneModule();            // the project's rules module (or no simulation)
 
     std::map<uint32_t, LastPosition>  lastPosition;       // uuid → baseline
-    std::map<uint32_t, PendingValidation> pendingValid;   // requestId → en vuelo
+    std::map<uint32_t, PendingValidation> pendingValid;   // requestId -> in flight
     std::map<uint32_t, uint64_t>      lastReqMs;          // uuid → last REQ sent (throttle)
 
     // Read-only observers: "addr:port" → { endpoint, lease deadline }. Kept apart from `clientMap` on
@@ -433,7 +557,28 @@ int main()
     std::map<std::string, ObserverEntry> observers;
     const uint64_t OBSERVER_LEASE_MS =
         (uint64_t)std::atoi(std::getenv("OBSERVER_LEASE_MS") ? std::getenv("OBSERVER_LEASE_MS") : "5000");
+    // Shared secret an observer must present. NO DEFAULT ON PURPOSE: a default would be published in
+    // this file and would therefore be no secret, and an operator who never sets one would be running
+    // with the feed wide open while believing it was protected. Unset means observers are refused.
+    const std::string observeToken =
+        std::getenv("DGS_OBSERVE_TOKEN") ? std::getenv("DGS_OBSERVE_TOKEN") : "";
+    const size_t OBSERVER_MAX =
+        (size_t)std::atoi(std::getenv("OBSERVER_MAX") ? std::getenv("OBSERVER_MAX") : "8");
+    std::cout << "[ZoneNode] observers: "
+              << (observeToken.empty() ? "DISABLED (DGS_OBSERVE_TOKEN unset)"
+                                       : "token required, max " + std::to_string(OBSERVER_MAX))
+              << std::endl;
     std::map<uint32_t, uint64_t>      bannedUntilMs;      // P7: uuid → blocked until (0 = forever)
+
+    // How long an un-acked handoff waits before being re-sent. It is a retry, not a spin: the entity
+    // stays owned and simulated here in the meantime.
+    const uint64_t HANDOFF_RETRY_MS =
+        (uint64_t)std::atoi(std::getenv("HANDOFF_RETRY_MS") ? std::getenv("HANDOFF_RETRY_MS") : "1000");
+
+    // How far a player is told about. 0 = tell everybody about everything, which is what the capacity
+    // numbers in the README were measured against.
+    const float INTEREST_RADIUS_M =
+        (float)std::atof(std::getenv("INTEREST_RADIUS_M") ? std::getenv("INTEREST_RADIUS_M") : "0");
 
     uint32_t reqSeq      = 1;
     uint32_t statSent    = 0;
@@ -453,17 +598,220 @@ int main()
         return true;
     };
 
+    // ⚠️ THE TICK WAS NOT A TICK, IT WAS A QUEUE OF BLOCKING WAITS. Measured with `tools/load_zone`:
+    // the zone delivered 4.6 complete snapshots a second where the design says 10, at EVERY population
+    // — one idle player included — and its own `performance` metric reported 211 us of work, so nothing
+    // in its telemetry could ever show it. The waits stacked up per tick: 100 ms of `usleep`, plus a
+    // 100 ms receive timeout on the HEAD socket, plus 5 + 5 for the validator and the social node, plus
+    // 10 for the last (empty) UDP read = ~220 ms. Isolated by making the fake head chatter every 20 ms,
+    // which removes only that 100 ms wait: the rate went 4.6 -> 8.7 Hz and player latency 142 -> 37 ms.
+    //
+    // So: ONE `poll` decides which sockets have something, and only those are read. An empty socket now
+    // costs nothing instead of its full timeout. `poll` before a blocking read also keeps `recvAll`
+    // safe — a readable socket delivers, whereas making these sockets non-blocking would let a partial
+    // read return EAGAIN mid-message and desynchronise the stream for good.
+    // ⚠️ AND IT ASKS TLS TOO. A TLS record can carry several messages, so OpenSSL may be holding
+    // decrypted bytes the kernel no longer reports as readable — `poll` says "nothing" and the node
+    // sits on data it already has. It is the classic way a TLS port goes quiet under load, and it
+    // would have looked exactly like the blocking-tick bug this gate was written to fix.
+    auto readable = [](DGS::TCPSocket& s, int fd, int timeoutMs) -> bool {
+        if (fd < 0) return false;
+        if (s.pending(fd)) return true;                     // already decrypted and waiting
+        pollfd p{ fd, POLLIN, 0 };
+        if (!(::poll(&p, 1, timeoutMs) > 0 && (p.revents & POLLIN))) return false;
+        // Readable at the kernel is not the same as readable at the application once TLS is on: a
+        // TLS 1.3 `NewSessionTicket` arriving after the handshake looks exactly like data here, and
+        // the blocking read that follows would wait for a message nobody sent. Ask the layer that
+        // can tell the difference.
+        return s.tlsEnabled() ? s.pending(fd) : true;
+    };
+
+    // The region this zone serves, and the size of a chunk. Read ONCE: they came from the environment
+    // and were re-read on every tick — nine `getenv` + `atoi` per tick for values that cannot change
+    // inside a process. Hoisting them is also what lets the restore below know what to ask for, which
+    // is the whole point: a zone has to know its own region before anyone can hand it back.
+    const int32_t xMin = std::atoi(std::getenv("CHUNK_X_MIN") ? std::getenv("CHUNK_X_MIN") : "0");
+    const int32_t xMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "100");
+    const int32_t yMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "0");
+    const int32_t yMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "100");
+    const int32_t zMin = std::atoi(std::getenv("CHUNK_Z_MIN") ? std::getenv("CHUNK_Z_MIN") : "0");
+    const int32_t zMax = std::atoi(std::getenv("CHUNK_Z_MAX") ? std::getenv("CHUNK_Z_MAX") : "100");
+    const float   csX  = (float)std::atof(std::getenv("CHUNK_SIZE_X") ? std::getenv("CHUNK_SIZE_X") : "1.0");
+    const float   csY  = (float)std::atof(std::getenv("CHUNK_SIZE_Y") ? std::getenv("CHUNK_SIZE_Y") : "1.0");
+    const float   csZ  = (float)std::atof(std::getenv("CHUNK_SIZE_Z") ? std::getenv("CHUNK_SIZE_Z") : "1.0");
+
+    // ── RESTORE FROM PERSISTENCE ────────────────────────────────────────────────────────────────
+    // A zone used to start EMPTY, always. Everything the cluster had ever written to Mongo was
+    // unreachable — the persistence node only wrote, and nothing could read one entity back, let alone
+    // a region. So a restart lost the world: not because the data was gone, but because nothing asked.
+    //
+    // This asks. One PKT_PERSIST_RANGE for exactly the chunks this zone serves, and the answer is a
+    // stream of entities ended by a PKT_NONE. It is BEST EFFORT on purpose: a zone must come up with no
+    // persistence node at all (that is how every test that does not care about it runs, and how a
+    // cluster survives losing its database), so a failure here is a log line, not a refusal to start.
+    //
+    // Restored entities take an ORDINARY LEASE. They are not privileged: a player who does not come
+    // back is purged by the same GC as anyone else once the lease runs out. The restore repopulates the
+    // world, it does not pin it.
+    // ── THE PERSISTENCE LINK ────────────────────────────────────────────────────────────────────
+    // ⚠️ NOTHING HERE MAY RUN ON THE TICK THREAD. Not the connect, and above all not the name
+    // resolution that precedes it: `connect`'s deadline covers the TCP handshake and nothing else, and
+    // a `PERSISTENCE_HOST` that does not resolve cost **11.2 seconds** on this machine. Measured twice,
+    // because I made the same mistake twice:
+    //   · restoring inline before the main loop delayed the zone's FIRST TICK by those 11 s, which
+    //     turned four unrelated end-to-end tests red by starving its metrics;
+    //   · then the write-through's periodic reconnect did it again from INSIDE the loop, freezing the
+    //     tick for 11 s every retry — `zone_policy_e2e` caught it as "the tick freezes", which is
+    //     precisely the failure that test exists to catch, and `viewer_e2e` as a lease that would not
+    //     expire. With `ZONE_PERSIST_MS=0` both went green, which is what identified it.
+    // So every connect happens on a worker thread and the loop only ever touches a socket that is
+    // already connected. A zone must start, and keep ticking, whether or not there is a database.
+    const char* persHost = std::getenv("PERSISTENCE_HOST") ? std::getenv("PERSISTENCE_HOST") : "persistence";
+    const int   persPort = std::atoi(std::getenv("PERSISTENCE_PORT") ? std::getenv("PERSISTENCE_PORT") : "42429");
+    const bool  restoreEnabled = !(std::getenv("ZONE_RESTORE") &&
+                                   std::string(std::getenv("ZONE_RESTORE")) == "0");
+
+    DGS::TCPSocket tcp_persistence;
+    bool     persistenceUp = false;
+    uint64_t lastPersistMs = 0;
+    uint64_t lastLinkTryMs = 0;
+
+    std::mutex                        linkMtx;
+    std::unique_ptr<DGS::TCPSocket>   linkReady;        // connected by the worker, taken by the loop
+    std::vector<DGS::EntityTransfer>  restorePending;   // what the region query brought back
+    std::atomic<bool>                 linkPending{false};
+    bool                              restoreMerged = !restoreEnabled;
+    std::thread                       linkThread;
+
+    // Connects on a worker thread and, the first time, asks for this zone's region. The socket is left
+    // connected and handed to the loop; the loop never resolves or connects anything itself.
+    auto spawnLink = [&](bool doRestore) {
+        if (linkPending.load()) return;
+        if (linkThread.joinable()) linkThread.join();
+        linkPending = true;
+        lastLinkTryMs = nowMs();
+        linkThread = std::thread([&, doRestore]() {
+            auto sock = std::unique_ptr<DGS::TCPSocket>(new DGS::TCPSocket());
+            if (sock->connect(persHost, persPort, 500)) DGS::sendAuth(*sock);
+            else
+            {
+                if (doRestore)
+                    std::cout << "[ZoneNode] no persistence at " << persHost << ":" << persPort
+                              << " -> starting with an empty world" << std::endl;
+                linkPending = false;
+                return;
+            }
+
+            if (doRestore)
+            {
+                DGS::PersistRange range{};
+                range.chunkXMin = xMin; range.chunkXMax = xMax;
+                range.chunkYMin = yMin; range.chunkYMax = yMax;
+                range.chunkZMin = zMin; range.chunkZMax = zMax;
+                range.limit     = (uint32_t)std::atoi(std::getenv("ZONE_RESTORE_MAX")
+                                                      ? std::getenv("ZONE_RESTORE_MAX") : "1024");
+
+                DGS::Packet req; req.packPersistRange(range);
+                sock->send(sock->getSocketFD(), req.getRawData(), req.getSize());
+
+                // Read answers until the PKT_NONE terminator or the deadline. The terminator is what
+                // lets "this region is empty" be an ANSWER instead of a timeout. One receive is one
+                // packet: `TCPSocket` length-prefixes every message.
+                const int restoreMs = std::atoi(std::getenv("ZONE_RESTORE_MS")
+                                                ? std::getenv("ZONE_RESTORE_MS") : "2000");
+                uint8_t buf[8192];
+                const uint64_t deadline = nowMs() + (uint64_t)restoreMs;
+                bool done = false;
+                std::vector<DGS::EntityTransfer> got;
+
+                while (!done && nowMs() < deadline)
+                {
+                    pollfd pfd{ sock->getSocketFD(), POLLIN, 0 };
+                    if (!sock->pending(sock->getSocketFD()))
+                    {
+                        if (::poll(&pfd, 1, 50) <= 0 || !(pfd.revents & POLLIN)) continue;
+                        if (sock->tlsEnabled() && !sock->pending(sock->getSocketFD())) continue;
+                    }
+                    const int n = sock->receive(sock->getSocketFD(), buf, sizeof(buf));
+                    if (n <= 0) break;
+
+                    {
+                        DGS::Packet p; p.setBuffer(buf, (size_t)n);
+                        if (p.getType() == DGS::PKT_NONE) { done = true; break; }
+
+                        DGS::EntityTransfer e{};
+                        if (!p.tryUnpackEntityTransfer(e)) continue;
+
+                        // Trust the bounds we ASKED for, not the answer: a document outside this zone
+                        // belongs to a neighbour, and claiming it would give one entity two owners —
+                        // the single thing this architecture exists to prevent.
+                        if (e.chunkX < xMin || e.chunkX > xMax ||
+                            e.chunkY < yMin || e.chunkY > yMax ||
+                            e.chunkZ < zMin || e.chunkZ > zMax) continue;
+
+                        got.push_back(e);
+                    }
+                }
+                std::cout << "[ZoneNode] restored " << got.size() << " entities from persistence"
+                          << (done ? "" : " (answer incomplete: deadline or closed connection)")
+                          << std::endl;
+                { std::lock_guard<std::mutex> lk(linkMtx); restorePending = std::move(got); }
+            }
+
+            { std::lock_guard<std::mutex> lk(linkMtx); linkReady = std::move(sock); }
+            linkPending = false;
+        });
+    };
+
+    if (!restoreEnabled) std::cout << "[ZoneNode] restore disabled (ZONE_RESTORE=0)" << std::endl;
+    spawnLink(restoreEnabled);
+
     while (true)
     {
-        int32_t xMin = std::atoi(std::getenv("CHUNK_X_MIN") ? std::getenv("CHUNK_X_MIN") : "0");
-        int32_t xMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "100");
-        int32_t yMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "0");
-        int32_t yMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "100");
-        int32_t zMin = std::atoi(std::getenv("CHUNK_Z_MIN") ? std::getenv("CHUNK_Z_MIN") : "0");
-        int32_t zMax = std::atoi(std::getenv("CHUNK_Z_MAX") ? std::getenv("CHUNK_Z_MAX") : "100");
-        float csX = (float)std::atof(std::getenv("CHUNK_SIZE_X") ? std::getenv("CHUNK_SIZE_X") : "1.0");
-        float csY = (float)std::atof(std::getenv("CHUNK_SIZE_Y") ? std::getenv("CHUNK_SIZE_Y") : "1.0");
-        float csZ = (float)std::atof(std::getenv("CHUNK_SIZE_Z") ? std::getenv("CHUNK_SIZE_Z") : "1.0");
+        const auto tickStart = std::chrono::steady_clock::now();
+
+        // The connected socket, and the restored world, arrive here — whenever the worker got round to
+        // them. Taking them costs a mutex and nothing else: no resolving, no connecting, no waiting.
+        {
+            std::lock_guard<std::mutex> lk(linkMtx);
+            if (linkReady)
+            {
+                tcp_persistence = std::move(*linkReady);
+                linkReady.reset();
+                persistenceUp = true;
+            }
+        }
+
+        if (!restoreMerged && !linkPending.load())
+        {
+            restoreMerged = true;
+
+            std::vector<DGS::EntityTransfer> incoming;
+            { std::lock_guard<std::mutex> lk(linkMtx); incoming = std::move(restorePending); }
+
+            const uint64_t lease = (uint64_t)std::atoi(std::getenv("ENTITY_LEASE_MS")
+                                                       ? std::getenv("ENTITY_LEASE_MS") : "3000");
+            int merged = 0, skipped = 0;
+            for (const auto& e : incoming)
+            {
+                // A client already talking about this entity is newer than anything stored. Restoring
+                // over it would drag a connected player back to their last save.
+                if (lastActiveSeen.count(e.uuid)) { ++skipped; continue; }
+
+                entities.push_back(e);
+                entityOwnedUntil[e.uuid] = nowMs() + lease;
+                lastActiveSeen[e.uuid]   = nowMs();
+                lastPosition[e.uuid] = { e.chunkX * csX + e.pos[0],
+                                         e.chunkY * csY + e.pos[1],
+                                         e.chunkZ * csZ + e.pos[2],
+                                         e.stats.speed[0], nowMs() };
+                ++merged;
+            }
+            if (merged > 0 || skipped > 0)
+                std::cout << "[ZoneNode] merged " << merged << " restored entities"
+                          << (skipped ? " (" + std::to_string(skipped) + " already live, kept)" : "")
+                          << std::endl;
+        }
 
         // Receive UDP from clients — DRAIN the socket, do not take one datagram per tick.
         //
@@ -492,23 +840,78 @@ int main()
             if (udpBytes <= 0) break;               // nothing left waiting: on with the tick
             g_bytesRx += (uint64_t)udpBytes;
 
-            // READ-ONLY OBSERVER (viewer / ops tooling). A 1-byte PKT_OBSERVE datagram subscribes the
-            // sender to the same stream the zone already broadcasts to its clients. It is deliberately
-            // NOT routed through the client path: an observer never lands in `clientMap`, never gets a
+            // READ-ONLY OBSERVER (viewer / ops tooling). A PKT_OBSERVE datagram subscribes the sender
+            // to the same stream the zone already broadcasts to its clients. It is deliberately NOT
+            // routed through the client path: an observer never lands in `clientMap`, never gets a
             // uuid, never takes a lease and never becomes an entity — subscribing must not be a way to
             // put something into the world. And it is a LEASE, refreshed by re-sending: a viewer that
             // closes its window stops being fed instead of collecting 10 datagrams a second for ever.
+            //
+            // ⚠️ IT USED TO BE ONE UNAUTHENTICATED BYTE. Anyone who could reach this UDP port got the
+            // position of every entity in the zone ten times a second — the exact feed a wallhack
+            // needs, handed over on request, and with no way to tell afterwards that it had happened.
+            // Now it carries a token and the zone FAILS CLOSED: with `DGS_OBSERVE_TOKEN` unset there
+            // are no observers at all, so forgetting to configure it cannot leave the feed open.
+            //
+            // What this does NOT do, and it must be said: the token travels in clear in a datagram.
+            // It closes "anyone who can reach the port", not "anyone who can read the wire" — on an
+            // untrusted path it is sniffable and replayable. The real answer is DTLS or a private
+            // network for the observer plane; this is the floor, not the ceiling.
             if (udpBytes >= 1 && udpBuf[0] == DGS::PKT_OBSERVE)
             {
+                if (observeToken.empty()) { statRejected++; continue; }   // fail closed
+
+                std::string offered;
+                try {
+                    DGS::Packet op;
+                    op.setBuffer(udpBuf, (size_t)udpBytes);
+                    op.unpackPacketType();
+                    offered = op.readString();
+                } catch (const std::exception&) { statRejected++; continue; }
+
+                // Length first, then a comparison that does not return early on the first wrong byte.
+                bool ok = offered.size() == observeToken.size();
+                if (ok) {
+                    unsigned char diff = 0;
+                    for (size_t i = 0; i < offered.size(); ++i)
+                        diff |= (unsigned char)(offered[i] ^ observeToken[i]);
+                    ok = (diff == 0);
+                }
                 const std::string key = clientAddr + ":" + std::to_string(clientPort);
+                if (!ok)
+                {
+                    statRejected++;
+                    std::cout << "[ZoneNode] observer REJECTED (bad token) " << key << std::endl;
+                    continue;
+                }
+                // A cap even for authenticated observers: each one multiplies the zone's egress by a
+                // whole extra client, so a leaked token must not turn into an amplifier.
+                if (!observers.count(key) && observers.size() >= OBSERVER_MAX)
+                {
+                    statRejected++;
+                    std::cout << "[ZoneNode] observer REJECTED (limit " << OBSERVER_MAX << ") "
+                              << key << std::endl;
+                    continue;
+                }
                 if (!observers.count(key))
                     std::cout << "[ZoneNode] observer subscribed " << key << std::endl;
                 observers[key] = { { clientAddr, clientPort }, nowMs() + OBSERVER_LEASE_MS };
             }
-            else if (udpBytes == sizeof(DGS::EntityTransfer))
+            // A client's position update. Recognised by its TYPE BYTE, not by its size: the size rule
+            // could not survive `dataSize` being honoured, and it was never sound anyway — a truncated
+            // datagram simply stopped matching and was dropped in silence (see `net_degraded`).
+            else if (udpBuf[0] == DGS::PKT_ENTITY_TRANSFER)
             {
-                DGS::EntityTransfer e;
-                std::memcpy(&e, udpBuf, sizeof(e));
+                DGS::EntityTransfer e{};
+                DGS::Packet ep;
+                ep.setBuffer(udpBuf, (size_t)udpBytes);
+                if (!ep.tryUnpackEntityTransfer(e))
+                {
+                    // Malformed, truncated, or a lying `dataSize`. It costs this datagram and nothing
+                    // else: a node must not die on what a stranger sends it.
+                    statRejected++;
+                    continue;
+                }
                 clientMap[e.uuid] = { clientAddr, clientPort };
 
                 // ---- P7 (§3.7): the zone applies what the social node decides (it NEVER decides).
@@ -597,7 +1000,9 @@ int main()
         {
             DGS::Packet ackP;
             uint8_t ackBuf[128];
-            int av = tcp_validator.receive(tcp_validator.getSocketFD(), ackBuf, sizeof(ackBuf));
+            int av = readable(tcp_validator, tcp_validator.getSocketFD(), 0)
+                     ? tcp_validator.receive(tcp_validator.getSocketFD(), ackBuf, sizeof(ackBuf))
+                     : -1;
             if (av > 0) g_bytesRx += (uint64_t)av;
             if (av > 0)
             {
@@ -638,11 +1043,24 @@ int main()
             }
         }
 
-        // HALF-OPEN: when we are in fail-open by exhaustion, probe the arbiter again every so often.
+        // HALF-OPEN: probe the arbiter again every so often, and NOT only when we gave up on it.
+        //
         // Without this `validated` stayed false FOREVER: nothing else in the node ever set it back to
         // true, so a validator that recovered was never used again and the head saw `state = 0` for the
         // rest of the process's life. A breaker that cannot close again is not a breaker, it's a fuse.
-        if (!validated && nowMs() - lastValidatorTryMs >= validatorRetryMs)
+        //
+        // ⚠️ AND `!validated` WAS NOT THE ONLY WAY TO GET STUCK. A `connect` that lands in a listening
+        // socket's ACCEPT QUEUE succeeds even though nobody ever accepts it: from this side the socket
+        // looks perfectly healthy, `validated` stays true, and every `send` on it fails silently. The
+        // zone then sat with the breaker OPEN reporting `state = 2` — honestly, but for ever: no
+        // verdict could arrive to close it, no timeout could accumulate because no request ever left,
+        // and the probe above never ran because `validated` was true. Measured: `reqSent` frozen at 67
+        // and `state = 2` at t = 20, 25 and 30 s, in 2 runs out of 3.
+        //
+        // So a breaker that has been open past its window is also a reason to re-dial. "Connected" is
+        // not the same as "working", and only re-dialling can tell them apart.
+        const bool stuckOpen = validated && cbState == 1 && nowMs() >= cbOpenUntil;
+        if ((!validated || stuckOpen) && nowMs() - lastValidatorTryMs >= validatorRetryMs)
         {
             validated = connectToValidator();
             if (validated) { cbState = 0; cbOpenUntil = 0; cbOpenCount = 0; }
@@ -651,7 +1069,9 @@ int main()
         // P7 (§3.7): receive from the social node (bans/permissions). The zone only APPLIES.
         {
             uint8_t socBuf[8192];
-            int sv = tcp_social.receive(tcp_social.getSocketFD(), socBuf, sizeof(socBuf));
+            int sv = readable(tcp_social, tcp_social.getSocketFD(), 0)
+                     ? tcp_social.receive(tcp_social.getSocketFD(), socBuf, sizeof(socBuf))
+                     : -1;
             if (sv > 0)
             {
                 DGS::Packet sp;
@@ -737,7 +1157,11 @@ int main()
         // Receive TCP from the HeadServer
         {
             uint8_t tcpBuf[8192];
-            int bytes = tcp_zone_node.receive(tcp_zone_node.getSocketFD(), tcpBuf, sizeof(tcpBuf));
+            // The head is the one that cost half the tick rate: 100 ms of waiting, every tick, for a
+            // socket that is silent almost all the time.
+            int bytes = readable(tcp_zone_node, tcp_zone_node.getSocketFD(), 0)
+                        ? tcp_zone_node.receive(tcp_zone_node.getSocketFD(), tcpBuf, sizeof(tcpBuf))
+                        : -1;
             if (bytes > 0) g_bytesRx += (uint64_t)bytes;
             if (bytes == 0)
             {
@@ -753,7 +1177,11 @@ int main()
                 {
                     case DGS::PKT_ENTITY_TRANSFER:
                     {
-                        auto e = pRecv.unpackEntityTransfer();
+                        DGS::EntityTransfer e{};
+                        // A malformed packet costs the packet, not the node: the throwing decode
+                        // would take the whole zone down with an uncaught exception, and this one
+                        // arrives over the network from a peer we do not control.
+                        if (!pRecv.tryUnpackEntityTransfer(e)) break;
 
                         // Handoff PROMOTION (P4 §3.6): this entity crossed the border into MY zone.
                         // If we were already projecting it as a ghost (seeing it while its owner
@@ -796,6 +1224,32 @@ int main()
                     case DGS::PKT_REASSIGN:
                     {
                         auto ra = pRecv.unpackEntityReassign();
+
+                        // An ANSWER to a handoff WE asked for, not an entity being given to us.
+                        // ack=1: it reached its new owner, we may finally let go.
+                        // ack=2: no zone covers that chunk — the head could not route it. Letting go
+                        //        would erase the entity from the world, so we keep it and keep trying.
+                        if (ra.ack != 0)
+                        {
+                            const uint32_t uuid = (uint32_t)ra.entityUuid;
+                            if (ra.ack == 1)
+                            {
+                                for (auto eit = entities.begin(); eit != entities.end();)
+                                    if (eit->uuid == uuid) eit = entities.erase(eit); else ++eit;
+                                entityOwnedUntil.erase(uuid);
+                                handoffLastTry.erase(uuid);
+                                std::cout << "[ZoneNode] handoff ACKED for " << uuid
+                                          << " -> released" << std::endl;
+                            }
+                            else
+                            {
+                                std::cout << "[ZoneNode] handoff for " << uuid
+                                          << " has NO OWNER (head could not route the chunk)"
+                                          << " -> keeping it" << std::endl;
+                            }
+                            break;
+                        }
+
                         // §3.6: the head confirms we are the new owning zone. If we already have the
                         // entity (its EntityTransfer arrived first) we renew the lease; otherwise we
                         // wait for the full state.
@@ -819,7 +1273,7 @@ int main()
                         // §3.9: the orchestrator asks us to drain (we are merging / scaling down).
                         auto lc = pRecv.unpackZoneLifecycle();
                         g_draining = 1;
-                        std::cout << "[ZoneNode] DRAIN solicitado (requestId=" << lc.requestId
+                        std::cout << "[ZoneNode] DRAIN requested (requestId=" << lc.requestId
                                   << ") -> no longer claiming entities" << std::endl;
 
                         // Serialise the region's authoritative state and hand it over: the module
@@ -931,6 +1385,60 @@ int main()
             }
         }
 
+        // ── WRITE-THROUGH TO PERSISTENCE ────────────────────────────────────────────────────────
+        // ⚠️ NOTHING IN A RUNNING CLUSTER EVER WROTE AN ENTITY TO MONGO. The persistence node's write
+        // path was reachable only by sending it a raw PKT_ENTITY_TRANSFER over TCP, and in the live
+        // chain nobody does: the zone sends the validator a PKT_VALIDATE_REQ, which the validator
+        // answers with an ACK and forwards nowhere, and the `cache_node` that would have relayed one had no
+        // client in the whole repository. Verified by running head + validator + persistence + zone +
+        // four players for five seconds: `Entity stored` 0, documents in Mongo 0. The write path and
+        // the read path were BOTH orphaned; restoring from an empty database would have been theatre.
+        //
+        // The zone is the right writer: it is the OWNER, so it is the only node that knows the current
+        // state. Periodic, not per update — at 10 Hz per entity a zone of 64 players would be 640
+        // upserts a second to describe a world that changes far more slowly than it is observed.
+        // `ZONE_PERSIST_MS` = 0 turns it off.
+        {
+            const uint64_t now = nowMs();
+            const uint64_t persistEvery = (uint64_t)std::atoi(
+                std::getenv("ZONE_PERSIST_MS") ? std::getenv("ZONE_PERSIST_MS") : "10000");
+
+            if (persistEvery > 0 && now - lastPersistMs >= persistEvery)
+            {
+                lastPersistMs = now;
+
+                // A dropped connection is ordinary: ask a worker to reconnect and carry on ticking.
+                // Doing it here would put a name resolution back on the tick — the exact bug this file
+                // records twice above.
+                if (!persistenceUp) spawnLink(/*doRestore*/ false);
+
+                if (persistenceUp)
+                {
+                    int written = 0;
+                    for (const auto& e : entities)
+                    {
+                        // Only what we OWN. Writing a ghost would mean persisting a neighbour's
+                        // entity from our stale projection of it — two writers for one state.
+                        auto ownIt = entityOwnedUntil.find(e.uuid);
+                        if (ownIt == entityOwnedUntil.end() || now >= ownIt->second) continue;
+
+                        DGS::Packet p; p.pack(e);
+                        if (!tcp_persistence.send(tcp_persistence.getSocketFD(),
+                                                  p.getRawData(), p.getSize()))
+                        {
+                            persistenceUp = false;
+                            std::cout << "[ZoneNode] persistence link lost while writing" << std::endl;
+                            break;
+                        }
+                        g_bytesTx += p.getSize();
+                        ++written;
+                    }
+                    if (written > 0)
+                        std::cout << "[ZoneNode] persisted " << written << " owned entities" << std::endl;
+                }
+            }
+        }
+
         // Entity GC (§3.5/§3.6): if an entity I own stops reporting past its lease I purge it, so we
         // do not serve them forever (a leak of `entities`/`lastPosition`/ownership in long sessions).
         {
@@ -983,12 +1491,26 @@ int main()
             }
         }
 
-        checkAndTransfer(tcp_zone_node, entities, entityOwnedUntil, xMin, xMax, yMin, yMax, zMin, zMax);
+        checkAndTransfer(tcp_zone_node, entities, entityOwnedUntil, handoffLastTry, HANDOFF_RETRY_MS,
+                         xMin, xMax, yMin, yMax, zMin, zMax);
         emitGhostDeltas(tcp_zone_node, entities, lastSnapshot, xMin, xMax, yMin, yMax, zMin, zMax, threshold);
 
-        // Broadcast to every connected client
+        // Broadcast to every connected client, from ONE serialisation of the snapshot, and to each
+        // one only what is near them.
+        const BroadcastFrames snapshot = buildBroadcast(entities, ghostEntities, csX, csY, csZ);
         for (const auto& [uuid, endpoint] : clientMap)
-            broadcastToClient(udp_zone_node, endpoint.first, endpoint.second, entities, ghostEntities);
+        {
+            // The recipient's own position is the centre of its interest. Until we have one — the
+            // very first tick after it appears — it is sent everything, because guessing where
+            // somebody is in order to decide what they may see is worse than a moment of extra data.
+            bool haveCentre = false;
+            float cx = 0, cy = 0, cz = 0;
+            for (const auto& f : snapshot.frames)
+                if (f.uuid == uuid) { cx = f.gx; cy = f.gy; cz = f.gz; haveCentre = true; break; }
+
+            broadcastToClient(udp_zone_node, endpoint.first, endpoint.second, snapshot,
+                              INTEREST_RADIUS_M, haveCentre, cx, cy, cz, uuid);
+        }
 
         // ...and to the observers, from the SAME snapshot: a viewer that showed something different
         // from what the players are being sent would be worse than no viewer at all.
@@ -1003,7 +1525,7 @@ int main()
                     continue;
                 }
                 broadcastToClient(udp_zone_node, it->second.endpoint.first,
-                                  it->second.endpoint.second, entities, ghostEntities);
+                                  it->second.endpoint.second, snapshot);
                 ++it;
             }
         }
@@ -1050,7 +1572,17 @@ int main()
             connectToHead();
         }
 
-        usleep(100000);
+        // A FIXED PERIOD, not a fixed pause. `usleep(100000)` slept 100 ms ON TOP of everything the tick
+        // had already spent, so the period was always longer than the 100 ms the design assumes — and
+        // grew with load. Sleeping only the remainder makes the tick a real 10 Hz, and when the work
+        // genuinely overruns the budget it now shows up as a rate drop instead of silently stretching.
+        {
+            const int64_t spentUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - tickStart).count();
+            const int64_t budgetUs = (int64_t)std::atoi(
+                std::getenv("ZONE_TICK_US") ? std::getenv("ZONE_TICK_US") : "100000");
+            if (spentUs < budgetUs) usleep((useconds_t)(budgetUs - spentUs));
+        }
     }
 
     return 0;

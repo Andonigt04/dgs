@@ -84,14 +84,42 @@ namespace DGS
         void pack(const ValidatorStatus& data);
         void pack(const EntityReassign& data);
         void pack(const ZoneLifecycle& data);
-        void packDelete(const ZoneLifecycle& data);   // §3.9: mismo struct, tipo PKT_DELETE_ZONE
+        void packDelete(const ZoneLifecycle& data);   // §3.9: same struct, type PKT_DELETE_ZONE
         void pack(const ZoneRegion& data);
-        // §3.7 Plano social/cuenta: deltas de guild/party + acciones de cuenta (ban/permisos).
+        // §3.7 Social/account plane: guild/party deltas + account actions (ban/permissions).
         void pack(const SocialDelta& data);
         void pack(const AccountAction& data);
         void pack(const PacketType& t) { clear(); write<PacketType>(t); }
+        /// Ask persistence for one entity's last stored state. Payload is just the uuid — the answer is
+        /// a PKT_ENTITY_TRANSFER, or a bare PKT_NONE when there is nothing stored for it.
+        void packPersistQuery(uint32_t uuid) { clear(); write<PacketType>(PKT_PERSIST_QUERY); write<uint32_t>(uuid); }
+        uint32_t unpackPersistQuery() { readPos = 1; return read<uint32_t>(); }
+        /// Ask persistence for everything stored inside a chunk range. The answer is a stream of
+        /// PKT_ENTITY_TRANSFER ended by a bare PKT_NONE.
+        void packPersistRange(const PersistRange& r)
+        {
+            clear();
+            write<PacketType>(PKT_PERSIST_RANGE);
+            write<int32_t>(r.chunkXMin); write<int32_t>(r.chunkXMax);
+            write<int32_t>(r.chunkYMin); write<int32_t>(r.chunkYMax);
+            write<int32_t>(r.chunkZMin); write<int32_t>(r.chunkZMax);
+            write<uint32_t>(r.limit);
+        }
+        PersistRange unpackPersistRange()
+        {
+            readPos = 1;
+            PersistRange r{};
+            r.chunkXMin = read<int32_t>(); r.chunkXMax = read<int32_t>();
+            r.chunkYMin = read<int32_t>(); r.chunkYMax = read<int32_t>();
+            r.chunkZMin = read<int32_t>(); r.chunkZMax = read<int32_t>();
+            r.limit     = read<uint32_t>();
+            return r;
+        }
 
         EntityTransfer unpackEntityTransfer();
+        /// Non-throwing decode for anything reading from the network. @return false if the buffer is
+        /// not a well-formed PKT_ENTITY_TRANSFER (wrong type, truncated, or a lying `dataSize`).
+        bool tryUnpackEntityTransfer(EntityTransfer& out);
         Command unpackCommand();
         ServerMetrics unpackServerMetrics();
         ZoneQuery unpackZoneQuery();

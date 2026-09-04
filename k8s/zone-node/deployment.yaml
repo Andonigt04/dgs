@@ -40,6 +40,44 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Node authentication. ABSENT HERE ON PURPOSE, and that is the uncomfortable default:
+            # with no secret the ports are open and every node says so in its first log lines. Set it
+            # on EVERY node (head, zone, validator, social, persistence) or none — a half-configured
+            # cluster is one where the unconfigured nodes accept anybody:
+            #   kubectl -n dgs create secret generic dgs-cluster \
+            #       --from-literal=secret="$(head -c 32 /dev/urandom | base64)"
+            # - name: DGS_CLUSTER_SECRET
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: dgs-cluster
+            #       key: secret
+            # Mutual TLS on the control plane. Also absent on purpose: with these unset the links are
+            # plain TCP, and every node says so. Mount a per-node certificate and the CA, and set all
+            # three or none — a node with certificates cannot talk to one without them.
+            # - name: DGS_TLS_CERT
+            #   value: /etc/dgs/tls/node.crt
+            # - name: DGS_TLS_KEY
+            #   value: /etc/dgs/tls/node.key
+            # - name: DGS_TLS_CA
+            #   value: /etc/dgs/tls/ca.crt
+            # The UDP game plane (positions and the zone's broadcast). Absent = in clear. It has to
+            # match on the ZONE, the CLIENTS and the viewer; a deployment would hand it to a client
+            # per session from the login API rather than shipping one value everywhere.
+            # - name: DGS_UDP_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: dgs-udp
+            #       key: key
+            # Read-only observer feed (dgs_viewer and ops tooling). DELIBERATELY ABSENT: with no token
+            # the zone refuses every observer, and that is the right default in a cluster — the feed is
+            # every entity's position ten times a second. To enable it, create the secret and uncomment:
+            #   kubectl -n dgs create secret generic dgs-observe \
+            #       --from-literal=token="$(head -c 24 /dev/urandom | base64)"
+            # - name: DGS_OBSERVE_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: dgs-observe
+            #       key: token
           ports:
             - containerPort: 42425
               protocol: UDP

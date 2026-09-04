@@ -242,7 +242,8 @@ static void sendEntity(DGS::UDPSocket& udp, uint32_t uuid, float x)
     e.chunkX = 50; e.chunkY = 50; e.chunkZ = 50;   // dead centre: no ghosts or handoffs in the way
     e.pos[0] = x;
     e.stats.speed[0] = 5.0f;
-    udp.send("127.0.0.1", kZoneUdp, (const uint8_t*)&e, sizeof(e));
+    DGS::Packet p; p.pack(e);
+    udp.send("127.0.0.1", kZoneUdp, p.getRawData(), p.getSize());
 }
 
 static bool waitForActive(int target, int msLimit)
@@ -257,16 +258,24 @@ static bool waitForActive(int target, int msLimit)
 }
 
 /// Waits until the head observes a validator state other than `notThis`. @return the state observed.
-static int waitForStateOtherThan(int notThis, int msLimit)
+/// Waits until the head observes exactly `want`, and reports what it saw last if it never does.
+///
+/// ⚠️ IT USED TO ACCEPT "ANY STATE OTHER THAN THE BROKEN ONE", and that stopped being good enough the
+/// moment the zone's tick was fixed to its nominal 10 Hz: at twice the rate it asks for twice as many
+/// verdicts, the breaker trips and re-trips more often inside the same wall clock, and the first state
+/// that is not 0 on the way back can perfectly well be 2 (breaker OPEN) rather than 1 (recovered).
+/// "It changed" was never the property under test — "it closed again" is.
+static int waitForState(int want, int msLimit)
 {
     const auto t0 = std::chrono::steady_clock::now();
+    int lastSeen = g_validatorState.load();
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - t0).count() < msLimit) {
-        const int s = g_validatorState.load();
-        if (s != notThis) return s;
+        lastSeen = g_validatorState.load();
+        if (lastSeen == want) return lastSeen;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    return g_validatorState.load();
+    return lastSeen;
 }
 
 int main(int argc, char** argv)
@@ -423,7 +432,8 @@ int main(int argc, char** argv)
         // the assertions above: a state that never comes back to 1 would mean the zone had simply given
         // up, and "state != 1" would be passing for the wrong reason.
         g_validatorMute = false;
-        const int stateRecovered = waitForStateOtherThan(stateAfter, 12000);
+        // The status heartbeat is every 5 s, so the window has to hold several of them.
+        const int stateRecovered = waitForState(1, 20000);
         std::printf("    after the arbiter recovers, the head sees state=%d\n", stateRecovered);
         check(stateRecovered == 1,
               "RECOVERY: once the arbiter answers again the breaker CLOSES and the head sees 'ok' again");

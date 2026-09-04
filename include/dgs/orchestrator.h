@@ -1026,7 +1026,7 @@ namespace DGS
                 auto svcRes = k8s.Post("/api/v1/namespaces/" + ns + "/services", svc, "application/json");
                 if (!svcRes || svcRes->status != 201)
                 {
-                    std::cerr << "[Orchestrator] Error creando Service " << name
+                    std::cerr << "[Orchestrator] Error creating Service " << name
                               << ": " << (svcRes ? svcRes->status : -1) << std::endl;
                     --nextNodePort;
                     return false;
@@ -1043,7 +1043,7 @@ namespace DGS
                     return true;
                 }
 
-                std::cerr << "[Orchestrator] Error creando Deployment " << name
+                std::cerr << "[Orchestrator] Error creating Deployment " << name
                           << ": " << (depRes ? depRes->status : -1) << std::endl;
                 // Rollback service
                 k8s.Delete("/api/v1/namespaces/" + ns + "/services/" + name);
@@ -1053,7 +1053,10 @@ namespace DGS
 
             void sendResizeCommand(int fd, int32_t newChunkMax)
             {
-                DGS::Command cmd;
+                // ⚠️ ZERO-INITIALISED. It was not, so `chunkSize*` and `addr` went on the wire as
+                // whatever was on the stack — and the validator, which reads its chunk size from a
+                // Command, would have taken garbage for it.
+                DGS::Command cmd{};
                 cmd.purpose = DGS::CMD_TRANSFER_SERVER;
                 cmd.chunkX  = newChunkMax;
 
@@ -1062,7 +1065,7 @@ namespace DGS
 
                 socket.send(fd, p.getRawData(), p.getSize());
 
-                std::cout << "[Orchestrator] Actualizando contenedor ZoneNode... " << fd << std::endl;
+                std::cout << "[Orchestrator] Resizing ZoneNode container... " << fd << std::endl;
             }
 
             DGS::TCPSocket& socket;
