@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <algorithm>
+#include <set>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -42,6 +43,10 @@ namespace DGS
         bool     haveEwma = false;
         double   rxEWMA = 0.0;           // bytes/s
         double   txEWMA = 0.0;
+        // ⚠️ THE TICK TIME WAS THE ONLY SIGNAL WITH NO SMOOTHING, and it is the one the split decision
+        // now leans on. A single slow tick — a persistence flush, a restore, the OS — would have been
+        // enough to order a scale-up on a healthy zone. Same EWMA as the byte rates.
+        double   tickEWMA = 0.0;         // ms
     };
 
     // §3.9 (P9b): lifecycle operations with a formal PRIORITY. Higher value = executed first.
@@ -102,6 +107,11 @@ namespace DGS
             void updateNodeTopology(int fd, const ServerMetrics& m)
             {
                 lastSeenMs[fd] = steadyMs();   // §3.9: lease/eviction on staleness
+
+                PopProfile& pp = popProfiles[fd];
+                std::memcpy(pp.x, m.popX, sizeof(pp.x));
+                std::memcpy(pp.y, m.popY, sizeof(pp.y));
+                std::memcpy(pp.z, m.popZ, sizeof(pp.z));
 
                 for (auto& zone : activeZones)
                 {
@@ -212,7 +222,61 @@ namespace DGS
                 static const double alpha    = evalCfg("EVAL_EWMA_ALPHA", 0.2);
                 static const double dtEst    = evalCfg("EVAL_DT_S",       0.1);
                 static const float  loadTh   = evalCfg("EVAL_LOAD_RAM",   0.80f);
-                static const float  perfTh   = evalCfg("EVAL_LOAD_PERF",  0.36f);
+
+                // ⚠️ THE LOAD SIGNAL WAS BACKWARDS, and it was backwards in a way that made it fire on
+                // the wrong zones. It read:
+                //
+                //     load = ramUsage > EVAL_LOAD_RAM && performance < EVAL_LOAD_PERF   (default 0.36)
+                //
+                // `ServerMetrics::performance` is documented "0..1", but what `zone_node` actually puts
+                // in it is THE TICK TIME IN MILLISECONDS (see the end of its main loop). So the second
+                // half of that AND said "and its tick took less than 0.36 ms" — it demanded the zone be
+                // FAST to call it overloaded, and a zone that had genuinely fallen behind, ticking at
+                // 40 ms of its 100 ms budget, was disqualified from splitting by the very fact that it
+                // was struggling.
+                //
+                // It is now the tick time against its own budget (`ZONE_TICK_US`, 100 ms), which is the
+                // one number that already accounts for entities, interest management, validation and
+                // broadcast together. RAM stays as a second, independent signal — a zone can run out of
+                // memory without missing a tick — and they are OR'd, not AND'd: either one is enough.
+                //
+                // THE DEFAULT IS MEASURED, not guessed. One zone, one chunk of 1000 m,
+                // INTEREST_RADIUS_M=500 (so everybody is inside everybody's radius — a crowd, which is
+                // the case that makes a zone split), players injected at 20 Hz, tick time read back out
+                // of its own metrics:
+                //
+                //     players    25     50     60     70     80     100    150    200
+                //     tick p50  3.2   21.3   16.0   55.7  111.3   103.7  308.2  692.7   ms
+                //
+                // Quadratic, and the knee is sharp: 60 players cost 16 ms, 80 cost 111. The first draft
+                // of this used 60 ms, which fires at ~72 players — but a split takes ~30 s to land
+                // (cooldown + settle + spawn) and on that curve a zone at 72 keeps climbing while it
+                // waits. 25 ms fires at ~63 and buys that reaction time. Below ~20 ms the numbers are
+                // in the noise of an idle zone, so there is nothing to gain by going lower.
+                //
+                // ⚠️ Y ES UNA FRACCION DEL PRESUPUESTO, NO UN NUMERO SUELTO. Los 25 ms de la primera
+                // version eran el 25 % de un periodo de 100 ms. Con el tick a 60 Hz el periodo son
+                // 16,6 ms, y 25 ms ya no es "una zona ocupada": es una zona que NO LLEGA — habria
+                // que esperar a que perdiera el ritmo para empezar a partirla, que es justo tarde.
+                // Atado al mismo `ZONE_TICK_US` que usa la zona, el umbral se mueve con el reloj en
+                // vez de quedarse anclado a un periodo que ya no existe. El 70 % deja sitio para los
+                // ~30 s que tarda un split en aterrizar (cooldown + settle + arranque).
+                static const float  tickBudgetMs = (float)(std::getenv("ZONE_TICK_US")
+                                        ? std::atoi(std::getenv("ZONE_TICK_US")) : 16666) / 1000.0f;
+                static const float  tickMsTh = evalCfg("EVAL_LOAD_TICK_MS", tickBudgetMs * 0.70f);
+
+                // A third signal, off by default: split at a flat entity count. The tick time above is
+                // self-calibrating and should be preferred; this exists because "no more than N players
+                // per zone" is sometimes a product decision rather than a measurement, and there was no
+                // way to express it — `activeEntities` was only ever read for the MERGE side.
+                // 0 = disabled, and it stays disabled by default even now that the number IS measured
+                // (~64 players in one chunk on this hardware, from the curve above). A flat cap cannot
+                // tell a crowd from a spread-out population: the same 200 players scattered over twenty
+                // chunks cost a fraction of what they cost standing together, and a flat cap would split
+                // zones that are not struggling. The tick time already knows the difference. Set this
+                // only when "no more than N players per zone" is a product rule rather than a capacity
+                // one.
+                static const uint32_t entTh = (uint32_t)evalCfg("EVAL_LOAD_ENTITIES", 0.0f);
                 static const double asymmTh  = evalCfg("EVAL_NET_ASYMM",   4.0);
                 static const float  failTh   = evalCfg("EVAL_FAIL_THRESH", 40.0f);
                 static const float  mergeLoad = evalCfg("EVAL_MERGE_LOAD_RAM", 0.22f);
@@ -293,20 +357,38 @@ namespace DGS
                 {
                     r.rxEWMA = rxRate;
                     r.txEWMA = txRate;
+                    r.tickEWMA = (double)m.performance;
                     r.haveEwma = true;
                 }
                 else
                 {
                     r.rxEWMA = alpha * rxRate + (1.0 - alpha) * r.rxEWMA;
                     r.txEWMA = alpha * txRate + (1.0 - alpha) * r.txEWMA;
+                    r.tickEWMA = alpha * (double)m.performance + (1.0 - alpha) * r.tickEWMA;
                 }
 
                 // --- Decision: three independent signals, ONE lifecycle queue (§4.2, P6/P9b) ---
                 // No signal mutates the cluster here: each enqueues its operation and
                 // `processLifecycleQueue()` (below) runs ONE per tick by priority. The split cooldown,
                 // the merge window and neighbour availability for a handoff are checked at execution.
-                bool load          = m.ramUsage     >  loadTh && m.performance < perfTh;
-                bool netSaturated  = r.txEWMA > 0 &&
+                const bool ramHot  = m.ramUsage      > loadTh;
+                const bool tickHot = r.tickEWMA      > tickMsTh;              // ms of its 100 ms budget
+                const bool crowded = entTh > 0 && m.activeEntities > entTh;
+                bool load          = ramHot || tickHot || crowded;
+                // ⚠️ THIS SIGNAL FIRED ON EVERY IDLE ZONE, and it is what actually caused the splits
+                // that looked like the load signal working. It was `txEWMA > 0 && txEWMA/(rxEWMA+1) >
+                // 4`, and a ratio of egress to ingress is disproportionate BY DESIGN in a zone: it
+                // receives one transform per player and broadcasts the world to all of them. An idle
+                // zone sending nothing but metrics — a few hundred bytes a second — against an rx of
+                // zero scores a ratio in the hundreds. Measured: a zone with one player and a 0.02 ms
+                // tick was being told to split, repeatedly, until it hit the one-chunk floor.
+                //
+                // The ratio only means anything once the egress is large in absolute terms. The floor
+                // comes from a measurement already in this repo: 64 players cost 2.67 MB/s of egress
+                // before interest management and 0.17 MB/s after. 1 MB/s sits above a healthy busy zone
+                // and below the pathological one.
+                static const double asymmMinTx = evalCfg("EVAL_NET_MIN_TX_BPS", 1000000.0f);
+                bool netSaturated  = r.txEWMA > asymmMinTx &&
                                      r.txEWMA / (r.rxEWMA + 1.0) > asymmTh;   // sends far more than it receives
                 bool failureProne  = m.failedTransfers > (uint32_t)failTh;    // validador/traspaso va mal
 
@@ -322,10 +404,35 @@ namespace DGS
                 }
                 else if (load || netSaturated)
                 {
-                    std::cout << "[Orchestrator] Umbral alcanzado fd=" << nodeFD
-                              << " (load=" << load << " net=" << netSaturated
-                              << ") -> encolado SPLIT" << std::endl;
-                    enqueueLifecycle(nodeFD, LifecycleOp::LIFECYCLE_SPLIT);
+                    // A zone already at the one-chunk floor cannot be split, so queueing one is not a
+                    // retry — it is a spin. It used to happen on every metrics sample, ten times a
+                    // second, for as long as the zone stayed overloaded. Report the real condition on a
+                    // throttle instead, because THIS is the state an operator has to see: a zone over
+                    // its budget that the cluster cannot help.
+                    if (atSplitFloor.count(nodeFD))
+                    {
+                        static const uint64_t sayEveryMs =
+                            (uint64_t)evalCfg("EVAL_FLOOR_REPORT_S", 30.0f) * 1000;
+                        auto& last = floorReportedMs[nodeFD];
+                        if (steadyMs() - last >= sayEveryMs)
+                        {
+                            last = steadyMs();
+                            std::cout << "[Orchestrator] ⚠ zone fd=" << nodeFD
+                                      << " OVERLOADED AND UNSPLITTABLE: tick="
+                                      << r.tickEWMA << "ms entities=" << m.activeEntities
+                                      << " ram=" << m.ramUsage
+                                      << " — it owns one chunk. Nothing the orchestrator can do."
+                                      << std::endl;
+                        }
+                    }
+                    else
+                    {
+                        std::cout << "[Orchestrator] Umbral alcanzado fd=" << nodeFD
+                                  << " (ram=" << ramHot << " tick=" << tickHot
+                                  << " crowd=" << crowded << " net=" << netSaturated
+                                  << ") -> encolado SPLIT" << std::endl;
+                        enqueueLifecycle(nodeFD, LifecycleOp::LIFECYCLE_SPLIT);
+                    }
                 }
                 // §3.9 scaling DOWN (merge): only if the node is consistently under load (window +
                 // hysteresis) and there is a smaller neighbour to drain. Enqueuing MERGE puts it behind
@@ -444,7 +551,25 @@ namespace DGS
             void enqueueLifecycle(int fd, LifecycleOp op)
             {
                 auto it = pendingLifecycle.find(fd);
-                if (it == pendingLifecycle.end() || (int)op > (int)it->second)
+                if (it == pendingLifecycle.end()) { pendingLifecycle[fd] = op; return; }
+
+                // ⚠️ MERGE AND SPLIT ON THE SAME ZONE ARE NOT A PRIORITY QUESTION, they are a
+                // CONTRADICTION, and treating them as a priority question meant a zone could never
+                // scale up once it had been idle. `pendingLifecycle` holds one op per fd and MERGE
+                // outranks SPLIT, so a MERGE queued while the zone was empty sat in that slot and every
+                // later SPLIT was silently discarded by the `>` below.
+                //
+                // Measured: 80 players in one zone, shipped defaults, 25 s — the head printed
+                // "Umbral alcanzado ... -> encolado SPLIT" 217 times and spawned ZERO children, while
+                // the queue kept postponing op 1 (merge) inside its settle window.
+                //
+                // The newest of the two is the true one: they come from the same evaluation of the same
+                // metrics sample, which chooses one or the other. Crash and reassign still outrank both.
+                const bool bothScaling =
+                    (op == LifecycleOp::LIFECYCLE_MERGE || op == LifecycleOp::LIFECYCLE_SPLIT) &&
+                    (it->second == LifecycleOp::LIFECYCLE_MERGE || it->second == LifecycleOp::LIFECYCLE_SPLIT);
+
+                if (bothScaling || (int)op > (int)it->second)
                     pendingLifecycle[fd] = op;
             }
 
@@ -498,14 +623,20 @@ namespace DGS
 
                 pendingLifecycle.erase(bestFd);
 
+                // ⚠️ THE SETTLE IS FOR SOMETHING THAT HAPPENED. It used to be stamped unconditionally,
+                // so an operation that decided to do NOTHING — `tryMergeDown` returning false because
+                // there is only one zone, which is the common case in a small cluster — still froze that
+                // zone out of the lifecycle for 30 s. A cluster of one zone re-queued that no-op merge
+                // forever and spent its whole life inside a settle window it had earned by doing nothing.
+                bool acted = false;
                 switch (bestOp)
                 {
-                    case LifecycleOp::LIFECYCLE_EVICT:     evictStaleZone(bestFd);  break;
-                    case LifecycleOp::LIFECYCLE_REASSIGN:  tryReassign(bestFd);     break;
-                    case LifecycleOp::LIFECYCLE_MERGE:     tryMergeDown(bestFd);    break;
-                    case LifecycleOp::LIFECYCLE_SPLIT:     trySplitDown(bestFd);    break;
+                    case LifecycleOp::LIFECYCLE_EVICT:     evictStaleZone(bestFd); acted = true; break;
+                    case LifecycleOp::LIFECYCLE_REASSIGN:  tryReassign(bestFd);    acted = true; break;
+                    case LifecycleOp::LIFECYCLE_MERGE:     acted = tryMergeDown(bestFd);         break;
+                    case LifecycleOp::LIFECYCLE_SPLIT:     acted = trySplitDown(bestFd);         break;
                 }
-                lastLifecycleMs[bestFd] = steadyMs();   // asentamiento tras operar
+                if (acted) lastLifecycleMs[bestFd] = steadyMs();   // asentamiento tras operar
                 return true;
             }
 
@@ -515,6 +646,16 @@ namespace DGS
             int nextNodePort { 30426 };
             SpawnBackend backend;   // §3.8 (P8): active spawn backend (LOCAL/K8S/TERRAFORM)
             std::map<std::string, pid_t> localPids;   // LOCAL: zone-node name → pid (for SIGTERM)
+            // Zones that own a single chunk and therefore cannot be split at all. Kept so the doomed
+            // SPLIT is not re-queued ten times a second, and so the condition can be reported as what
+            // it is rather than as a skipped operation.
+            std::set<int>           atSplitFloor;
+            std::map<int, uint64_t> floorReportedMs;
+            // The last population profile each zone reported, so a SPLIT can cut where the people are.
+            // Kept beside `activeZones` rather than inside `ZoneInfo` because ZoneInfo is the wire shape
+            // of a zone and this is local knowledge.
+            struct PopProfile { uint16_t x[MAX_SPLIT_BUCKETS], y[MAX_SPLIT_BUCKETS], z[MAX_SPLIT_BUCKETS]; };
+            std::map<int, PopProfile> popProfiles;
             std::map<int, std::chrono::steady_clock::time_point> lastScaleTime;
 
             // --- Per-zone lifecycle state (§3.9) ---
@@ -538,6 +679,9 @@ namespace DGS
 
             void removeFromActiveZones(int fd)
             {
+                atSplitFloor.erase(fd);
+                floorReportedMs.erase(fd);
+                popProfiles.erase(fd);
                 for (auto it = activeZones.begin(); it != activeZones.end(); ++it)
                     if (it->fd == fd) { activeZones.erase(it); return; }
             }
@@ -552,23 +696,68 @@ namespace DGS
             // Expands the survivor's topology to cover the union (so findTargetNode routes to the
             // survivor while the draining node gives up). The node applies the new range through its env
             // (the zone re-reads CHUNK_* every tick) — resizing the deployment is a backend job (§3.8).
+            /// @return el eje por el que se pueden fusionar, o -1 si su union NO es una caja.
+            ///
+            /// ⚠️ LA ENVOLVENTE NO ES LA UNION. Esto calculaba min/max en los tres ejes y se quedaba
+            /// con la caja que los contiene a los dos — que es MAS GRANDE que su union en cuanto no
+            /// estan alineados. Con A = X[0..10] Y[0..100] y B = X[11..20] Y[0..50], la envolvente
+            /// incluye X[11..20] Y[51..100]: territorio que era de un TERCERO, o de nadie. El
+            /// superviviente se lo quedaba, y como `findTargetNode` devuelve la primera coincidencia,
+            /// le robaba los chunks a su vecino sin que nada lo dijera.
+            ///
+            /// Dos cajas solo se pueden fusionar si coinciden EXACTAMENTE en dos ejes y se tocan en el
+            /// tercero. Cualquier otra cosa se rechaza: mejor no fusionar que inventarse una region.
+            static int mergeableAxis(const ZoneInfo& a, const ZoneInfo& b)
+            {
+                const bool sameX = a.chunkXMin == b.chunkXMin && a.chunkXMax == b.chunkXMax;
+                const bool sameY = a.chunkYMin == b.chunkYMin && a.chunkYMax == b.chunkYMax;
+                const bool sameZ = a.chunkZMin == b.chunkZMin && a.chunkZMax == b.chunkZMax;
+                auto touch = [](int32_t aMin, int32_t aMax, int32_t bMin, int32_t bMax) {
+                    return aMax + 1 == bMin || bMax + 1 == aMin;
+                };
+                if (sameY && sameZ && touch(a.chunkXMin, a.chunkXMax, b.chunkXMin, b.chunkXMax)) return AXIS_X;
+                if (sameX && sameZ && touch(a.chunkYMin, a.chunkYMax, b.chunkYMin, b.chunkYMax)) return AXIS_Y;
+                if (sameX && sameY && touch(a.chunkZMin, a.chunkZMax, b.chunkZMin, b.chunkZMax)) return AXIS_Z;
+                return -1;
+            }
+
             void absorbRegion(int survivorFD, int victimFD)
             {
                 const ZoneInfo* s = findZoneInfo(survivorFD);
                 const ZoneInfo* v = findZoneInfo(victimFD);
                 if (!s || !v) { std::cout << "[Orchestrator] absorbRegion: zone not in the topology" << std::endl; return; }
-                int32_t nXMin = std::min(s->chunkXMin, v->chunkXMin), nXMax = std::max(s->chunkXMax, v->chunkXMax);
-                int32_t nYMin = std::min(s->chunkYMin, v->chunkYMin), nYMax = std::max(s->chunkYMax, v->chunkYMax);
-                int32_t nZMin = std::min(s->chunkZMin, v->chunkZMin), nZMax = std::max(s->chunkZMax, v->chunkZMax);
+
+                const int axis = mergeableAxis(*s, *v);
+                if (axis < 0)
+                {
+                    std::cout << "[Orchestrator] absorbRegion: fd=" << survivorFD << " y fd=" << victimFD
+                              << " no forman una caja -> NO se fusionan" << std::endl;
+                    return;
+                }
+
+                const int32_t nMin = (axis == AXIS_X) ? std::min(s->chunkXMin, v->chunkXMin)
+                                   : (axis == AXIS_Y) ? std::min(s->chunkYMin, v->chunkYMin)
+                                                      : std::min(s->chunkZMin, v->chunkZMin);
+                const int32_t nMax = (axis == AXIS_X) ? std::max(s->chunkXMax, v->chunkXMax)
+                                   : (axis == AXIS_Y) ? std::max(s->chunkYMax, v->chunkYMax)
+                                                      : std::max(s->chunkZMax, v->chunkZMax);
+
                 for (auto& z : activeZones)
                 {
                     if (z.fd != survivorFD) continue;
-                    z.chunkXMin = nXMin; z.chunkXMax = nXMax;
-                    z.chunkYMin = nYMin; z.chunkYMax = nYMax;
-                    z.chunkZMin = nZMin; z.chunkZMax = nZMax;
+                    if (axis == AXIS_X) { z.chunkXMin = nMin; z.chunkXMax = nMax; }
+                    if (axis == AXIS_Y) { z.chunkYMin = nMin; z.chunkYMax = nMax; }
+                    if (axis == AXIS_Z) { z.chunkZMin = nMin; z.chunkZMax = nMax; }
                 }
+
+                // ⚠️ Y SE LO DECIMOS A LA ZONA. Anotarlo solo aqui duraba hasta la siguiente muestra
+                // de metricas: `updateNodeTopology` reescribe la caja del head con la que reporta la
+                // zona. Sin este comando el mundo de la victima quedaba huerfano a los 100 ms.
+                sendResizeCommand(survivorFD, (ResizeAxis)axis, nMin, nMax);
+
                 std::cout << "[Orchestrator] Absorbiendo fd=" << victimFD << " en fd=" << survivorFD
-                          << " X[" << nXMin << "-" << nXMax << "]" << std::endl;
+                          << " eje=" << (axis == AXIS_X ? 'X' : axis == AXIS_Y ? 'Y' : 'Z')
+                          << " [" << nMin << "-" << nMax << "]" << std::endl;
             }
 
             // Number of chunks in a zone (the "which is smallest" heuristic).
@@ -597,39 +786,206 @@ namespace DGS
             // §3.9 (P9b): executes the SPLIT (scale up), serialised through the lifecycle queue. It used
             // to live inline in evaluateServer; it is now a queue operation with SPLIT priority (the
             // lowest, after crash and merge) and the cooldown still applies per zone (lastScaleTime).
-            void trySplitDown(int fd)
+            bool trySplitDown(int fd)
             {
                 static const int cooldown = (int)evalCfg("EVAL_COOLDOWN_S", 30.0f);
 
                 const ZoneInfo* me = findZoneInfo(fd);
-                if (!me) return;
-                if (zoneState(fd) != ZoneState::READY) return;
+                if (!me) return false;
+                if (zoneState(fd) != ZoneState::READY) return false;
 
                 auto now = std::chrono::steady_clock::now();
                 auto it  = lastScaleTime.find(fd);
                 if (it != lastScaleTime.end() &&
                     std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count() < cooldown)
-                    return;
+                    return false;
 
-                int32_t width = me->chunkXMax - me->chunkXMin;
+                // ⚠️ IT ONLY EVER CUT ON X, and that is not a smaller version of splitting — it is a
+                // different, weaker thing. A zone cut on X over and over becomes a thinner and thinner
+                // SLAB: the crowd that made it split stays together inside one band, and every extra
+                // node buys a strip of empty world next to them. Cutting the LONGEST axis instead is
+                // what makes repeated splits converge on a grid, so the second cut separates what the
+                // first one could not.
+                const int32_t wX = me->chunkXMax - me->chunkXMin;
+                const int32_t wY = me->chunkYMax - me->chunkYMin;
+                const int32_t wZ = me->chunkZMax - me->chunkZMin;
+
+                ResizeAxis axis = AXIS_X;
+                int32_t    width = wX;
+                if (wY > width) { axis = AXIS_Y; width = wY; }
+                if (wZ > width) { axis = AXIS_Z; width = wZ; }
+
+                // ⚠️ THE FLOOR. A zone's box is expressed in WHOLE CHUNKS, and the routing key is a
+                // chunk: `ZoneQuery` carries `chunkX/Y/Z` and nothing finer, so two zones cannot share
+                // one chunk — the head would have no way to tell them apart. A zone down to a single
+                // chunk therefore CANNOT be split, on any axis, and no amount of hardware helps.
+                //
+                // What that costs is a measurement, not an opinion. On this machine, one zone with a
+                // 1000 m chunk and INTEREST_RADIUS_M=500 crosses its tick budget at ~70 players
+                // standing together (60 -> 16 ms, 70 -> 56 ms, 80 -> 111 ms). So the floor reads:
+                // ANY 1000 m OF WORLD HOLDING MORE THAN ~70 PLAYERS IS BEYOND WHAT SPLITTING CAN FIX.
+                // A town square of 500 people needs chunks of about 350 m, and that is a deploy-time
+                // decision (`CHUNK_SIZE_*`) taken before anybody logs in.
+                //
+                // Lifting it for real means making the routing key finer than a chunk — position in
+                // `ZoneQuery`, sub-chunk bounds, and every chunk-keyed query along with it. That is a
+                // protocol change and it is NOT done here.
+                //
+                // What IS done here: stop pretending. This used to log one line and return, while
+                // `evaluateServer` re-enqueued the same doomed SPLIT on every metrics sample — a zone
+                // drowning at 700 ms a tick spun the lifecycle queue forever and the only trace was a
+                // line that read like an ordinary skip. Now the zone is marked, the condition is
+                // reported once with what to actually do about it, and no further SPLIT is queued for
+                // it (see `atSplitFloor` in evaluateServer).
                 if (width < 1)
                 {
-                    std::cout << "[Orchestrator] Zona demasiado pequena para dividir (width=" << width << ")" << std::endl;
-                    return;
+                    if (!atSplitFloor.count(fd))
+                    {
+                        atSplitFloor.insert(fd);
+                        std::cout << "[Orchestrator] ⚠ zone fd=" << fd
+                                  << " is AT THE SPLIT FLOOR: it owns a single chunk"
+                                  << " (X=" << wX << " Y=" << wY << " Z=" << wZ << ")"
+                                  << " and CANNOT be divided further — the routing key is a chunk."
+                                  << " If it is overloaded, splitting will not fix it:"
+                                  << " reduce CHUNK_SIZE_* at deploy time or cut INTEREST_RADIUS_M."
+                                  << std::endl;
+                    }
+                    return false;   // nothing happened: do not earn a settle window
+                }
+                atSplitFloor.erase(fd);   // it has room again (a merge gave it back some range)
+
+                // ⚠️ AND NOW WHERE TO CUT IT. Everything above picks an axis from the GEOMETRY. That is
+                // the right fallback and the wrong default: a zone splits because of the people in it,
+                // and the people are not spread evenly across its box. With the whole crowd in chunk 3
+                // of a 0..100 zone, the geometric cut lands at 50 — the child gets 51..100, empty, the
+                // parent keeps every last player, and it takes about five generations (~2.5 min at one
+                // split per 30 s) to walk the cut down to them. A population cut lands on the third
+                // chunk the first time.
+                //
+                // So if this zone has reported a population profile, the axis AND the cut both come
+                // from it: for each axis, find the bucket boundary where the entities divide most
+                // evenly, and take the axis whose best boundary is the most even of the three. Zero
+                // population, no profile at all (a zone older than this field), or a crowd that no
+                // boundary can divide — everyone inside one bucket — all fall back to the geometric
+                // choice already computed above, which is what `chosen` starts as.
+                bool     popCut = false;
+                int32_t  cutLow = 0;
+
+                auto pit = popProfiles.find(fd);
+                if (pit != popProfiles.end())
+                {
+                    double bestImbalance = 1.0;   // 1.0 = every entity on one side: no better than none
+
+                    for (int a = 0; a < 3; ++a)
+                    {
+                        const uint16_t* h = (a == 0) ? pit->second.x : (a == 1) ? pit->second.y : pit->second.z;
+                        const int32_t aLo = (a == 0) ? me->chunkXMin : (a == 1) ? me->chunkYMin : me->chunkZMin;
+                        const int32_t aHi = (a == 0) ? me->chunkXMax : (a == 1) ? me->chunkYMax : me->chunkZMax;
+                        const int64_t span = (int64_t)aHi - (int64_t)aLo + 1;
+                        if (span < 2) continue;   // one chunk on this axis: nothing to divide
+
+                        int64_t total = 0;
+                        for (uint32_t b = 0; b < MAX_SPLIT_BUCKETS; ++b) total += h[b];
+                        if (total == 0) continue;
+
+                        // Walk the bucket boundaries, keeping the one that halves the population best.
+                        int64_t cum = 0;
+                        for (uint32_t b = 0; b + 1 < MAX_SPLIT_BUCKETS; ++b)
+                        {
+                            cum += h[b];
+
+                            // ⚠️ THE LAST CHUNK OF BUCKET b, and it has to be the EXACT inverse of the
+                            // zone's `(v - lo) * B / span`. A first version used
+                            // `lo + (b+1)*span/B - 1`, which is off by one chunk: with span=101 and
+                            // B=32, chunk 3 lands in bucket 0 but that formula ends bucket 0 at chunk
+                            // 2 — so part of the bucket's own population fell on the far side of the
+                            // cut it was supposed to be counted for. Measured: a town in chunks 0..10
+                            // was cut at 2 (22/58) instead of 6 (50/30).
+                            const int64_t endOfBucket =
+                                (int64_t)aLo + ((int64_t)(b + 1) * span - 1) / (int64_t)MAX_SPLIT_BUCKETS;
+                            if (endOfBucket < aLo || endOfBucket >= aHi) continue;
+
+                            const double imbalance =
+                                (double)std::llabs(cum - (total - cum)) / (double)total;
+                            if (imbalance < bestImbalance)
+                            {
+                                bestImbalance = imbalance;
+                                axis   = (a == 0) ? AXIS_X : (a == 1) ? AXIS_Y : AXIS_Z;
+                                cutLow = (int32_t)endOfBucket;
+                                popCut = true;
+                            }
+                        }
+                    }
                 }
 
-                std::cout << "[Orchestrator] SPLIT fd=" << fd << " (cola de vida)" << std::endl;
+                // Nothing divided them: every entity sits inside one bucket, on all three axes. That is
+                // the case a cut cannot fix — the routing key is a chunk — but the geometric middle is
+                // still the wrong answer to give. Cutting AROUND the crowd instead narrows the box down
+                // to the chunk they are standing in within a couple of generations, so the cluster
+                // reaches the honest "unsplittable" verdict (and frees the rest of the world) in about
+                // a minute instead of walking a binary search down to it over seven splits and three
+                // and a half minutes.
+                if (!popCut && pit != popProfiles.end())
+                {
+                    for (int a = 0; a < 3 && !popCut; ++a)
+                    {
+                        const uint16_t* h = (a == 0) ? pit->second.x : (a == 1) ? pit->second.y : pit->second.z;
+                        const int32_t aLo = (a == 0) ? me->chunkXMin : (a == 1) ? me->chunkYMin : me->chunkZMin;
+                        const int32_t aHi = (a == 0) ? me->chunkXMax : (a == 1) ? me->chunkYMax : me->chunkZMax;
+                        const int64_t span = (int64_t)aHi - (int64_t)aLo + 1;
+                        if (span < 2) continue;
 
-                int32_t midLow  =  (me->chunkXMin + me->chunkXMax)      / 2;
-                int32_t midHigh = ((me->chunkXMin + me->chunkXMax) + 1) / 2;
+                        uint32_t heaviest = 0; uint16_t most = 0;
+                        for (uint32_t b = 0; b < MAX_SPLIT_BUCKETS; ++b)
+                            if (h[b] > most) { most = h[b]; heaviest = b; }
+                        if (most == 0) continue;
 
-                if (spawnZoneNode(midHigh, me->chunkXMax,
-                                  me->chunkYMin, me->chunkYMax,
-                                  me->chunkZMin, me->chunkZMax))
+                        auto endOf = [&](uint32_t b) {
+                            return (int64_t)aLo + ((int64_t)(b + 1) * span - 1) / (int64_t)MAX_SPLIT_BUCKETS;
+                        };
+                        // Prefer cutting BELOW the crowd (giving away the empty space under it); if it
+                        // is already in the first bucket there is nothing below, so cut above instead.
+                        const int64_t below = (heaviest > 0) ? endOf(heaviest - 1) : (int64_t)aLo - 1;
+                        const int64_t above = endOf(heaviest);
+                        const int64_t pick  = (below >= aLo && below < aHi) ? below
+                                            : ((above >= aLo && above < aHi) ? above : (int64_t)aLo - 1);
+                        if (pick < aLo || pick >= aHi) continue;
+
+                        axis   = (a == 0) ? AXIS_X : (a == 1) ? AXIS_Y : AXIS_Z;
+                        cutLow = (int32_t)pick;
+                        popCut = true;
+                    }
+                }
+
+                const int32_t lo = (axis == AXIS_X) ? me->chunkXMin : (axis == AXIS_Y) ? me->chunkYMin : me->chunkZMin;
+                const int32_t hi = (axis == AXIS_X) ? me->chunkXMax : (axis == AXIS_Y) ? me->chunkYMax : me->chunkZMax;
+
+                const int32_t midLow  = popCut ? cutLow      : ( (lo + hi)      / 2);
+                const int32_t midHigh = popCut ? (cutLow + 1) : (((lo + hi) + 1) / 2);
+
+                std::cout << "[Orchestrator] SPLIT fd=" << fd << " (cola de vida) axis="
+                          << (axis == AXIS_X ? 'X' : axis == AXIS_Y ? 'Y' : 'Z')
+                          << " cut=" << (popCut ? "POPULATION" : "geometric")
+                          << " " << lo << ".." << hi << " -> " << lo << ".." << midLow
+                          << " + " << midHigh << ".." << hi << std::endl;
+
+                // The child takes the upper half OF THE CHOSEN AXIS and inherits the other two whole.
+                const int32_t cxMin = (axis == AXIS_X) ? midHigh : me->chunkXMin;
+                const int32_t cyMin = (axis == AXIS_Y) ? midHigh : me->chunkYMin;
+                const int32_t czMin = (axis == AXIS_Z) ? midHigh : me->chunkZMin;
+
+                if (spawnZoneNode(cxMin, me->chunkXMax,
+                                  cyMin, me->chunkYMax,
+                                  czMin, me->chunkZMax))
                 {
                     lastScaleTime[fd] = now;
-                    sendResizeCommand(fd, midLow);
+                    sendResizeCommand(fd, axis, lo, midLow);
+                    return true;
                 }
+                // The spawn failed (no fork, kubectl refused, the API said no). No child exists, so the
+                // parent must NOT be resized — that would hand its upper half to nobody — and no settle
+                // is earned: the next evaluation should be free to try again.
+                return false;
             }
 
             // Merge (scale down): picks the smallest neighbour as the victim, requests a drain, and lets
@@ -921,13 +1277,27 @@ namespace DGS
                 std::string headPort = std::getenv("HEAD_SERVER_PORT") ? std::getenv("HEAD_SERVER_PORT") : "42424";
                 std::string podIP    = std::getenv("MY_POD_IP")        ? std::getenv("MY_POD_IP")        : "127.0.0.1";
 
+                // ⚠️ CHUNK SIZE WAS NOT INHERITED. `zoneSpawnEnv` defaults it to "1.0" and nobody
+                // overrode it, so a split of a zone running 1000 m chunks produced a child running
+                // ONE METRE chunks. Routing is by chunk index so it still routed, but the child's
+                // world coordinates (`chunkX * csX + pos`, what goes out over UDP and to the viewer)
+                // came out 1000x off. The head cannot read it off the parent — chunk size does not
+                // travel in ServerMetrics — so it takes its OWN environment, which is what the k8s
+                // manifest and demo_cluster.sh already set on every node of a cluster.
+                auto envOr = [](const char* n, const char* d) {
+                    const char* v = std::getenv(n); return std::string(v ? v : d);
+                };
+                const std::string csX = envOr("CHUNK_SIZE_X", "1.0");
+                const std::string csY = envOr("CHUNK_SIZE_Y", "1.0");
+                const std::string csZ = envOr("CHUNK_SIZE_Z", "1.0");
+
                 pid_t pid = fork();
                 if (pid < 0) { std::cerr << "[Orchestrator] fork LOCAL fallo" << std::endl; --nextNodePort; return false; }
                 if (pid == 0)
                 {
                     // Child: becomes the zone_node with the topology env (the same one k8s gets).
                     auto env = zoneSpawnEnv(xMin, xMax, yMin, yMax, zMin, zMax, udpPort,
-                                            headHost, headPort, podIP);
+                                            headHost, headPort, podIP, csX, csY, csZ);
                     for (const auto& kv : env) putenv(const_cast<char*>(kv.c_str()));
 
                     execl(bin.c_str(), bin.c_str(), (char*)nullptr);
@@ -970,6 +1340,9 @@ namespace DGS
                 const std::string podIP = nodeIP ? nodeIP : "127.0.0.1";
 
                 auto i = [](int32_t v) { return std::to_string(v); };
+                auto envOrK = [](const char* n) {
+                    const char* v = std::getenv(n); return std::string(v ? v : "1.0");
+                };
 
                 // --- Service (NodePort UDP) ---
                 std::string svc = R"({"apiVersion":"v1","kind":"Service","metadata":{"name":")" + name +
@@ -996,7 +1369,14 @@ namespace DGS
                         R"({"name":"CHUNK_Y_MIN","value":")" + i(yMin) + R"("},)"
                         R"({"name":"CHUNK_Y_MAX","value":")" + i(yMax) + R"("},)"
                         R"({"name":"CHUNK_Z_MIN","value":")" + i(zMin) + R"("},)"
-                        R"({"name":"CHUNK_Z_MAX","value":")" + i(zMax) + R"("})"
+                        R"({"name":"CHUNK_Z_MAX","value":")" + i(zMax) + R"("},)"
+                        // Same omission as the LOCAL path had: without these the child runs 1 m chunks
+                        // whatever the rest of the cluster uses, and its world coordinates come out
+                        // scaled. Taken from the head's own environment (chunk size does not travel in
+                        // ServerMetrics, so there is nothing per-zone to copy).
+                        R"({"name":"CHUNK_SIZE_X","value":")" + envOrK("CHUNK_SIZE_X") + R"("},)"
+                        R"({"name":"CHUNK_SIZE_Y","value":")" + envOrK("CHUNK_SIZE_Y") + R"("},)"
+                        R"({"name":"CHUNK_SIZE_Z","value":")" + envOrK("CHUNK_SIZE_Z") + R"("})"
                     R"(]}]}}}})" ;
 
                 if (viaKubectl)
@@ -1051,21 +1431,31 @@ namespace DGS
                 return false;
             }
 
-            void sendResizeCommand(int fd, int32_t newChunkMax)
+            void sendResizeCommand(int fd, ResizeAxis axis, int32_t newMin, int32_t newMax)
             {
                 // ⚠️ ZERO-INITIALISED. It was not, so `chunkSize*` and `addr` went on the wire as
                 // whatever was on the stack — and the validator, which reads its chunk size from a
                 // Command, would have taken garbage for it.
                 DGS::Command cmd{};
-                cmd.purpose = DGS::CMD_TRANSFER_SERVER;
-                cmd.chunkX  = newChunkMax;
+                cmd.purpose    = DGS::CMD_TRANSFER_SERVER;
+                // ⚠️ EL RANGO COMPLETO, no solo el maximo. Mandar solo el maximo hacia imposible la
+                // FUSION: un superviviente que se queda la region de otro tiene que CRECER, y con un
+                // solo numero la zona no podia saber hasta donde. Medido: tras fusionar, el chunk de
+                // la victima dejaba de tener dueno en cuanto el superviviente mandaba sus siguientes
+                // metricas — `updateNodeTopology` reescribe la caja del head con la que reporta la
+                // zona, y la zona seguia con la suya de siempre. `findTargetNode` devolvia -1.
+                cmd.chunkX     = newMax;   // maximo nuevo en `resizeAxis`
+                cmd.chunkY     = newMin;   // minimo nuevo en `resizeAxis`
+                cmd.resizeAxis = axis;
 
                 DGS::Packet p;
                 p.pack(cmd);
 
                 socket.send(fd, p.getRawData(), p.getSize());
 
-                std::cout << "[Orchestrator] Resizing ZoneNode container... " << fd << std::endl;
+                std::cout << "[Orchestrator] Resizing ZoneNode fd=" << fd << " axis="
+                          << (axis == AXIS_X ? 'X' : axis == AXIS_Y ? 'Y' : 'Z')
+                          << " -> [" << newMin << ".." << newMax << "]" << std::endl;
             }
 
             DGS::TCPSocket& socket;

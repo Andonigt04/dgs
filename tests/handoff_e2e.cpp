@@ -202,6 +202,11 @@ int main(int argc, char** argv)
     if (zone == 0) {
         if (!std::getenv("HANDOFF_E2E_VERBOSE")) std::freopen("/dev/null", "w", stdout);
         setenv("ZONE_UDP_PORT",      std::to_string(kZoneUdp).c_str(), 1);
+    // ⚠️ EL TECHO DE VELOCIDAD ES DEL SERVIDOR, y este test cruza fronteras a propósito dando saltos
+    // que ningún jugador daría. Antes bastaba con que el cliente declarara una velocidad enorme —que
+    // es justo el agujero que `client_claims_e2e` cierra: el anti-trampas preguntaba al sospechoso—,
+    // así que ahora lo declara quien debe, el despliegue.
+        setenv("CLIENT_MAX_SPEED_MPS", "1000000", 1);
         setenv("HEAD_SERVER_HOST",   "127.0.0.1", 1);
         setenv("HEAD_SERVER_PORT",   std::to_string(kHeadPort).c_str(), 1);
         setenv("VALIDATOR_HOST",     "127.0.0.1", 1);

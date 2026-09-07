@@ -398,6 +398,15 @@ struct PendingValidation
     DGS::EntityTransfer entity;
     float      maxSpeed;
     uint32_t   ownerZone;
+    // ⚠️ UNA ACCION SOLO OCURRE SI SE ACEPTA, y esa es toda la diferencia con el movimiento. Una
+    // posicion ya esta en `entities` cuando se pregunta —falla abierto, y un sitio mal aceptado se
+    // corrige en el siguiente paquete—; una accion CREA algo, y lo creado no se deshace. Asi que la
+    // entidad propuesta espera aqui y solo entra en el mundo con el veredicto bueno. Sin validador,
+    // sin modulo o con el interruptor abierto, nunca entra: eso es fallar cerrado.
+    bool       applyOnAccept = false;
+    uint16_t   pendingAction  = 0;   ///< ActionKind, cuando `applyOnAccept`
+    uint32_t   actor          = 0;   ///< a quien hay que contestarle
+    uint32_t   clientReqId    = 0;   ///< el numero con el que EL reconoce su peticion
 };
 
 // Last known GLOBAL position of each entity (baseline for the S1 pre-check and for the REQ).
@@ -406,21 +415,64 @@ struct LastPosition
     float    gx, gy, gz;
     float    maxSpeed;
     uint64_t tsMs;
+    // Metros de margen ACUMULADOS y todavia sin gastar. Ver `s1Plausible`.
+    float    budgetM = 0.0f;
 };
 
 // Local S1 pre-check (generic, module-agnostic): a fast teleport/speed filter.
 // It is the same computation as the validator's fallback, applied BEFORE sending the REQ so the
 // network is not saturated. The sender here is the owning zone → this is a plausibility step, not an
 // authority one.
+/// ⚠️ ESTO JUZGABA LA CONEXION Y NO LA VELOCIDAD, y es el fallo mas injusto que tenia el sistema.
+///
+/// Era `maxDist = maxSpeed * dt + 1 m`, con `dt` medido entre las LLEGADAS de dos datagramas. Mientras
+/// los paquetes llegan repartidos, bien. En cuanto se agolpan —y se agolpan en cuanto la maquina o la
+/// red se ocupan— dos que llegan con un milisegundo de diferencia reciben `maxSpeed * 0.001 + 1 m` de
+/// margen para un paso que el jugador dio en cincuenta milisegundos. Rechazado por un salto que no ha
+/// dado. Medido en este repo: 0 de 20 pasos legitimos rechazados en maquina ociosa, 8 de 20 bajo la
+/// suite entera. El mismo jugador y el mismo movimiento, distinto veredicto segun lo ocupado que
+/// estuviera el SERVIDOR.
+///
+/// Ahora el margen se ACUMULA con el tiempo real en vez de calcularse por paquete: un cubo que se
+/// llena a `maxSpeed` metros por segundo y del que cada paso aceptado gasta su distancia. Una racha de
+/// cuatro paquetes pegados gasta del margen que se lleno durante los doscientos milisegundos de
+/// silencio anterior, que es exactamente el tiempo que el jugador estuvo andando.
+///
+/// El cubo tiene TOPE, y ese tope es lo que impide que esto sea una barra libre: quien se queda quieto
+/// diez segundos no acumula diez segundos de teletransporte. Media segundo de margen es lo mismo que
+/// concedia el calculo viejo ante un hueco de medio segundo, asi que no se abre la mano — se reparte
+/// mejor.
 static bool s1Plausible(const DGS::EntityTransfer& e, float csX, float csY, float csZ,
-                        const LastPosition& last, float dt)
+                        LastPosition& last, float dt)
 {
-    if (dt <= 0 || dt > 2.f) return true;
-    float dx = (e.chunkX * csX + e.pos[0]) - last.gx;
-    float dy = (e.chunkY * csY + e.pos[1]) - last.gy;
-    float dz = (e.chunkZ * csZ + e.pos[2]) - last.gz;
-    float maxDist = (last.maxSpeed * dt) + 1.0f;   // 1 m of slack
-    return (dx*dx + dy*dy + dz*dz) <= (maxDist * maxDist);
+    // ⚠️ AQUI HABIA DOS PUERTAS DE ATRAS, y las dos eran `return true`.
+    //
+    //   · `dt <= 0` — cuatro datagramas leidos en el mismo milisegundo dan dt = 0, y saltaban el
+    //     filtro entero. Como la referencia avanza con cada uno aceptado, sesenta pasos seguidos
+    //     mueven al jugador trescientos metros en un milisegundo. No hay que entender el protocolo:
+    //     basta con no dormir entre envios.
+    //   · `dt > 2 s` — esperar tres segundos y teletransportarse a donde sea.
+    //
+    // Las dos desaparecen con el cubo: si no ha pasado tiempo, no se ha acumulado margen, y punto. Y
+    // esperar mucho tampoco sirve porque el cubo tiene tope. Un filtro con escapes no es un filtro.
+    static const float burstS = [] {
+        const char* v = std::getenv("S1_BURST_S");
+        const float f = v ? (float)std::atof(v) : 0.5f;
+        return (f > 0.0f && f < 5.0f) ? f : 0.5f;
+    }();
+
+    const float dx = (e.chunkX * csX + e.pos[0]) - last.gx;
+    const float dy = (e.chunkY * csY + e.pos[1]) - last.gy;
+    const float dz = (e.chunkZ * csZ + e.pos[2]) - last.gz;
+    const float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+    last.budgetM += last.maxSpeed * (dt > 0.0f ? dt : 0.0f);
+    const float cap = last.maxSpeed * burstS + 1.0f;   // el metro de holgura de siempre
+    if (last.budgetM > cap) last.budgetM = cap;
+
+    if (dist > last.budgetM) return false;
+    last.budgetM -= dist;
+    return true;
 }
 
 int main()
@@ -548,6 +600,7 @@ int main()
     loadZoneModule();            // the project's rules module (or no simulation)
 
     std::map<uint32_t, LastPosition>  lastPosition;       // uuid → baseline
+    std::map<uint32_t, uint64_t>      lastChatAt;         // uuid → last LOCAL chat (anti-spam)
     std::map<uint32_t, PendingValidation> pendingValid;   // requestId -> in flight
     std::map<uint32_t, uint64_t>      lastReqMs;          // uuid → last REQ sent (throttle)
 
@@ -577,6 +630,18 @@ int main()
 
     // How far a player is told about. 0 = tell everybody about everything, which is what the capacity
     // numbers in the README were measured against.
+    // Same as the social node's per-uuid limit: one person, one voice, at a human rate.
+    const uint64_t LOCAL_CHAT_RATE_MS =
+        (uint64_t)std::atoi(std::getenv("CHAT_RATE_MS") ? std::getenv("CHAT_RATE_MS") : "500");
+
+    // El techo de velocidad de un JUGADOR, en metros por segundo, y es del servidor porque el cliente
+    // no puede declarar el numero con el que se le juzga (ver la nota en la entrada UDP). Por defecto
+    // 150: por encima de correr, saltar y caer —la gravedad llega a ~50 m/s en cinco segundos— y muy
+    // por debajo de un teleport. Un juego con vehiculos tendra que subirlo, y ese es exactamente el
+    // tipo de decision que pertenece al despliegue y no al jugador.
+    const float CLIENT_MAX_SPEED_MPS =
+        (float)std::atof(std::getenv("CLIENT_MAX_SPEED_MPS") ? std::getenv("CLIENT_MAX_SPEED_MPS") : "150");
+
     const float INTEREST_RADIUS_M =
         (float)std::atof(std::getenv("INTEREST_RADIUS_M") ? std::getenv("INTEREST_RADIUS_M") : "0");
 
@@ -630,12 +695,26 @@ int main()
     // and were re-read on every tick — nine `getenv` + `atoi` per tick for values that cannot change
     // inside a process. Hoisting them is also what lets the restore below know what to ask for, which
     // is the whole point: a zone has to know its own region before anyone can hand it back.
-    const int32_t xMin = std::atoi(std::getenv("CHUNK_X_MIN") ? std::getenv("CHUNK_X_MIN") : "0");
-    const int32_t xMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "100");
-    const int32_t yMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "0");
-    const int32_t yMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "100");
-    const int32_t zMin = std::atoi(std::getenv("CHUNK_Z_MIN") ? std::getenv("CHUNK_Z_MIN") : "0");
-    const int32_t zMax = std::atoi(std::getenv("CHUNK_Z_MAX") ? std::getenv("CHUNK_Z_MAX") : "100");
+    //
+    // ⚠️ THE DEFAULT USED TO BE 0..100 IN EVERY AXIS, and with `CHUNK_SIZE_*` also defaulting to 1.0
+    // that is a box of ONE HUNDRED METRES. A game that spawns its players anywhere else got an empty
+    // ZoneResponse and no zone at all, silently. The default is now "the whole world", so the
+    // orchestrator's model — start with one zone covering everything and let SPLIT subdivide it under
+    // load — works without anyone having to guess where the spawn points are.
+    //
+    // Why ±1e6 chunks and not INT32_MIN..INT32_MAX: three places do arithmetic on these bounds that
+    // would overflow at the extremes — `isNearBorder` computes `xMax - threshold`, the drain computes
+    // `(xMin + xMax) / 2` and `xMax - xMin`, and the region hash computes `xMin * 31 + yMin * 17`.
+    // ±1e6 keeps every one of those inside int32 and is still 2000000 km across at 1 km chunks, which
+    // is 50x the circumference of the Earth.
+    // ⚠️ THE MAXIMA ARE NOT const: CMD_TRANSFER_SERVER (a SPLIT) shrinks one of them at runtime, and
+    // which one depends on the axis the orchestrator chose. See the PKT_COMMAND handler.
+    int32_t       xMin = std::atoi(std::getenv("CHUNK_X_MIN") ? std::getenv("CHUNK_X_MIN") : "-1000000");
+    int32_t       xMax = std::atoi(std::getenv("CHUNK_X_MAX") ? std::getenv("CHUNK_X_MAX") : "1000000");
+    int32_t       yMin = std::atoi(std::getenv("CHUNK_Y_MIN") ? std::getenv("CHUNK_Y_MIN") : "-1000000");
+    int32_t       yMax = std::atoi(std::getenv("CHUNK_Y_MAX") ? std::getenv("CHUNK_Y_MAX") : "1000000");
+    int32_t       zMin = std::atoi(std::getenv("CHUNK_Z_MIN") ? std::getenv("CHUNK_Z_MIN") : "-1000000");
+    int32_t       zMax = std::atoi(std::getenv("CHUNK_Z_MAX") ? std::getenv("CHUNK_Z_MAX") : "1000000");
     const float   csX  = (float)std::atof(std::getenv("CHUNK_SIZE_X") ? std::getenv("CHUNK_SIZE_X") : "1.0");
     const float   csY  = (float)std::atof(std::getenv("CHUNK_SIZE_Y") ? std::getenv("CHUNK_SIZE_Y") : "1.0");
     const float   csZ  = (float)std::atof(std::getenv("CHUNK_SIZE_Z") ? std::getenv("CHUNK_SIZE_Z") : "1.0");
@@ -840,6 +919,17 @@ int main()
             if (udpBytes <= 0) break;               // nothing left waiting: on with the tick
             g_bytesRx += (uint64_t)udpBytes;
 
+            // ⚠️ QUE LLEGA, cuando hay que averiguar por que algo no pasa. Un datagrama de un tipo
+            // que esta cadena no reconoce se ignora en silencio, asi que "no llego" y "llego y no lo
+            // entendi" se ven exactamente igual desde fuera. Con `ZONE_TRACE_UDP=1` se distinguen.
+            // Apagado por defecto: son diez lineas por segundo y por jugador.
+            {
+                static const bool traceUdp = std::getenv("ZONE_TRACE_UDP") != nullptr;
+                if (traceUdp)
+                    std::cout << "[ZoneNode] udp tipo=" << (int)udpBuf[0] << " " << udpBytes
+                              << " bytes de " << clientAddr << ":" << clientPort << std::endl;
+            }
+
             // READ-ONLY OBSERVER (viewer / ops tooling). A PKT_OBSERVE datagram subscribes the sender
             // to the same stream the zone already broadcasts to its clients. It is deliberately NOT
             // routed through the client path: an observer never lands in `clientMap`, never gets a
@@ -897,9 +987,260 @@ int main()
                     std::cout << "[ZoneNode] observer subscribed " << key << std::endl;
                 observers[key] = { { clientAddr, clientPort }, nowMs() + OBSERVER_LEASE_MS };
             }
+            // ── LOCAL CHAT (§3.7 `CHAT_LOCAL`) ──────────────────────────────────────────────────
+            // ⚠️ THIS CHANNEL WAS IMPLEMENTED BY NOBODY. The social node returns early for it with the
+            // comment "the owning zone emits it", and the zone had zero mentions of chat: a message on
+            // the local channel went nowhere at all. It belongs here because "local" means WHO IS NEAR
+            // YOU, and the zone is the only process that knows — it is already deciding exactly that,
+            // every tick, for the entity broadcast.
+            //
+            // So it travels the plane it belongs to: the client's UDP link, sealed like everything else
+            // on it, filtered by the same interest radius, and never touching the social node or the
+            // head. Nothing else in the system has to grow a subscription model for it.
+            else if (udpBuf[0] == DGS::PKT_CHAT)
+            {
+                DGS::ChatMessage cm{};
+                try {
+                    DGS::Packet cp;
+                    cp.setBuffer(udpBuf, (size_t)udpBytes);
+                    cm = cp.unpackChatMessage();
+                } catch (const std::exception&) { statRejected++; continue; }
+
+                if (cm.channel != DGS::CHAT_LOCAL) { statRejected++; continue; }   // not ours
+
+                // The ban list this zone already keeps for movement applies to speech as well: a
+                // banned player who cannot enter the world has no business being heard in it.
+                auto bIt = bannedUntilMs.find(cm.uuid);
+                if (bIt != bannedUntilMs.end() && (bIt->second == 0 || nowMs() < bIt->second))
+                { statRejected++; continue; }
+
+                // Same rate as the social node's, and for the same reason: one uuid must not be able
+                // to make the zone fan out faster than a person can type.
+                const uint64_t nowChat = nowMs();
+                auto lc = lastChatAt.find(cm.uuid);
+                if (lc != lastChatAt.end() && nowChat - lc->second < LOCAL_CHAT_RATE_MS)
+                { statRejected++; continue; }
+                lastChatAt[cm.uuid] = nowChat;
+
+                // Where the speaker is. Without a position we cannot say who is near them, and
+                // shouting to the whole zone would be the opposite of what this channel means.
+                auto sp = lastPosition.find(cm.uuid);
+                if (sp == lastPosition.end()) { statRejected++; continue; }
+
+                cm.timestampMs = (uint32_t)nowChat;
+                DGS::Packet outChat; outChat.pack(cm);
+
+                // Sealed ONCE for everybody, exactly as the entity broadcast is: the alternative is
+                // encrypting the same sentence once per listener.
+                std::vector<uint8_t> sealed;
+                DGS::sealForUdp(outChat.getRawData(), outChat.getSize(), sealed);
+
+                int heard = 0;
+                for (const auto& [ouuid, endpoint] : clientMap)
+                {
+                    if (ouuid == cm.uuid) continue;              // you do not need to be told what you said
+                    auto op = lastPosition.find(ouuid);
+                    if (op == lastPosition.end()) continue;
+                    if (INTEREST_RADIUS_M > 0.0f)
+                    {
+                        const float dx = op->second.gx - sp->second.gx;
+                        const float dy = op->second.gy - sp->second.gy;
+                        const float dz = op->second.gz - sp->second.gz;
+                        if (dx*dx + dy*dy + dz*dz > INTEREST_RADIUS_M * INTEREST_RADIUS_M) continue;
+                    }
+                    udp_zone_node.sendRaw(endpoint.first, endpoint.second, sealed.data(), sealed.size());
+                    g_bytesTx += DGS::udpWireSize(outChat.getSize());
+                    ++heard;
+                }
+                std::cout << "[ZoneNode] local chat uuid=" << cm.uuid << " heard by " << heard
+                          << std::endl;
+            }
             // A client's position update. Recognised by its TYPE BYTE, not by its size: the size rule
             // could not survive `dataSize` being honoured, and it was never sound anyway — a truncated
             // datagram simply stopped matching and was dropped in silence (see `net_degraded`).
+            else if (udpBuf[0] == DGS::PKT_ACTION)
+            {
+                // ⚠️ AQUI EMPIEZA LO QUE EL JUGADOR PIDE, y hasta hoy no habia por donde pedir nada.
+                // El validador distingue `kind=0` (movimiento, falla abierto suavizado) de `kind=1`
+                // (accion, falla CERRADO) desde hace tiempo, y `action_e2e` lo cubre — pero la zona
+                // ponia `kind = 0` a pelo en todas sus peticiones, asi que la ruta segura no la
+                // alcanzaba ningun juego. Esto la conecta.
+                DGS::ActionRequest a{};
+                DGS::Packet ap;
+                ap.setBuffer(udpBuf, (size_t)udpBytes);
+                // ⚠️ UNA ACCION DESCARTADA NO PUEDE SER MUDA. Todas las salidas de aqui eran un
+                // `continue` sin una linea, asi que "el objeto no aparece" no distinguia entre no
+                // haber llegado, no entenderse, no estar permitida y no poder preguntar al validador.
+                // Me costo una tarde de sondas averiguar cual de las cuatro era.
+                if (!ap.tryUnpackActionRequest(a))
+                {
+                    std::cout << "[ZoneNode] ACCION RECHAZADA: datagrama ilegible (" << udpBytes
+                              << " bytes)" << std::endl;
+                    statRejected++; continue;
+                }
+
+                // ⚠️ APUNTAR DE DONDE VIENE, o no hay a quien contestarle. La direccion de un cliente
+                // solo se registraba al recibir su ENTIDAD, y una peticion no es una entidad: quien
+                // pedia algo sin haberse movido antes no existia para el mapa de clientes, asi que el
+                // veredicto no tenia destino. Medido: el rechazo no llegaba nunca.
+                clientMap[a.actor] = { clientAddr, clientPort };
+
+                // Un baneado no pide nada.
+                auto banA = bannedUntilMs.find(a.actor);
+                if (banA != bannedUntilMs.end() && (banA->second == 0 || nowMs() < banA->second))
+                {
+                    std::cout << "[ZoneNode] ACCION RECHAZADA: " << a.actor << " esta baneado"
+                              << std::endl;
+                    statRejected++; continue;
+                }
+
+                if (a.action != DGS::ACTION_PLACE &&
+                    a.action != DGS::ACTION_DROP &&
+                    a.action != DGS::ACTION_REMOVE &&
+                    a.action != DGS::ACTION_MOVE)
+                {
+                    std::cout << "[ZoneNode] ACCION RECHAZADA: verbo " << a.action << " desconocido"
+                              << std::endl;
+                    statRejected++; continue;
+                }
+                // DROP y PLACE CREAN; REMOVE y MOVE operan sobre algo que ya existe.
+                const bool creates = (a.action == DGS::ACTION_PLACE || a.action == DGS::ACTION_DROP);
+
+                // ⚠️ SOBRE ALGO QUE EXISTE Y QUE ES DEL MUNDO. REMOVE y MOVE llevan un uuid elegido
+                // por quien pide —no hay otra forma de decir cual—, asi que el servidor comprueba
+                // ANTES de preguntarle a nadie que ese objeto existe aqui y que es un objeto del
+                // mundo. Sin esto, un uuid inventado se convierte en una peticion valida sobre la
+                // entidad de otro: bastaria con acertar un numero para borrar a un jugador.
+                DGS::EntityTransfer* victim = nullptr;
+                if (!creates)
+                {
+                    for (auto& ent : entities)
+                        if (ent.uuid == a.target) { victim = &ent; break; }
+                    if (!victim || !(victim->state & DGS::STATE_WORLD_OWNED))
+                    {
+                        std::cout << "[ZoneNode] ACCION RECHAZADA: " << a.target
+                                  << (victim ? " no es un objeto del mundo" : " no existe aqui")
+                                  << std::endl;
+                        statRejected++;
+                        continue;
+                    }
+                }
+
+                // ⚠️ EL UUID LO PONE EL SERVIDOR. Si lo eligiera quien pide, acertar un numero
+                // bastaria para sobrescribir el objeto de otro. Se deriva del sitio y de lo que es,
+                // asi que pedir dos veces lo mismo en el mismo punto no crea gemelos, y el bit alto
+                // separa los objetos del mundo del espacio de los jugadores.
+                uint64_t h = 1469598103934665603ull;
+                auto mix = [&h](const void* p, size_t n) {
+                    const uint8_t* b = (const uint8_t*)p;
+                    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                };
+                const int32_t qx = (int32_t)std::llround(a.pos[0] * 10.0f);
+                const int32_t qz = (int32_t)std::llround(a.pos[2] * 10.0f);
+                mix(&a.chunkX, sizeof(a.chunkX)); mix(&a.chunkY, sizeof(a.chunkY));
+                mix(&a.chunkZ, sizeof(a.chunkZ)); mix(&qx, sizeof(qx)); mix(&qz, sizeof(qz));
+                if (a.dataSize) mix(a.data, a.dataSize);
+                const uint32_t newUuid = 0x80000000u | (uint32_t)(h & 0x7FFFFFFFu);
+
+                // Lo que se PROPONE. En PLACE es un objeto nuevo; en REMOVE y MOVE es el que ya
+                // existe, con el cambio pedido — el validador tiene que ver sobre que decide.
+                DGS::EntityTransfer prop{};
+                if (!creates)
+                {
+                    prop = *victim;
+                    if (a.action == DGS::ACTION_MOVE)
+                    {
+                        prop.chunkX = a.chunkX; prop.chunkY = a.chunkY; prop.chunkZ = a.chunkZ;
+                        prop.pos[0] = a.pos[0]; prop.pos[1] = a.pos[1]; prop.pos[2] = a.pos[2];
+                        prop.angle  = a.angle;
+                    }
+                }
+                else
+                {
+                prop.uuid   = newUuid;
+                prop.type   = DGS::ENT_ITEM;
+                prop.state  = DGS::STATE_WORLD_OWNED;   // lo pone el SERVIDOR, no el cliente
+                prop.chunkX = a.chunkX; prop.chunkY = a.chunkY; prop.chunkZ = a.chunkZ;
+                prop.pos[0] = a.pos[0]; prop.pos[1] = a.pos[1]; prop.pos[2] = a.pos[2];
+                prop.angle  = a.angle;
+                prop.dataSize = a.dataSize;
+                if (a.dataSize) std::memcpy(prop.data, a.data, a.dataSize);
+                }
+
+                // Sin validador alcanzable no se coloca nada. Es lo contrario del movimiento, y a
+                // proposito: una posicion mal aceptada se corrige sola en el siguiente paquete, un
+                // objeto creado de mas se queda.
+                if (!circuitBreakerOk())
+                {
+                    std::cout << "[ZoneNode] ACCION RECHAZADA (sin validador): actor=" << a.actor
+                              << std::endl;
+                    statRejected++;
+                    continue;
+                }
+
+                // ⚠️ EL BLOB QUE EL MODULO ESPERA, no el que a mi me venia bien. El ABI lo tiene
+                // escrito: `validateAction(zone, actor, blob, n, world)` con el blob = `ActionHeader`
+                // + el payload del juego. Y el validador pasa `r.entityUuid` como ACTOR — asi que ese
+                // campo lleva QUIEN pide, no el objeto propuesto, o el modulo no puede escribir una
+                // sola regla sobre quien hace las cosas.
+                //
+                // La entidad que se VALIDA y la que se APLICA no son la misma: la primera lleva el
+                // blob de la accion, la segunda el payload limpio del juego (el modelo). Mezclarlas
+                // haria que la mesa que acaba en el mundo llevara dentro la cabecera de la peticion.
+                DGS::EntityTransfer forValidation = prop;
+                {
+                    DGS::ActionHeader hdr{};
+                    hdr.verb   = a.action;                 // mismos numeros que ActionVerb
+                    hdr.flags  = 0;
+                    hdr.target = a.target;
+                    hdr.at[0]  = prop.chunkX * csX + prop.pos[0];
+                    hdr.at[1]  = prop.chunkY * csY + prop.pos[1];
+                    hdr.at[2]  = prop.chunkZ * csZ + prop.pos[2];
+                    hdr.amount = 1.0f;
+
+                    const uint16_t hdrN = (uint16_t)sizeof(hdr);
+                    const uint16_t payN = (uint16_t)std::min<size_t>(a.dataSize,
+                                              DGS::MAX_ENTITY_DATA - hdrN);
+                    std::memcpy(forValidation.data, &hdr, hdrN);
+                    if (payN) std::memcpy(forValidation.data + hdrN, a.data, payN);
+                    forValidation.dataSize = (uint16_t)(hdrN + payN);
+                }
+
+                DGS::ValidateRequest req{};
+                req.requestId  = reqSeq++;
+                req.entityUuid = a.actor;    // el ABI lo recibe como `actor`
+                req.ownerZone  = (uint32_t)(xMin * 31 + yMin * 17 + zMin);
+                req.moduleId   = 0;
+                req.kind       = 1;          // ACCION: la ruta que falla cerrado
+                req.entity     = forValidation;
+                req.maxSpeed   = 0.0f;
+                req.dtSeconds  = 0.0f;
+
+                DGS::Packet pReq; pReq.pack(req);
+                if (tcp_validator.send(tcp_validator.getSocketFD(), pReq.getRawData(), pReq.getSize()))
+                {
+                    g_bytesTx += pReq.getSize();
+                    PendingValidation pv{};
+                    pv.deadlineMs    = nowMs() + 500;
+                    pv.entity        = prop;
+                    pv.ownerZone     = req.ownerZone;
+                    pv.applyOnAccept = true;
+                    pv.pendingAction = a.action;
+                    pv.actor         = a.actor;
+                    pv.clientReqId   = a.requestId;
+                    pendingValid[req.requestId] = pv;
+                    statSent++;
+                    std::cout << "[ZoneNode] ACCION " << a.action << " pedida por " << a.actor
+                              << " -> validando (uuid " << prop.uuid << ")" << std::endl;
+                }
+                else
+                {
+                    std::cout << "[ZoneNode] ACCION RECHAZADA: no se pudo enviar al validador"
+                              << std::endl;
+                    statRejected++;
+                }
+                continue;
+            }
             else if (udpBuf[0] == DGS::PKT_ENTITY_TRANSFER)
             {
                 DGS::EntityTransfer e{};
@@ -913,6 +1254,28 @@ int main()
                     continue;
                 }
                 clientMap[e.uuid] = { clientAddr, clientPort };
+
+                // ⚠️ LO QUE UN CLIENTE DECLARA SOBRE SI MISMO NO VALE NADA, Y HASTA AQUI VALIA TODO.
+                // Este datagrama viene por el enlace UDP de un JUGADOR (los traspasos entre zonas van
+                // por TCP), y llegaba entero: tipo de entidad, bits de estado y stats, tal cual, a
+                // creer. Tres cosas se creian que no se pueden creer:
+                //
+                //   · `stats.speed` — que es EL NUMERO CON EL QUE SE LE JUZGA. S1 comprueba
+                //     `maxDist = maxSpeed * dt + 1 m` contra el ultimo valor recibido, o sea que el
+                //     anti-trampas le preguntaba al sospechoso cual era el limite de velocidad. Un
+                //     cliente con `maxSpeed = 1e9` no era rechazado jamas.
+                //   · `type` — un jugador podia declararse ENT_ITEM y dejar de ser tratado como quien
+                //     se mueve.
+                //   · `state` — y con el `STATE_WORLD_OWNED`, el bit que EXIME del recolector de
+                //     leases. Un cliente podia sembrar el mundo de objetos que no caducan nunca.
+                //
+                // Quien entro por aqui ES un jugador, y el techo de velocidad es del SERVIDOR. Lo que
+                // el juego tenga de suyo —vida, dano, lo que sea, que cambia de un juego a otro y no
+                // tiene por que parecerse a `Stats`— viaja en `data`, que es opaco a proposito y que
+                // este nodo no interpreta.
+                e.type  = DGS::ENT_PLAYER;
+                e.state = (DGS::EntityState)(e.state & ~DGS::STATE_WORLD_OWNED);
+                e.stats.speed[0] = e.stats.speed[1] = e.stats.speed[2] = CLIENT_MAX_SPEED_MPS;
 
                 // ---- P7 (§3.7): the zone applies what the social node decides (it NEVER decides).
                 // A banned account → ENTRY is blocked (the client keeps sending positions, but the zone
@@ -969,13 +1332,22 @@ int main()
                 }
 
                 // ALWAYS update the baseline (fail-open included) with the last accepted state.
-                lastPosition[e.uuid] = {
-                    e.chunkX * csX + e.pos[0],
-                    e.chunkY * csY + e.pos[1],
-                    e.chunkZ * csZ + e.pos[2],
-                    e.stats.speed[0],
-                    now
-                };
+                //
+                // ⚠️ SIN CONSERVAR EL PRESUPUESTO, ESTA LINEA DESHACIA EL ARREGLO DE S1. Asignar la
+                // struct entera pone `budgetM` a su valor por defecto, o sea a CERO, en cada paquete
+                // aceptado — y el cubo que se llena con el tiempo real se vaciaba antes de servir para
+                // nada. Medido: el mismo 12 contra 6 que antes del arreglo, con el arreglo puesto.
+                {
+                    const float keepBudget = lastPosition.count(e.uuid) ? lastPosition[e.uuid].budgetM : 0.0f;
+                    lastPosition[e.uuid] = {
+                        e.chunkX * csX + e.pos[0],
+                        e.chunkY * csY + e.pos[1],
+                        e.chunkZ * csZ + e.pos[2],
+                        e.stats.speed[0],
+                        now,
+                        keepBudget
+                    };
+                }
 
                 // Update or add the entity (§3.9: while DRAINING we stop claiming entities — the
                 // orchestrator's topology already routes them to the survivor).
@@ -984,7 +1356,40 @@ int main()
                     bool found = false;
                     for (auto& existing : entities)
                     {
-                        if (existing.uuid == e.uuid) { existing = e; found = true; break; }
+                        if (existing.uuid == e.uuid)
+                        {
+                            // ⚠️ `existing = e` USED TO WIPE THE ENTITY'S PAYLOAD TWENTY TIMES A SECOND.
+                            // Every update replaced the whole struct, and an ordinary movement update
+                            // carries `dataSize = 0` — that is the entire point of `dataSize`, the 67x
+                            // saving this system's capacity rests on: a player who is only moving does
+                            // not re-send four kilobytes of inventory. So the blob survived exactly one
+                            // tick. Measured: a client sent a 64-byte inventory, the zone broadcast
+                            // `dataSize = 64`, and one second of ordinary transforms later it broadcast
+                            // **0**.
+                            //
+                            // `dataSize == 0` means "I have nothing new to say about my payload", not
+                            // "my payload is empty". Everything else in the update still replaces what
+                            // was there — position, stats, state — because that IS what those packets
+                            // are for.
+                            //
+                            // ⚠️ AND THERE IS NO WAY TO CLEAR A PAYLOAD. With this reading a client
+                            // cannot send an empty one on purpose; it would need a signal of its own.
+                            // Nothing needs that today, and inventing one nobody uses would be worse
+                            // than writing down that it is missing.
+                            const uint16_t keepSize = e.dataSize == 0 ? existing.dataSize : 0;
+                            uint8_t keep[DGS::MAX_ENTITY_DATA];
+                            if (keepSize) std::memcpy(keep, existing.data, keepSize);
+
+                            existing = e;
+
+                            if (keepSize)
+                            {
+                                existing.dataSize = keepSize;
+                                std::memcpy(existing.data, keep, keepSize);
+                            }
+                            found = true;
+                            break;
+                        }
                     }
                     if (!found) entities.push_back(e);
 
@@ -1009,16 +1414,45 @@ int main()
                 ackP.setBuffer(ackBuf, av);
                 if (ackP.getType() == DGS::PKT_VALIDATE_ACK)
                 {
-                    auto ack = ackP.unpackValidateAck();
-                    auto it = pendingValid.find(ack.requestId);
+                    auto ack_ = ackP.unpackValidateAck();
+                    auto it = pendingValid.find(ack_.requestId);
                     if (it != pendingValid.end())
                     {
                         uint32_t uuid = it->second.entity.uuid;
+                        const bool     it2Apply  = it->second.applyOnAccept;
+                        const uint16_t it2Action = it->second.pendingAction;
+                        const uint32_t it2Actor  = it->second.actor;
+                        const uint32_t it2ReqId  = it->second.clientReqId;
+                        const DGS::EntityTransfer appliedEntity = it->second.entity;
                         pendingValid.erase(it);
-                        if (ack.verdict == 0)
+
+                        // ⚠️ CONTESTARLE. Una peticion sin respuesta no es una peticion: el cliente
+                        // pedia colocar o tirar algo, lo ponia ya en su pantalla —prediccion optimista,
+                        // que es lo correcto para que se sienta inmediato— y NUNCA se enteraba de si
+                        // habia ocurrido. Si el servidor decia que no, el objeto se quedaba en su
+                        // mundo y en el de nadie mas. Dos mundos distintos y ni un mensaje.
+                        if (it2Apply)
+                        {
+                            auto cli = clientMap.find(it2Actor);
+                            if (cli != clientMap.end())
+                            {
+                                DGS::ActionAck ack{};
+                                ack.requestId = it2ReqId;
+                                ack.action    = it2Action;
+                                ack.accepted  = (ack_.verdict == 0) ? 0 : 1;
+                                ack.uuid      = (ack_.verdict == 0) ? 0u : appliedEntity.uuid;
+                                DGS::Packet pAck; pAck.pack(ack);
+                                std::vector<uint8_t> sealedAck;
+                                DGS::sealForUdp(pAck.getRawData(), pAck.getSize(), sealedAck);
+                                udp_zone_node.sendRaw(cli->second.first, cli->second.second,
+                                                      sealedAck.data(), sealedAck.size());
+                                g_bytesTx += DGS::udpWireSize(pAck.getSize());
+                            }
+                        }
+                        if (ack_.verdict == 0)
                         {
                             std::cout << "[ZoneNode] VALIDATOR: VIOLATION uuid=" << uuid
-                                      << " weight=" << ack.weight << std::endl;
+                                      << " weight=" << ack_.weight << std::endl;
                             statViolations++;
                             // Evict from the local registry
                             for (auto ite = entities.begin(); ite != entities.end();)
@@ -1028,6 +1462,37 @@ int main()
                         }
                         else
                         {
+                            // Una accion pendiente: AHORA existe, y no antes.
+                            if (it2Apply)
+                            {
+                                if (it2Action == DGS::ACTION_REMOVE)
+                                {
+                                    for (auto ie = entities.begin(); ie != entities.end();)
+                                        if (ie->uuid == appliedEntity.uuid) ie = entities.erase(ie);
+                                        else ++ie;
+                                    lastPosition.erase(appliedEntity.uuid);
+                                    std::cout << "[ZoneNode] ACCION ACEPTADA: destruido uuid="
+                                              << appliedEntity.uuid << std::endl;
+                                }
+                                else
+                                {
+                                    // PLACE crea; MOVE reemplaza al que ya estaba por la version
+                                    // movida. Los dos acaban igual: la entidad que el validador
+                                    // aprobo, y ninguna otra.
+                                    bool replaced = false;
+                                    for (auto& ie : entities)
+                                        if (ie.uuid == appliedEntity.uuid) { ie = appliedEntity; replaced = true; break; }
+                                    if (!replaced) entities.push_back(appliedEntity);
+                                    // Un lease normal, no `now + 0`. El bit es lo que lo mantiene
+                                    // vivo y lo que lo hace persistible; el lease solo tiene que no
+                                    // nacer caducado, o toda comprobacion de propiedad dice que no.
+                                    entityOwnedUntil[appliedEntity.uuid] = nowMs() + (uint64_t)std::atoi(
+                                        std::getenv("ENTITY_LEASE_MS") ? std::getenv("ENTITY_LEASE_MS") : "3000");
+                                    std::cout << "[ZoneNode] ACCION ACEPTADA: "
+                                              << (replaced ? "movido" : "creado") << " uuid="
+                                              << appliedEntity.uuid << std::endl;
+                                }
+                            }
                             // Good verdict → close the breaker.
                             // ⚠️ AND RESET THE TRIP COUNTER. Without this `cbOpenCount` only ever grew:
                             // 3 timeouts across the whole life of the process were enough to exhaust it
@@ -1219,6 +1684,68 @@ int main()
 
                         ghostEntities[ghost.uuid] = ghost;
                         ghostLastSeen[ghost.uuid] = nowMs();
+                        break;
+                    }
+                    case DGS::PKT_COMMAND:
+                    {
+                        // ⚠️ THIS HANDLER DID NOT EXIST, AND WITHOUT IT THE SPLIT WAS A NO-OP.
+                        // `trySplitDown` spawns a child owning [midHigh..xMax] and sends the parent
+                        // `CMD_TRANSFER_SERVER` with the new xMax. Nothing here read it: `xMax` was
+                        // `const`, taken from the environment at boot. And the head does not remember
+                        // the cut either — `updateNodeTopology` overwrites its record of the box with
+                        // whatever the zone reports in PKT_METRICS, which was the unchanged one.
+                        //
+                        // So parent [0..100] and child [51..100] both claimed 51..100 forever, and
+                        // `findTargetNode` returns the FIRST match by insertion order — the parent,
+                        // registered first. The child received nothing at all. The cluster could scale
+                        // up on paper and route exactly as if it had not.
+                        //
+                        // `orchestrator_test` did not catch it because it forces DGS_ZONE_BIN=/bin/true
+                        // and asserts that the resize LEAVES over the socket, not that anyone obeys it.
+                        //
+                        // Shrinking is enough to fix it: everything else already follows. The entities
+                        // now outside the box are handed off by `checkAndTransfer` on the next tick
+                        // (which is what makes the split actually move players), the ghost border moves
+                        // with `isNearBorder`, and the head learns the new box from the very next
+                        // PKT_METRICS because that is where it reads it from.
+                        auto cmd = pRecv.unpackCommand();
+                        if (cmd.purpose != DGS::CMD_TRANSFER_SERVER) break;
+
+                        // WHICH bound is being cut. A split used to be able to cut on X and nothing
+                        // else, so a zone could only ever become a thinner slab and a crowd standing
+                        // in one place could not be divided however many nodes were thrown at it.
+                        const char  name   = (cmd.resizeAxis == DGS::AXIS_Y) ? 'Y'
+                                           : (cmd.resizeAxis == DGS::AXIS_Z) ? 'Z' : 'X';
+                        int32_t&    bound  = (cmd.resizeAxis == DGS::AXIS_Y) ? yMax
+                                           : (cmd.resizeAxis == DGS::AXIS_Z) ? zMax : xMax;
+                        int32_t&    low    = (cmd.resizeAxis == DGS::AXIS_Y) ? yMin
+                                           : (cmd.resizeAxis == DGS::AXIS_Z) ? zMin : xMin;
+                        const int32_t newMax = cmd.chunkX;   // rango nuevo EN ESE EJE
+                        const int32_t newMin = cmd.chunkY;
+
+                        // ⚠️ ANTES ESTO SOLO DEJABA ENCOGER, Y ASI LA FUSION ERA IMPOSIBLE. La regla
+                        // era "un resize solo puede encoger", puesta como defensa contra que dos zonas
+                        // reclamaran los mismos chunks. Pero un superviviente que se queda la region
+                        // de otro tiene que CRECER, y sin poder hacerlo el mundo de la victima se
+                        // quedaba sin dueno: medido, `findTargetNode` devolvia -1 cien milisegundos
+                        // despues de fusionar, porque el head reescribe su copia de la caja con la que
+                        // reporta la zona y la zona seguia con la suya.
+                        //
+                        // Quien decide las cajas es el HEAD: es el unico que ve la topologia entera, y
+                        // es el que ahora se niega a fusionar dos cajas cuya union no sea un rectangulo
+                        // (ver `mergeableAxis`). Aqui solo se rechaza lo que no tiene sentido en si
+                        // mismo, un rango invertido.
+                        if (newMin > newMax)
+                        {
+                            std::cout << "[ZoneNode] RESIZE " << name << "[" << newMin << ".." << newMax
+                                      << "] RECHAZADO: rango invertido" << std::endl;
+                            break;
+                        }
+
+                        std::cout << "[ZoneNode] RESIZE: " << name << " [" << low << ".." << bound
+                                  << "] -> [" << newMin << ".." << newMax << "]" << std::endl;
+                        low   = newMin;
+                        bound = newMax;
                         break;
                     }
                     case DGS::PKT_REASSIGN:
@@ -1419,8 +1946,23 @@ int main()
                     {
                         // Only what we OWN. Writing a ghost would mean persisting a neighbour's
                         // entity from our stale projection of it — two writers for one state.
-                        auto ownIt = entityOwnedUntil.find(e.uuid);
-                        if (ownIt == entityOwnedUntil.end() || now >= ownIt->second) continue;
+                        //
+                        // ⚠️ SALVO LOS OBJETOS DEL MUNDO, y sin esta linea no se guardaba ni uno. Un
+                        // jugador demuestra que es suyo reportandose; una piedra tirada no reporta
+                        // nada — para eso existe `STATE_WORLD_OWNED`. Pero el GC lo exime por el BIT y
+                        // este escritor decidia por el LEASE, asi que las dos mitades del sistema
+                        // discrepaban sobre quien es el dueno de una piedra: el recolector la dejaba
+                        // vivir y la persistencia la ignoraba. Resultado exacto de "puse algo y
+                        // manana no estaba", pero por dentro: nunca llego a la base de datos.
+                        //
+                        // La regla es UNA: si lleva el bit, la posee la zona que cubre su chunk. Aqui
+                        // y en el GC, o vuelven a discrepar.
+                        const bool worldOwned = (e.state & DGS::STATE_WORLD_OWNED) != 0;
+                        if (!worldOwned)
+                        {
+                            auto ownIt = entityOwnedUntil.find(e.uuid);
+                            if (ownIt == entityOwnedUntil.end() || now >= ownIt->second) continue;
+                        }
 
                         DGS::Packet p; p.pack(e);
                         if (!tcp_persistence.send(tcp_persistence.getSocketFD(),
@@ -1448,6 +1990,17 @@ int main()
             {
                 if (now - it->second > lease)
                 {
+                    // ⚠️ A CRATE IS NOT A PLAYER WHO LEFT. The lease exists so a disconnected client
+                    // stops being served; applied to everything it also means the world cannot contain
+                    // an object, because nothing reports a crate on the ground. `STATE_WORLD_OWNED`
+                    // says "the world vouches for this one" and the GC leaves it alone — measured
+                    // before this existed: three items placed once were gone 3 s later, restore or no
+                    // restore.
+                    bool worldOwned = false;
+                    for (const auto& ent : entities)
+                        if (ent.uuid == it->first) { worldOwned = (ent.state & DGS::STATE_WORLD_OWNED) != 0; break; }
+                    if (worldOwned) { ++it; continue; }
+
                     entityOwnedUntil.erase(it->first);
                     lastPosition.erase(it->first);
                     lastSnapshot.erase(it->first);
@@ -1495,11 +2048,29 @@ int main()
                          xMin, xMax, yMin, yMax, zMin, zMax);
         emitGhostDeltas(tcp_zone_node, entities, lastSnapshot, xMin, xMax, yMin, yMax, zMin, zMax, threshold);
 
+        // ⚠️ CADA CUANTO SE SIMULA Y CADA CUANTO SE ENVIA SON DOS DECISIONES, Y ESTABAN PEGADAS.
+        // La difusion vivia DENTRO del tick, asi que subir la simulacion de 10 a 60 Hz multiplico por
+        // seis el trafico hacia todos los clientes sin que nadie lo pidiera — y el ancho de banda es
+        // justo el recurso escaso aqui, no la CPU (el tick cuesta 0,095 ms). Mas Hz debe decidir lo
+        // FLUIDA que va la simulacion; cuantos datos salen por el cable es otro mando.
+        //
+        // El defecto son los 100 ms de siempre: separar los dos relojes no debe cambiar por su cuenta
+        // lo que sale por el cable, o el cambio deja de ser un refactor y se convierte en una decision
+        // de producto tomada de tapadillo. Subirlo es lo UNICO que hace que un vecino se mueva fluido
+        // sin suavizar en el cliente, y cuesta ancho de banda lineal: es una decision, no un defecto.
+        // `ZONE_BROADCAST_MS` = 0 lo devuelve a "cada tick".
+        static uint64_t lastBroadcastMs = 0;
+        const uint64_t  bcastEveryMs = (uint64_t)std::atoi(
+            std::getenv("ZONE_BROADCAST_MS") ? std::getenv("ZONE_BROADCAST_MS") : "100");
+        const bool toca = (bcastEveryMs == 0) || (nowMs() - lastBroadcastMs >= bcastEveryMs);
+        if (toca) lastBroadcastMs = nowMs();
+
         // Broadcast to every connected client, from ONE serialisation of the snapshot, and to each
         // one only what is near them.
         const BroadcastFrames snapshot = buildBroadcast(entities, ghostEntities, csX, csY, csZ);
         for (const auto& [uuid, endpoint] : clientMap)
         {
+            if (!toca) break;
             // The recipient's own position is the centre of its interest. Until we have one — the
             // very first tick after it appears — it is sent everything, because guessing where
             // somebody is in order to decide what they may see is worse than a moment of extra data.
@@ -1524,8 +2095,15 @@ int main()
                     it = observers.erase(it);
                     continue;
                 }
-                broadcastToClient(udp_zone_node, it->second.endpoint.first,
-                                  it->second.endpoint.second, snapshot);
+                // ⚠️ Y AL MISMO RITMO QUE LOS JUGADORES. Esto se quedo fuera del mando de difusion, asi
+                // que un visor recibia CADA TICK mientras los clientes recibian cada 100 ms: a 60 Hz,
+                // seis veces mas datagramas de los que nadie le habia pedido. Ademas de contradecir lo
+                // que dice el parrafo de arriba, ahogaba a quien mirase — medido con el banco, que se
+                // quedaba colgado drenando un socket que se llenaba mas rapido de lo que lo vaciaba.
+                // La caducidad del lease se sigue mirando cada tick: eso es barato y es correccion.
+                if (toca)
+                    broadcastToClient(udp_zone_node, it->second.endpoint.first,
+                                      it->second.endpoint.second, snapshot);
                 ++it;
             }
         }
@@ -1537,6 +2115,36 @@ int main()
         metrics.node.chunkZMin = zMin; metrics.node.chunkZMax = zMax;
         std::strncpy(metrics.node.addr, zoneAddr, sizeof(metrics.node.addr) - 1);
         metrics.node.port = udpPort;
+
+        // WHERE the load is, one coarse histogram per axis over this zone's own box. The orchestrator
+        // has never had this: it knew the box and one entity COUNT, so a split could only cut the box
+        // down the middle — and a crowd standing in chunk 3 of a 0..100 zone got a cut at 50 that left
+        // them all on one side. See ServerMetrics for what it deliberately does not capture.
+        //
+        // Bucketing is over the CURRENT box, which the same packet carries, so the head can invert it
+        // without agreeing on anything else. A box of one chunk collapses to bucket 0, which is right:
+        // there is nothing to divide.
+        {
+            auto bucket = [](int32_t v, int32_t lo, int32_t hi) -> uint32_t {
+                const int64_t span = (int64_t)hi - (int64_t)lo + 1;
+                if (span <= 1) return 0;
+                int64_t b = ((int64_t)v - (int64_t)lo) * (int64_t)DGS::MAX_SPLIT_BUCKETS / span;
+                if (b < 0) b = 0;
+                if (b >= (int64_t)DGS::MAX_SPLIT_BUCKETS) b = DGS::MAX_SPLIT_BUCKETS - 1;
+                return (uint32_t)b;
+            };
+            for (const auto& e : entities)
+            {
+                // Saturating: a bucket with more than 65535 entities in it is already far past
+                // anything a zone can serve, and wrapping would point the cut at the wrong place.
+                uint16_t& bx = metrics.popX[bucket(e.chunkX, xMin, xMax)];
+                uint16_t& by = metrics.popY[bucket(e.chunkY, yMin, yMax)];
+                uint16_t& bz = metrics.popZ[bucket(e.chunkZ, zMin, zMax)];
+                if (bx < 0xFFFF) ++bx;
+                if (by < 0xFFFF) ++by;
+                if (bz < 0xFFFF) ++bz;
+            }
+        }
         metrics.startTimeS      = (uint64_t)std::time(nullptr);
         metrics.bytesRx         = g_bytesRx;
         metrics.bytesTx         = g_bytesTx;
@@ -1563,24 +2171,47 @@ int main()
         auto end = std::chrono::high_resolution_clock::now();
         metrics.performance = std::chrono::duration<float, std::milli>(end - start).count();
 
-        DGS::Packet p;
-        p.pack(metrics);
-        g_bytesTx += p.getSize();
-        if (!tcp_zone_node.send(tcp_zone_node.getSocketFD(), p.getRawData(), p.getSize()))
+        // ⚠️ LA TELEMETRIA NO VA AL RITMO DE LA SIMULACION. Esto se enviaba UNA VEZ POR TICK, asi que
+        // subir el tick de 10 a 60 Hz habria multiplicado por seis el trafico hacia el head y el
+        // tamaño de sus logs sin decir nada nuevo: el orquestador decide con medias moviles sobre
+        // decenas de segundos, y 10 muestras por segundo ya son mas de las que mira. Cada cuanto se
+        // MIDE y cada cuanto se SIMULA son preguntas distintas.
         {
-            std::cerr << "[ZoneNode] Connection with HeadServer lost. Reconnecting..." << std::endl;
-            connectToHead();
+            static uint64_t lastMetricsMs = 0;
+            const uint64_t everyMs = (uint64_t)std::atoi(
+                std::getenv("ZONE_METRICS_MS") ? std::getenv("ZONE_METRICS_MS") : "100");
+            if (nowMs() - lastMetricsMs >= everyMs)
+            {
+                lastMetricsMs = nowMs();
+                DGS::Packet p;
+                p.pack(metrics);
+                g_bytesTx += p.getSize();
+                if (!tcp_zone_node.send(tcp_zone_node.getSocketFD(), p.getRawData(), p.getSize()))
+                {
+                    std::cerr << "[ZoneNode] Connection with HeadServer lost. Reconnecting..." << std::endl;
+                    connectToHead();
+                }
+            }
         }
 
-        // A FIXED PERIOD, not a fixed pause. `usleep(100000)` slept 100 ms ON TOP of everything the tick
-        // had already spent, so the period was always longer than the 100 ms the design assumes — and
-        // grew with load. Sleeping only the remainder makes the tick a real 10 Hz, and when the work
+        // A FIXED PERIOD, not a fixed pause. `usleep()` slept the whole budget ON TOP of everything the
+        // tick had already spent, so the period was always longer than the design assumes — and grew
+        // with load. Sleeping only the remainder makes the tick a real rate, and when the work
         // genuinely overruns the budget it now shows up as a rate drop instead of silently stretching.
+        //
+        // ⚠️ 60 Hz, NO 10. El periodo era de 100 ms "por diseño", y el diseño no lo sostenia ninguna
+        // medida: el tick cuesta 0,095 ms de MEDIANA y 0,17 en el p99 — el 0,1 % del presupuesto que
+        // tenia. Lo que costaba esa decision se veia en la pantalla del jugador: la posicion de un
+        // vecino llegaba diez veces por segundo, asi que alguien andando a 5 m/s daba zancadas de
+        // medio metro, y eso se lee como latencia del servidor aunque el servidor conteste en 2 ms.
+        // A 16,6 ms el mismo trabajo ocupa el 0,6 % y la posicion llega seis veces mas a menudo.
+        // Lo que sube seis veces es el ancho de banda de difusion, no la CPU; el radio de interes es
+        // lo que acota eso, no el reloj.
         {
             const int64_t spentUs = std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - tickStart).count();
             const int64_t budgetUs = (int64_t)std::atoi(
-                std::getenv("ZONE_TICK_US") ? std::getenv("ZONE_TICK_US") : "100000");
+                std::getenv("ZONE_TICK_US") ? std::getenv("ZONE_TICK_US") : "16666");
             if (spentUs < budgetUs) usleep((useconds_t)(budgetUs - spentUs));
         }
     }

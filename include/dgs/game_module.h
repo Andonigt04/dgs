@@ -59,6 +59,8 @@ namespace DGS
         ACT_TRANSFER = 3,   // move an item between inventories (what/structure = opaque, after the header)
         ACT_INTERACT = 4,   // generic use/activation
         ACT_PLACE    = 5,   // PLACE a building piece (payload: PlaceAction, see below)
+        ACT_MOVE     = 6,   // MOVE an existing world object (drag a table — NOT walking)
+        ACT_DROP     = 7,   // an item LEAVES an inventory and becomes a world object
         ACT__COUNT
     };
 

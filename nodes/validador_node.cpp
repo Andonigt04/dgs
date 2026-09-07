@@ -253,8 +253,26 @@ int main()
     if (!tcpSocket.listen(tcpPort))         { std::cerr << "[Validator] TCP error on port "  << tcpPort  << std::endl; return 1; }
     if (!headServer.connect(headHost, headPort))  { std::cerr << "[Validator] Failed to connect to HeadServer" << std::endl; return 1; }
     DGS::sendAuth(headServer);
-    if (!persistence.connect(persHost, persPort)) { std::cerr << "[Validator] Failed to connect to Persistence" << std::endl; return 1; }
-    DGS::sendAuth(persistence);
+    // ⚠️ THIS USED TO BE `return 1`, AND IT KILLED THE NODE OVER SOMEBODY ELSE'S START-UP ORDER.
+    // A validator whose persistence node is not up YET would exit — and in a cluster nothing
+    // guarantees an order: Kubernetes starts pods as it pleases, `docker compose up` starts them all at
+    // once, and `tools/demo_cluster.sh` reproduced it every single time (persistence needs a moment to
+    // reach Mongo, the validator gave up in that window and died, leaving the whole demo with no
+    // anti-cheat and a log two lines long).
+    //
+    // The rule the rest of this system already follows is written down in `zone_node`: a node must
+    // start, and keep working, whether or not there is a database. Persistence is where a validator
+    // FORWARDS accepted state; losing it costs durability, not validation, and validation is what this
+    // process is for. It is the same shape as the bug the note below records — a node refusing to
+    // start over something optional — one line above it.
+    //
+    // ⚠️ WHAT IS NOT DONE: there is no reconnection. If persistence appears later this node will not
+    // notice, and forwarding stays off until it is restarted. Saying so because "it survives" reads
+    // like "it recovers", and it does not.
+    bool persistenceUp = persistence.connect(persHost, persPort);
+    if (persistenceUp) DGS::sendAuth(persistence);
+    else std::cerr << "[Validator] Persistence unavailable at " << persHost << ":" << persPort
+                   << " -> validating anyway, accepted state is NOT forwarded" << std::endl;
 
     // ⚠️ THIS NODE USED TO REFUSE TO START. It did a BLOCKING read here for an initial `Command` and
     // `return 1` if it did not arrive — and the head does not send one to an ordinary connection. The
@@ -467,7 +485,15 @@ int main()
                     e.stats.speed[0]
                 };
 
-                persistence.send(persistence.getSocketFD(), p.getRawData(), p.getSize());
+                if (persistenceUp &&
+                    !persistence.send(persistence.getSocketFD(), p.getRawData(), p.getSize()))
+                {
+                    // It was there and now it is not: say it ONCE and stop trying, rather than a line
+                    // per accepted entity for the rest of the process's life.
+                    persistenceUp = false;
+                    std::cerr << "[Validator] persistence link lost -> accepted state is no longer "
+                                 "forwarded" << std::endl;
+                }
             }
         }
     }

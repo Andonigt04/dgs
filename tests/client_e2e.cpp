@@ -52,6 +52,7 @@ static const int kApiPort   = 21601;
 static const int kHeadPort  = 21602;
 static const int kZoneAPort = 21603;   // the zone the first query points at
 static const int kZoneBPort = 21604;   // the zone the second query points at
+static const int kSocialPort = 21605;  // chat lives here now, NOT on the head
 
 static std::atomic<bool> g_done{false};
 
@@ -61,11 +62,44 @@ static std::atomic<int>  g_loginCalls{0};
 
 // ── Fake head ───────────────────────────────────────────────────────────────────────────────────
 static std::atomic<int>  g_zoneQueries{0};     // how many ZoneQuery packets reached the head
-static std::atomic<int>  g_chatsAtHead{0};
+static std::atomic<int>  g_chatsAtHead{0};     // must stay 0: chat left the head
+static std::atomic<int>  g_chatsAtSocial{0};
+static std::atomic<int>  g_socialFd{-1};
 static std::atomic<int>  g_answerPort{kZoneAPort};   // which zone the head points the client at
 static std::atomic<int>  g_headFd{-1};         // so the test can push packets down to the client
 
 static DGS::TCPSocket g_wire;                  // only for send/receive over an arbitrary fd
+
+/// A stand-in for `social_node`: accepts one connection, counts the chat it is sent, and can push one
+/// back. Chat used to go to the head, which fanned it out to EVERY connection it held — measured at 96
+/// chatters taking a zone query from 0.07 ms to 43.6 ms with the head at 11% of one core. That is what
+/// this port exists to keep off the orchestrator.
+static void fakeSocial(std::atomic<bool>& ready)
+{
+    DGS::TCPSocket s;
+    if (!s.listen(kSocialPort)) { ready = true; return; }
+    { timeval tv{}; tv.tv_usec = 200000;
+      setsockopt(s.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+    ready = true;
+    while (!g_done)
+    {
+        const int fd = s.accept();
+        if (fd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
+        g_socialFd = fd;
+        { timeval tv{}; tv.tv_usec = 200000; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+        uint8_t buf[8192];
+        while (!g_done)
+        {
+            const int n = s.receive(fd, buf, sizeof(buf));
+            if (n == 0) break;
+            if (n < 0)  continue;
+            DGS::Packet p; p.setBuffer(buf, (size_t)n);
+            if (p.getType() == DGS::PKT_CHAT) ++g_chatsAtSocial;
+        }
+        s.closeClient(fd);
+        g_socialFd = -1;
+    }
+}
 
 static void fakeHead(std::atomic<bool>& ready)
 {
@@ -172,6 +206,11 @@ int main()
     std::thread tHead(fakeHead, std::ref(h));
     std::thread tZa(fakeZone, kZoneAPort, &g_zoneA, std::ref(za), &g_zoneABound);
     std::thread tZb(fakeZone, kZoneBPort, &g_zoneB, std::ref(zb), &g_zoneBBound);
+    std::atomic<bool> so{false};
+    std::thread tSo(fakeSocial, std::ref(so));
+    while (!so) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    setenv("SOCIAL_HOST", "127.0.0.1", 1);
+    setenv("SOCIAL_TCP_PORT", std::to_string(kSocialPort).c_str(), 1);
     while (!h || !za || !zb) std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     check(api.is_running(), "the fake login API is up");
@@ -211,7 +250,7 @@ int main()
         const float pos[3] = { 1.0f, 2.0f, 3.0f };
         const float idRot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   // identity: yaw = 0
 
-        c.sendTransform(7001, 0, 0, 0, pos, idRot);
+        c.sendState(7001, 0, 0, 0, pos, idRot);
         check(waitFor(g_zoneA.count, 1, 2000),
               "its position lands on the zone the head named (not anywhere else)");
         check(g_zoneA.lastUuid.load() == 7001, "carrying the right uuid");
@@ -220,25 +259,49 @@ int main()
         // ── (3) The query is cached per chunk ────────────────────────────────────────────────
         // Re-querying on every frame would turn a movement update into a round trip to the head.
         const int queriesAfterFirst = g_zoneQueries.load();
-        for (int i = 0; i < 20; ++i) c.sendTransform(7001, 0, 0, 0, pos, idRot);
+        for (int i = 0; i < 20; ++i) c.sendState(7001, 0, 0, 0, pos, idRot);
         check(waitFor(g_zoneA.count, 21, 3000), "21 updates in the same chunk all arrive");
         check(g_zoneQueries.load() == queriesAfterFirst,
               "and NONE of them re-queries the head (the zone is cached per chunk)");
 
-        // ── (4) Crossing a border re-queries — and the traffic MOVES ─────────────────────────
+        // ── (4) Crossing a border: ANNOUNCE, then re-query, and the traffic MOVES ────────────
+        // ⚠️ THE ORDER CHANGED, AND THIS TEST USED TO PIN THE WRONG ONE. It asserted that the client
+        // re-queries the head the instant its chunk changes — which it did, and which is exactly why
+        // the authority handoff was unreachable code: the zone that OWNED the player never heard they
+        // had left, because the very next datagram went to somebody else. Only the owner can start a
+        // handoff (`checkAndTransfer`), so the entity was not ceded, it was quietly GC'd, and no
+        // server-side state moved with it. See `client_handoff_e2e`, which measures that end to end.
+        //
+        // So the client now ANNOUNCES first: it keeps reporting to the zone it is leaving, carrying the
+        // NEW chunk, for `ZONE_ANNOUNCE_MS`, and only then asks the head. Both halves are pinned below,
+        // because "it announces" without "it eventually moves" would be a client stuck in the past.
+        g_answerPort = kZoneBPort;
+        const int aBeforeCross = g_zoneA.count.load();
+        c.sendState(7001, 5, 0, 0, pos, idRot);
+        check(waitFor(g_zoneA.count, aBeforeCross + 1, 2000),
+              "crossing a border first TELLS THE ZONE BEING LEFT (that is what starts the handoff)");
+        check(g_zoneA.lastChunkX.load() == 5,
+              "and what it tells it is the NEW chunk (which is what puts the entity out of bounds)");
+        check(g_zoneQueries.load() == queriesAfterFirst,
+              "and it has NOT asked the head yet: authority moves when the servers agree, not before");
+
+        // Now let the announcement window run out. The client keeps sending, as a game loop does.
+        for (int i = 0; i < 12 && g_zoneQueries.load() == queriesAfterFirst; ++i) {
+            c.sendState(7001, 5, 0, 0, pos, idRot);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        check(waitFor(g_zoneQueries, queriesAfterFirst + 1, 3000),
+              "and once the announcement is done it DOES re-query the head");
         // Counting queries is not enough: a client that asked and ignored the answer would pass. The
         // observable that matters is which socket the next datagram lands on.
-        g_answerPort = kZoneBPort;
-        c.sendTransform(7001, 5, 0, 0, pos, idRot);
-        check(waitFor(g_zoneQueries, queriesAfterFirst + 1, 3000),
-              "moving to another chunk DOES re-query the head");
         check(waitFor(g_zoneB.count, 1, 3000),
               "and the update goes to the NEW zone (the answer is used, not just requested)");
         check(g_zoneB.lastChunkX.load() == 5, "with the new chunk in it");
 
         const int aBefore = g_zoneA.count.load();
-        c.sendTransform(7001, 5, 0, 0, pos, idRot);
-        check(waitFor(g_zoneB.count, 2, 2000) && g_zoneA.count.load() == aBefore,
+        const int bBefore = g_zoneB.count.load();
+        c.sendState(7001, 5, 0, 0, pos, idRot);
+        check(waitFor(g_zoneB.count, bBefore + 1, 2000) && g_zoneA.count.load() == aBefore,
               "and it stays there: the old zone stops receiving");
 
         // ── (5) The yaw encoding is a real encoding ──────────────────────────────────────────
@@ -251,30 +314,42 @@ int main()
 
         const float yaw90[4] = { 0.0f, 0.70710678f, 0.0f, 0.70710678f };   // +90 deg about Y
         const int b2 = g_zoneB.count.load();
-        c.sendTransform(7001, 5, 0, 0, pos, yaw90);
+        c.sendState(7001, 5, 0, 0, pos, yaw90);
         check(waitFor(g_zoneB.count, b2 + 1, 2000), "a rotated update arrives");
         check(g_zoneB.lastAngle.load() != angleIdentity,
               "and a different yaw encodes to a DIFFERENT angle (it is not a constant)");
 
-        // ── (6) Stats and inventory travel by the same route ─────────────────────────────────
-        const int b3 = g_zoneB.count.load();
-        DGS::Stats st{}; st.speed[0] = 12.5f; st.health = 80.0f;
-        c.sendStats(7001, st);
-        check(waitFor(g_zoneB.count, b3 + 1, 2000) &&
-              g_zoneB.lastSpeed.load() > 12.0f && g_zoneB.lastSpeed.load() < 13.0f,
-              "sendStats reaches the current zone with the stats intact");
-
+        // ── (6) EL PAYLOAD VIAJA CON EL ESTADO, y no por un canal propio ─────────────────────
+        // ⚠️ ESTA FASE PROBABA TRES LLAMADAS QUE YA NO EXISTEN. `sendTransform`, `sendStats` y
+        // `sendInventory` mandaban el MISMO paquete con un campo distinto relleno, y tenerlas
+        // separadas costaba que cada una tuviera que acordarse de lo que las otras habian dicho — de
+        // ahi salieron dos bugs: unos `Stats` en blanco que borraban la velocidad declarada, y una
+        // posicion a cero que teletransportaba al jugador al origen de su chunk.
+        //
+        // Ahora es una sola, y las stats del juego ya no viajan en `Stats` —que es la forma de UN
+        // juego metida en el protocolo— sino dentro del payload opaco, junto al inventario. Lo que se
+        // comprueba aqui es lo unico que el DGS promete de ese payload: que llega con su TAMANO, no
+        // los cuatro kilobytes enteros.
         const int b4 = g_zoneB.count.load();
         const uint8_t inv[] = { 1, 2, 3, 4, 5, 6, 7 };
-        c.sendInventory(7001, inv, sizeof(inv));
+        c.sendState(7001, 5, 0, 0, pos, idRot, inv, sizeof(inv));
         check(waitFor(g_zoneB.count, b4 + 1, 2000) && g_zoneB.lastDataSize.load() == sizeof(inv),
-              "sendInventory carries its opaque payload SIZE (dataSize, not the whole 4 KB)");
+              "el payload opaco viaja con el estado, y con su tamano (dataSize, no 4 KB)");
 
-        // ── (7) Chat goes over TCP to the head, not UDP to the zone ──────────────────────────
+        // ── (7) Chat goes to the SOCIAL node — not the head, not the zone ────────────────────
+        // ⚠️ THIS TEST USED TO PIN THE OPPOSITE, and it was green the whole time chat was costing the
+        // orchestrator its day job. The head's handler fanned every message out to every connection it
+        // held — players, and also every zone and validator, which dropped them — with no channel, no
+        // rate limit and no ban check, on the single thread that also routes authority handoffs.
+        // Measured on loopback: 96 chatters took a zone query from 0.07 ms to 43.6 ms while the head
+        // sat at 11% of one core. It was never CPU; it was head-of-line blocking, the answer arriving
+        // behind everyone else's conversation on the same stream.
         const int b5 = g_zoneB.count.load();
         c.sendChat(7001, "andoni", "hola");
-        check(waitFor(g_chatsAtHead, 1, 2000), "chat is sent to the head over TCP");
+        check(waitFor(g_chatsAtSocial, 1, 2000), "chat is sent to the SOCIAL node");
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        check(g_chatsAtHead.load() == 0,
+              "and NOT to the head (the orchestrator is out of the chat path)");
         check(g_zoneB.count.load() == b5, "and NOT to the zone over UDP (they are different planes)");
 
         // ── (8) The receive loop sorts what arrives, and polling DRAINS ──────────────────────
@@ -285,9 +360,11 @@ int main()
             DGS::Packet pe; pe.pack(e);
             g_wire.send(fd, pe.getRawData(), pe.getSize());
 
+            // The chat comes back on the SOCIAL link, which is where it lives now.
             DGS::ChatMessage cm{}; cm.uuid = 9; std::snprintf(cm.text, sizeof(cm.text), "eco");
             DGS::Packet pc; pc.pack(cm);
-            g_wire.send(fd, pc.getRawData(), pc.getSize());
+            const int sfd = g_socialFd.load();
+            if (sfd >= 0) g_wire.send(sfd, pc.getRawData(), pc.getSize());
 
             std::vector<DGS::EntityTransfer> ents;
             std::vector<DGS::ChatMessage>    chats;
@@ -299,7 +376,7 @@ int main()
             check(ents.size() == 1 && ents[0].uuid == 4242,
                   "an entity arriving from the head lands in pollEntities()");
             check(chats.size() == 1 && chats[0].uuid == 9,
-                  "and a chat lands in pollChats() (they are sorted, not lumped together)");
+                  "and a chat from the SOCIAL link lands in pollChats() (two sockets, one inbox)");
             check(c.pollEntities().empty() && c.pollChats().empty(),
                   "a second poll comes back EMPTY: polling drains, it does not replay");
         } else {
@@ -312,7 +389,8 @@ int main()
 
     g_done = true;
     api.stop();
-    tApi.join(); tHead.join(); tZa.join(); tZb.join();
+    tApi.join();
+    tSo.join(); tHead.join(); tZa.join(); tZb.join();
 
     std::printf("\n== client_e2e: %d OK · %d FAILED ==\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

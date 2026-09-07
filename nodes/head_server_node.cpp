@@ -57,6 +57,22 @@ int main()
     {
         auto q = p.unpackZoneQuery();
         DGS::ZoneResponse r = orchestrator.findZoneResponse(q.chunkX, q.chunkY, q.chunkZ);
+
+        // ⚠️ A MISS USED TO BE COMPLETELY SILENT. `findZoneResponse` returns a zeroed ZoneResponse
+        // when no zone covers the chunk, and this handler shipped it without a word — so a player
+        // standing in unserved space produced no log line, no counter, nothing. The client got
+        // addr="" port=0 and, for a long time, stored it and sent its position nowhere.
+        // The client now refuses an empty response; this is the other half, the server saying why.
+        if (r.port == 0 || r.addr[0] == '\0')
+        {
+            static uint64_t misses = 0;
+            ++misses;
+            std::cout << "[HeadServer] NO ZONE covers chunk=(" << q.chunkX << "," << q.chunkY
+                      << "," << q.chunkZ << ")  uuid=" << q.uuid
+                      << "  activeZones=" << orchestrator.activeZones.size()
+                      << "  misses=" << misses << std::endl;
+        }
+
         DGS::Packet resp;
         resp.pack(r);
         serverSocket.send(fd, resp.getRawData(), resp.getSize());
@@ -65,7 +81,15 @@ int main()
     dispatcher.registerHandler(DGS::PKT_METRICS, [&](int fd, DGS::Packet& p)
     {
         auto m = p.unpackServerMetrics();
-        std::cout << "[HeadServer] PKT_METRICS fd=" << fd << " zones=" << orchestrator.activeZones.size() << std::endl;
+        // The three numbers the SPLIT decision is actually made of. Without them a cluster that never
+        // scales (or scales constantly) gives you nothing to reason from — and `performance` in
+        // particular is the one whose units were wrong in the struct comment for a long time: it is the
+        // zone's TICK TIME IN MILLISECONDS against its 100 ms budget.
+        std::cout << "[HeadServer] PKT_METRICS fd=" << fd
+                  << " zones=" << orchestrator.activeZones.size()
+                  << " tick=" << m.performance << "ms"
+                  << " ram=" << m.ramUsage
+                  << " entities=" << m.activeEntities << std::endl;
         orchestrator.updateNodeTopology(fd, m);
         orchestrator.evaluateServer(m, fd);
 
@@ -79,12 +103,27 @@ int main()
         logger.log(entry);
     });
 
-    dispatcher.registerHandler(DGS::PKT_CHAT, [&](int fd, DGS::Packet& p)
-    {
-        for (int clientFD : nodeClients)
-            if (clientFD != fd)
-                serverSocket.send(clientFD, p.getRawData(), p.getSize());
-    });
+    // ⚠️ THE CHAT HANDLER THAT USED TO BE HERE COST THE ORCHESTRATOR ITS DAY JOB. It fanned every
+    // message out to EVERY connection this node holds — other players, and also every zone, validator
+    // and social node, which received a packet they do not handle and dropped it — with no channel, no
+    // rate limit, no ban check and no ordering. All of it on the single thread that also routes
+    // authority handoffs and answers "which zone covers my chunk?".
+    //
+    // And it did not need to saturate anything to hurt. Measured on loopback, a zone query — what a
+    // player does at every chunk border — against chat load on the same head:
+    //
+    //     chatters   msg/s    head CPU   query p50
+    //            0       0         ~0%     0.07 ms
+    //           48     963        3.3%     0.06 ms   (p95 already 5.1 ms)
+    //           96    1618       11.4%    43.60 ms
+    //
+    // A 600x degradation with the head at ELEVEN PER CENT of one core: it was never CPU, it was
+    // head-of-line blocking. The answer a player is waiting for arrives behind everyone else's
+    // conversation in the same TCP stream — the probe had to read 74 chat packets per query to find
+    // its own reply.
+    //
+    // Chat belongs to `social_node`, which already had the channels, the per-uuid rate limit, the ban
+    // list and the subscriber fan-out, and which nothing was using. The client talks to it directly.
 
     dispatcher.registerHandler(DGS::PKT_VALIDATOR_STATUS, [&](int fd, DGS::Packet& p)
     {

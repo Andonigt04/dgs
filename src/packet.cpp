@@ -83,12 +83,13 @@ namespace DGS
         write<float>(data.chunkSizeX);
         write<float>(data.chunkSizeY);
         write<float>(data.chunkSizeZ);
+        write<ResizeAxis>(data.resizeAxis);
     }
 
     Command Packet::unpackCommand()
     {
         readPos = 1;
-        Command data;
+        Command data{};
         data.purpose = read<HeadPurpose>();
         data.chunkX = read<int32_t>();
         data.chunkY = read<int32_t>();
@@ -102,7 +103,84 @@ namespace DGS
         data.chunkSizeY = read<float>();
         data.chunkSizeZ = read<float>();
 
+        // Appended after the fact, so it is read ONLY if it is there. `read<T>` throws on overflow and
+        // a zone must not die on a short Command from something older than this field.
+        data.resizeAxis = (readPos + sizeof(ResizeAxis) <= buffer.size()) ? read<ResizeAxis>() : AXIS_X;
+
         return data;
+    }
+
+    void Packet::pack(const ActionRequest& data)
+    {
+        clear();
+        write<PacketType>(PKT_ACTION);
+        write<uint32_t>(data.requestId);
+        write<uint32_t>(data.actor);
+        write<uint16_t>(data.action);
+        write<uint32_t>(data.target);
+        write<int32_t>(data.chunkX);
+        write<int32_t>(data.chunkY);
+        write<int32_t>(data.chunkZ);
+        write<float>(data.pos[0]); write<float>(data.pos[1]); write<float>(data.pos[2]);
+        write<uint16_t>(data.angle);
+        // Solo los bytes que hay, como `EntityTransfer`: mandar los 4096 siempre serian 4 KB por
+        // peticion para decir "una mesa".
+        const uint16_t n = data.dataSize > MAX_ENTITY_DATA ? (uint16_t)MAX_ENTITY_DATA : data.dataSize;
+        write<uint16_t>(n);
+        if (n) writeRaw(data.data, n);
+    }
+
+    bool Packet::tryUnpackActionRequest(ActionRequest& out)
+    {
+        try
+        {
+            readPos = 1;
+            ActionRequest d{};
+            d.requestId = read<uint32_t>();
+            d.actor  = read<uint32_t>();
+            d.action = read<uint16_t>();
+            d.target = read<uint32_t>();
+            d.chunkX = read<int32_t>();
+            d.chunkY = read<int32_t>();
+            d.chunkZ = read<int32_t>();
+            d.pos[0] = read<float>(); d.pos[1] = read<float>(); d.pos[2] = read<float>();
+            d.angle  = read<uint16_t>();
+            d.dataSize = read<uint16_t>();
+            // Un `dataSize` que miente es la forma mas barata de tumbar un nodo: se comprueba contra
+            // lo que de verdad queda en el buffer, no contra el numero que trae.
+            if (d.dataSize > MAX_ENTITY_DATA) return false;
+            if (readPos + d.dataSize > buffer.size()) return false;
+            if (d.dataSize) { std::memcpy(d.data, &buffer[readPos], d.dataSize); readPos += d.dataSize; }
+            out = d;
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+    void Packet::pack(const ActionAck& data)
+    {
+        clear();
+        write<PacketType>(PKT_ACTION_ACK);
+        write<uint32_t>(data.requestId);
+        write<uint16_t>(data.action);
+        write<uint8_t>(data.accepted);
+        write<uint32_t>(data.uuid);
+    }
+
+    bool Packet::tryUnpackActionAck(ActionAck& out)
+    {
+        try
+        {
+            readPos = 1;
+            ActionAck d{};
+            d.requestId = read<uint32_t>();
+            d.action    = read<uint16_t>();
+            d.accepted  = read<uint8_t>();
+            d.uuid      = read<uint32_t>();
+            out = d;
+            return true;
+        }
+        catch (...) { return false; }
     }
 
     void Packet::pack(const ServerMetrics& data)
@@ -126,12 +204,17 @@ namespace DGS
         write<uint64_t>(data.bytesTx);
         write<uint32_t>(data.failedTransfers);
         write<uint32_t>(data.activeEntities);
+        // Population histograms (see ServerMetrics). Appended at the end so the existing fields do not
+        // shift, and read back only if the packet actually carries them.
+        for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) write<uint16_t>(data.popX[i]);
+        for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) write<uint16_t>(data.popY[i]);
+        for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) write<uint16_t>(data.popZ[i]);
     }
 
     ServerMetrics Packet::unpackServerMetrics()
     {
         readPos = 1;
-        ServerMetrics data;
+        ServerMetrics data{};   // ⚠️ zero-initialised: the histograms below may not be on the wire
         data.ramUsage = read<float>();
         data.performance = read<float>();
         data.node.chunkXMin = read<int32_t>();
@@ -148,6 +231,18 @@ namespace DGS
         data.bytesTx = read<uint64_t>();
         data.failedTransfers = read<uint32_t>();
         data.activeEntities = read<uint32_t>();
+
+        // Appended after the fact, so they are read ONLY if they are there — a zone built before this
+        // field still reports metrics, just without a population profile, and the orchestrator falls
+        // back to the geometric cut for it. `read<T>` throws on overflow and the head must not die on
+        // a short packet from an older node.
+        const size_t need = 3 * MAX_SPLIT_BUCKETS * sizeof(uint16_t);
+        if (readPos + need <= buffer.size())
+        {
+            for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) data.popX[i] = read<uint16_t>();
+            for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) data.popY[i] = read<uint16_t>();
+            for (uint32_t i = 0; i < MAX_SPLIT_BUCKETS; ++i) data.popZ[i] = read<uint16_t>();
+        }
 
         return data;
     }

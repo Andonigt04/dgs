@@ -7,12 +7,17 @@
 // observer token exists to protect — and, since nothing was authenticated either, could forge a
 // position for somebody else's uuid.
 //
-// Each datagram is sealed with AES-256-GCM now: `nonce(12) || ciphertext || tag(16)`. One key for the
-// game plane (`DGS_UDP_KEY`), so a zone still encrypts each broadcast frame ONCE and sends the same
-// bytes to everybody — a per-peer DTLS session would have made the zone encrypt the same snapshot N
-// times and thrown away the serialise-once-per-tick property the capacity numbers rest on.
+// Each datagram is sealed with AES-256-GCM now: `session(4) || nonce(12) || ciphertext || tag(16)`,
+// with the session id bound in as additional authenticated data so it cannot be swapped.
 //
-// Five checks, and each is another's counter-proof:
+//   session 0 → the GROUP key (`DGS_UDP_KEY`). The zone's broadcast uses it, and it must: the same
+//               payload goes to N recipients, and one key is what lets the zone seal each frame ONCE
+//               instead of once per recipient. A per-peer DTLS session would have thrown away the
+//               serialise-once-per-tick property the capacity numbers rest on.
+//   session N → HMAC-SHA256(`DGS_UDP_MASTER`, N). The SERVERS hold the master and derive; a client is
+//               issued only its own key, so it cannot read the player next to it.
+//
+// Six checks, and each is another's counter-proof:
 //   A. with the key, a datagram round-trips intact — otherwise everything below would be measuring a
 //      link that simply does not work.
 //   B. a receiver WITHOUT the key sees bytes that do not contain the plaintext. Read off a plain
@@ -22,6 +27,8 @@
 //   D. a datagram with ONE BYTE CHANGED is refused. Encryption that hides the contents from a reader
 //      while accepting anything from a writer is half a job; the GCM tag is the other half.
 //   E. a receiver with the WRONG key is refused too, rather than handed rubbish.
+//   F. a SERVER derives a session key from the master and reads that client's uplink, and ANOTHER
+//      CLIENT — holding the group key and its own session key — cannot.
 //
 // What this deliberately does NOT do is prevent replay: a captured datagram can be re-sent inside its
 // lifetime. The layer above already deals with that for the traffic that matters — the validator's
@@ -32,6 +39,9 @@
 #include "include/dgs/packet.h"
 
 #include <sys/socket.h>
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -118,8 +128,8 @@ int main()
         std::printf("    a tap without the key captured %d bytes; the marker is %s\n",
                     n, inClear ? "PRESENT" : "absent");
         check(n > 0 && !inClear, "B · what travels does NOT contain the plaintext");
-        check(n == (int)p.getSize() + 28,
-              "B · and it is 28 bytes longer: nonce(12) + tag(16), the price of the seal");
+        check(n == (int)p.getSize() + 32,
+              "B · and it is 32 bytes longer: session(4) + nonce(12) + tag(16), the price of the seal");
     }
 
     // ══ C. The counter-proof for (B): no key at all ══════════════════════════════════════════════
@@ -207,6 +217,64 @@ int main()
         const int n = rx.receive(buf, sizeof(buf), from, port);
         std::printf("    receiving with the wrong key -> %d\n", n);
         check(n <= 0, "E · a receiver holding the WRONG key gets nothing, not rubbish");
+    }
+
+    // ══ F. PER-SESSION KEYS: one client cannot read another's uplink ═════════════════════════════
+    // The group key is unavoidable for the BROADCAST — it is the same data for everybody, and one key
+    // is what lets the zone seal each frame once instead of once per recipient. What a player says
+    // about THEMSELVES is a different matter, and that is what a session key is for: the servers hold
+    // `DGS_UDP_MASTER` and derive per session; a client is issued only its own.
+    {
+        auto sessionEnv = [](const char* id, const char* key) {
+            if (id)  setenv("DGS_UDP_SESSION", id, 1);       else unsetenv("DGS_UDP_SESSION");
+            if (key) setenv("DGS_UDP_SESSION_KEY", key, 1);  else unsetenv("DGS_UDP_SESSION_KEY");
+        };
+
+        // Session 7's key, computed exactly as the login API would from the master.
+        uint8_t master[32], k7[32]; unsigned int kl = 0;
+        SHA256((const unsigned char*)"the-cluster-master", 18, master);
+        const uint32_t id7 = 7;
+        HMAC(EVP_sha256(), master, 32, (const unsigned char*)&id7, sizeof(id7), k7, &kl);
+        // `DGS_UDP_SESSION_KEY` is a passphrase, hashed the same way as the others, so the client is
+        // handed the hex of its derived key and the two sides agree.
+        char hex[65] = {0};
+        for (int i = 0; i < 32; ++i) std::snprintf(hex + i * 2, 3, "%02x", k7[i]);
+
+        DGS::UDPSocket rx; rx.bind(kPort + 6);
+        { timeval tv{}; tv.tv_usec = 300000;
+          setsockopt(rx.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+
+        // The client seals as session 7. It holds its own key and NOT the master.
+        setKey("the-game-plane-key");
+        unsetenv("DGS_UDP_MASTER");
+        sessionEnv("7", hex);
+        DGS::UDPSocket tx; tx.bind(0);
+        DGS::Packet p = marked();
+        tx.send("127.0.0.1", kPort + 6, p.getRawData(), p.getSize());
+
+        // A SERVER reads it: it holds the master and derives session 7's key.
+        sessionEnv(nullptr, nullptr);
+        setenv("DGS_UDP_MASTER", "the-cluster-master", 1);
+        uint8_t buf[8192]; std::string from; int port = 0;
+        const int asServer = rx.receive(buf, sizeof(buf), from, port);
+        std::printf("    a server holding the master reads session 7: %d bytes\n", asServer);
+        check(asServer == (int)p.getSize(),
+              "F · a server derives the session key from the master and reads the uplink");
+
+        // ANOTHER CLIENT tries the same datagram: it has the group key and its OWN session, not 7's.
+        unsetenv("DGS_UDP_MASTER");
+        sessionEnv("7", hex);
+        DGS::UDPSocket tx2; tx2.bind(0);
+        tx2.send("127.0.0.1", kPort + 6, p.getRawData(), p.getSize());
+
+        sessionEnv("9", "a-different-clients-key");
+        const int asOther = rx.receive(buf, sizeof(buf), from, port);
+        std::printf("    another client (session 9) reading session 7's uplink: %d\n", asOther);
+        check(asOther <= 0,
+              "F · but ANOTHER CLIENT cannot: it holds the group key and its own, not session 7's");
+
+        sessionEnv(nullptr, nullptr);
+        unsetenv("DGS_UDP_MASTER");
     }
 
     setKey(nullptr);

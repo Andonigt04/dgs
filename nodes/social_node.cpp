@@ -65,6 +65,55 @@ static void broadcast(int fd, DGS::TCPSocket& s, const std::set<int>& subscriber
         if (sub != fd) s.send(sub, raw, n);
 }
 
+/// Who is on the other end of each player connection, learned from what they say.
+///
+/// ⚠️ AUTOMATIC, WITH WHAT THE PROTOCOL ALREADY CARRIES, and the limit that comes with it is written
+/// down rather than designed around: a chat message carries its sender's uuid, so a connection that
+/// has SPOKEN is identified. One that has only listened is not, and it therefore does not receive
+/// guild chat until it says something. The alternative is an identify packet the client sends on
+/// connecting; that is the right answer and it is not this one.
+///
+/// Erring towards silence is deliberate: an unknown connection receiving a guild's conversation would
+/// be a leak, and a known one missing it is an inconvenience.
+static std::map<int, uint32_t> g_fdUuid;
+
+/// Do these two share a guild? Scanned rather than indexed: a guild list is small and this runs once
+/// per recipient per message, which the per-uuid rate limit already caps at two a second.
+static bool sharesGuild(const SocialState& st, uint32_t a, uint32_t b)
+{
+    for (const auto& g : st.guilds)
+        if (g.second.count(a) && g.second.count(b)) return true;
+    return false;
+}
+
+/// Chat goes to PLAYERS. A zone subscribes here to receive BANS, and it drains that link one message
+/// per tick — so putting the chat firehose in the same queue would push a ban behind the entire
+/// backlog, which is a worse place for it than the head it just came from. Nodes announce themselves
+/// (`AuthGate::isNode`); players do not.
+static void broadcastToPlayers(int fd, DGS::TCPSocket& s, const std::set<int>& subscribers,
+                               const DGS::AuthGate& gate, const uint8_t* raw, size_t n)
+{
+    for (int sub : subscribers)
+        if (sub != fd && !gate.isNode(sub)) s.send(sub, raw, n);
+}
+
+/// Chat that only some players may hear. `GUILD` is the one channel here whose audience is not
+/// everybody — and sending it to everybody, which is what happened until now, is not a bandwidth
+/// question but a privacy one: a guild's conversation was being handed to every player online.
+static void broadcastToGuild(int fd, DGS::TCPSocket& s, const std::set<int>& subscribers,
+                             const DGS::AuthGate& gate, const SocialState& st, uint32_t from,
+                             const uint8_t* raw, size_t n)
+{
+    for (int sub : subscribers)
+    {
+        if (sub == fd || gate.isNode(sub)) continue;
+        auto it = g_fdUuid.find(sub);
+        if (it == g_fdUuid.end()) continue;              // never spoken: we cannot know, so we do not send
+        if (!sharesGuild(st, from, it->second)) continue;
+        s.send(sub, raw, n);
+    }
+}
+
 // ⚠️ A SUBSCRIBER THAT CONNECTS LATE USED TO LEARN NOTHING. Bans and guild changes were broadcast at
 // the moment they happened and never again, so a zone that started afterwards — or reconnected, or was
 // scaled up — served a banned account happily, and restoring this node's state from the database would
@@ -151,7 +200,7 @@ static void applySocialDelta(DGS::TCPSocket& s, const std::set<int>& subscribers
 }
 
 // Chat service: per-channel routing + per-uuid rate limit + ordering seq (§3.7).
-static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers,
+static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers, const DGS::AuthGate& gate,
                        int fd, DGS::Packet& p, SocialState& st)
 {
     auto c = p.unpackChatMessage();
@@ -168,6 +217,7 @@ static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers,
         return;   // dropped (anti-spam) — never reaches the fan-out
     }
     lastChatAt[c.uuid] = now;
+    g_fdUuid[fd] = c.uuid;   // this connection has now identified itself, by speaking
 
     // Local channel → routed by the zone through spatial interest; the rest by subscription here (§3.7).
     if (c.channel == DGS::CHAT_LOCAL) return;   // the owning zone emits it, not the social node
@@ -176,7 +226,10 @@ static void handleChat(DGS::TCPSocket& s, const std::set<int>& subscribers,
     c.timestampMs = (uint32_t)std::time(nullptr);
 
     DGS::Packet out; out.pack(c);
-    broadcast(fd, s, subscribers, out.getRawData(), out.getSize());
+    if (c.channel == DGS::CHAT_GUILD)
+        broadcastToGuild(fd, s, subscribers, gate, st, c.uuid, out.getRawData(), out.getSize());
+    else
+        broadcastToPlayers(fd, s, subscribers, gate, out.getRawData(), out.getSize());
 
     std::cout << "[Social] chat channel=" << (int)c.channel << " uuid=" << c.uuid
               << " seq=" << c.seq << std::endl;
@@ -414,6 +467,7 @@ int main()
                     socialSocket.closeClient(fd);
                     subscribers.erase(fd);
                     gate.forget(fd);
+                    g_fdUuid.erase(fd);
                     continue;
                 }
 
@@ -421,11 +475,23 @@ int main()
                 p.setBuffer(buffer, bytes);
 
                 if (gate.consume(fd, p)) continue;
-                if (!gate.allows(fd)) { gate.refuse(fd, (int)p.getType()); continue; }
-                switch (p.getType())
+
+                // ⚠️ THIS PORT SERVES BOTH NODES AND PLAYERS NOW, so it cannot be gated wholesale —
+                // the same split the head already makes for the same reason. A player's client sends
+                // chat here and has no business holding the cluster secret; what stays privileged is
+                // everything that CHANGES the world's social state: banning somebody, editing a guild.
+                //
+                // Chat arriving from a stranger is not a hole in the way an unauthenticated ban would
+                // be: it is rate-limited per uuid, it is checked against the ban list, and it is the
+                // one thing this node exists to carry for players.
+                const DGS::PacketType t = p.getType();
+                const bool privileged = t == DGS::PKT_SOCIAL_DELTA || t == DGS::PKT_ACCOUNT;
+                if (privileged && !gate.allows(fd)) { gate.refuse(fd, (int)t); continue; }
+
+                switch (t)
                 {
                     case DGS::PKT_SOCIAL_DELTA: applySocialDelta(socialSocket, subscribers, fd, p, st, persistence); break;
-                    case DGS::PKT_CHAT:         handleChat(socialSocket, subscribers, fd, p, st); break;
+                    case DGS::PKT_CHAT:         handleChat(socialSocket, subscribers, gate, fd, p, st); break;
                     case DGS::PKT_ACCOUNT:      handleAccount(socialSocket, subscribers, fd, p, st, persistence); break;
                     default: break;
                 }

@@ -11,7 +11,7 @@
 // server against the same one. Encryption without identity would only mean a private conversation
 // with a stranger.
 //
-// Five checks, each the counter-proof of another:
+// Six groups of checks, each the counter-proof of another:
 //   A. with certificates on both ends, a packet still makes the round trip intact — otherwise
 //      everything else here would be measuring a link that simply does not work.
 //   B. the bytes on the wire are NOT the plaintext. Read by a third socket that man-in-the-middles
@@ -21,6 +21,8 @@
 //   D. with the environment unset, the link is plain and still works, which is the documented default.
 //   E. and with TLS OFF the same tap DOES read the plaintext — so (B) measured the encryption rather
 //      than a packet that was never sent or a tap watching the wrong socket.
+//   F. ONE CONNECTION, TWO THREADS: a sender and a receiver on the same descriptor at the same time,
+//      which is exactly what `Client` does and what TLS does not tolerate by itself.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
@@ -141,6 +143,52 @@ static void tap(std::atomic<bool>& ready, std::atomic<bool>& stop, std::string& 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     close(up); close(cli); close(srv);
+}
+
+// ── F. One connection, two threads ───────────────────────────────────────────────────────────────
+// The frames are self-describing so that a SPLICED stream is detectable and not merely suspected:
+// bytes 0..3 are the sequence number, the length is a function of it, and every remaining byte is
+// `seq & 0xff`. A frame assembled out of two writers' bytes fails at least one of the three.
+static const int    kFrames   = 200;
+static size_t frameLen(int seq) { return 64 + (size_t)(seq % 40) * 100; }   // 64 B … 3.9 kB
+
+static void fillFrame(int seq, std::vector<uint8_t>& out)
+{
+    out.assign(frameLen(seq), (uint8_t)(seq & 0xff));
+    const uint32_t s = (uint32_t)seq;
+    std::memcpy(out.data(), &s, sizeof(s));
+}
+
+/// Reads whole frames and writes each one straight back, on one thread. Its job is only to give the
+/// client something to talk to; the interesting concurrency is on the client side.
+static void echoServer(std::atomic<bool>& ready, std::atomic<bool>& stop, int port)
+{
+    DGS::TCPSocket s;
+    if (!s.listen(port)) { ready = true; return; }
+    { timeval tv{}; tv.tv_usec = 200000;
+      setsockopt(s.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+    ready = true;
+
+    int fd = -1;
+    while (!stop && fd < 0)
+    {
+        fd = s.accept();
+        if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (fd < 0) return;
+    { timeval tv{}; tv.tv_usec = 200000; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+
+    std::vector<uint8_t> buf(8192);
+    int echoed = 0;
+    while (!stop && echoed < kFrames)
+    {
+        const int n = s.receive(fd, buf.data(), buf.size());
+        if (n == 0) break;          // orderly close
+        if (n < 0) continue;        // timeout: go round and re-check `stop`
+        if (!s.send(fd, buf.data(), (size_t)n)) break;
+        ++echoed;
+    }
+    s.closeClient(fd);
 }
 
 int main(int argc, char** argv)
@@ -287,6 +335,185 @@ int main(int argc, char** argv)
                     onTheWire.size(), inClear ? "PRESENT" : "absent");
         check(inClear,
               "E · without TLS the tap DOES read the plaintext (so (B) measured the encryption)");
+    }
+
+    // ══ F. One TLS connection used from two threads at once ══════════════════════════════════════
+    // ⚠️ THIS WAS A DOCUMENTED HOLE BEFORE IT WAS A TEST. `Client` sends from the caller's thread and
+    // receives on `recvLoop`, over one `TCPSocket`. Without TLS the kernel serialises that; with TLS
+    // both threads drive the SAME `SSL`, which has one record layer and one error state, and the
+    // result is undefined behaviour rather than a lost message.
+    //
+    // What is checked is a PROPERTY OF THE STREAM, not an absence of crashes: every frame is echoed
+    // back whole and in one piece. A missing lock does not have to crash to be caught — it produces a
+    // frame whose length, sequence number and filler no longer agree.
+    //
+    // MEASURED, with the two locks in `network.cpp` commented out and nothing else changed:
+    //   6 runs out of 6 detected it — 3 exited with SIGSEGV before finishing the exchange, and the
+    //   other 3 came back red having received 37, 39 and 41 of the 200 frames.
+    // With the locks in place: 200 sent, 200 received, 0 damaged, over 20 consecutive runs. So the
+    // hole this closes was undefined behaviour in the literal sense, not a theoretical one.
+    {
+        setCerts("node.crt", "node.key", "ca.crt");
+        std::atomic<bool> sReady{false}, stop{false};
+        std::thread srv(echoServer, std::ref(sReady), std::ref(stop), kPort + 8);
+        while (!sReady) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        DGS::TCPSocket c;
+        bool up = false;
+        for (int i = 0; i < 100 && !up; ++i) {
+            if (c.connect("127.0.0.1", kPort + 8, 2000)) up = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        { timeval tv{}; tv.tv_sec = 2;
+          setsockopt(c.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+          setsockopt(c.getSocketFD(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
+        check(up, "F · a TLS connection for the two-thread exchange");
+
+        std::atomic<int> sent{0}, got{0}, damaged{0};
+        std::vector<int> seen(kFrames, 0);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+
+        if (up)
+        {
+            const int fd = c.getSocketFD();
+
+            std::thread writer([&]() {
+                std::vector<uint8_t> frame;
+                for (int i = 0; i < kFrames && std::chrono::steady_clock::now() < until; ++i)
+                {
+                    fillFrame(i, frame);
+                    if (!c.send(fd, frame.data(), frame.size())) break;
+                    ++sent;
+                }
+            });
+
+            std::thread reader([&]() {
+                std::vector<uint8_t> buf(8192);
+                while (got < kFrames && std::chrono::steady_clock::now() < until)
+                {
+                    const int n = c.receive(fd, buf.data(), buf.size());
+                    if (n == 0) break;
+                    if (n < 0) continue;   // SO_RCVTIMEO expired: re-check the deadline
+                    ++got;
+
+                    uint32_t seq = 0;
+                    std::memcpy(&seq, buf.data(), sizeof(seq));
+                    bool ok = seq < (uint32_t)kFrames && (size_t)n == frameLen((int)seq);
+                    for (int b = 4; ok && b < n; ++b)
+                        if (buf[b] != (uint8_t)(seq & 0xff)) ok = false;
+                    if (!ok) ++damaged;
+                    else     ++seen[seq];
+                }
+            });
+
+            writer.join();
+            reader.join();
+        }
+
+        stop = true;
+        srv.join();
+
+        int missing = 0, duplicated = 0;
+        for (int i = 0; i < kFrames; ++i) { if (seen[i] == 0) ++missing; else if (seen[i] > 1) ++duplicated; }
+        std::printf("    two threads on one TLS link: sent %d, received %d, damaged %d, "
+                    "missing %d, duplicated %d\n",
+                    sent.load(), got.load(), damaged.load(), missing, duplicated);
+
+        check(sent.load() == kFrames && got.load() == kFrames,
+              "F · every frame written while another thread was reading came back");
+        check(damaged.load() == 0 && missing == 0 && duplicated == 0,
+              "F · and each one arrived WHOLE (no frame spliced out of two writers' bytes)");
+
+        // Counter-proof for the line above: the verifier must reject a damaged frame, or "0 damaged"
+        // would be satisfied by a check that accepts anything.
+        {
+            std::vector<uint8_t> a, b;
+            fillFrame(3, a);
+            fillFrame(7, b);
+            a.resize(frameLen(3) / 2);
+            a.insert(a.end(), b.begin(), b.begin() + (long)(frameLen(3) - a.size()));  // a splice
+            uint32_t seq = 0; std::memcpy(&seq, a.data(), sizeof(seq));
+            bool ok = seq < (uint32_t)kFrames && a.size() == frameLen((int)seq);
+            for (size_t i = 4; ok && i < a.size(); ++i)
+                if (a[i] != (uint8_t)(seq & 0xff)) ok = false;
+            check(!ok, "F · the intactness check DOES reject a spliced frame (it is not a rubber stamp)");
+        }
+    }
+
+    // ══ G. A peer that connects and says nothing ═════════════════════════════════════════════════
+    // ⚠️ ONE SOCKET, NO CREDENTIALS, NO TRAFFIC, AND THE NODE STOPS ACCEPTING. `accept()` ran
+    // `SSL_accept` on the caller's own loop with a blocking descriptor, so anybody who could reach the
+    // port could open a connection, send nothing, and park that node's accept loop for ever. Node
+    // authentication does not help: the handshake happens BEFORE anyone gets to prove who they are.
+    //
+    // The check is a fact about the LISTENER, not about the silent peer: after the silent connection,
+    // a legitimate client must still get through. `DGS_TLS_HANDSHAKE_MS` is turned down so the test
+    // costs its own timeout rather than the 5 s default.
+    {
+        setenv("DGS_TLS_HANDSHAKE_MS", "600", 1);
+        setCerts("node.crt", "node.key", "ca.crt");
+        std::atomic<bool> sReady{false}, stop{false};
+        std::thread srv(echoServer, std::ref(sReady), std::ref(stop), kPort + 10);
+        while (!sReady) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // A raw socket: it completes the TCP handshake and then never speaks TLS.
+        const int mute = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(kPort + 10);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        const bool connected = ::connect(mute, (sockaddr*)&a, sizeof(a)) == 0;
+        check(connected, "G · a silent peer opens a TCP connection to the node");
+
+        const auto t0 = std::chrono::steady_clock::now();
+        DGS::TCPSocket c;
+        bool up = false;
+        for (int i = 0; i < 60 && !up; ++i) {
+            if (c.connect("127.0.0.1", kPort + 10, 2000)) up = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        bool echoed = false;
+        if (up) {
+            { timeval tv{}; tv.tv_sec = 2;
+              setsockopt(c.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+            std::vector<uint8_t> frame; fillFrame(11, frame);
+            std::vector<uint8_t> buf(8192);
+            if (c.send(c.getSocketFD(), frame.data(), frame.size())) {
+                const int n = c.receive(c.getSocketFD(), buf.data(), buf.size());
+                echoed = n == (int)frame.size() && std::memcmp(buf.data(), frame.data(), (size_t)n) == 0;
+            }
+        }
+        const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        std::printf("    a real client got served %ld ms after a silent peer took the accept slot\n", ms);
+        check(echoed, "G · the listener SURVIVES it and still serves a legitimate client");
+
+        ::close(mute);
+        stop = true;
+        srv.join();
+
+        // Counter-proof: the deadline is what does the work, so raising it must bring the freeze back.
+        // With 2.5 s of patience on the listener, a client that only waits 800 ms is NOT served — which
+        // is what the old code did with no upper bound at all, for ever.
+        setenv("DGS_TLS_HANDSHAKE_MS", "2500", 1);
+        std::atomic<bool> sReady2{false}, stop2{false};
+        std::thread srv2(echoServer, std::ref(sReady2), std::ref(stop2), kPort + 12);
+        while (!sReady2) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        const int mute2 = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a2{}; a2.sin_family = AF_INET; a2.sin_port = htons(kPort + 12);
+        a2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::connect(mute2, (sockaddr*)&a2, sizeof(a2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));   // let the listener take it
+
+        DGS::TCPSocket blocked;
+        const bool served = blocked.connect("127.0.0.1", kPort + 12, 800);
+        std::printf("    with the listener's patience raised to 2500 ms, a 800 ms client was %s\n",
+                    served ? "STILL SERVED" : "not served");
+        check(!served, "G · and the deadline is what saves it (raise it and the freeze comes back)");
+
+        ::close(mute2);
+        stop2 = true;
+        srv2.join();
+        unsetenv("DGS_TLS_HANDSHAKE_MS");
     }
 
     std::printf("\n== tls_test: %d OK · %d FAILED ==\n", g_pass, g_fail);

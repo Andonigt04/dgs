@@ -80,16 +80,25 @@ namespace DGS
 
     /// Announces this node to a peer it has just connected to. A no-op when no secret is configured.
     /// @return whether the write succeeded (true as well when auth is off: nothing to write).
+    /// ⚠️ IT IS SENT EVEN WITH NO SECRET, and that is a deliberate change of meaning: this packet
+    /// says "I am a node", and the MAC is the part that PROVES it. Returning early when no secret was
+    /// configured meant a cluster in its default configuration had no way at all to tell a node from a
+    /// player — which the social node needs, and not for permission: it must never send the chat
+    /// firehose down a zone's link, because a zone drains that link one message per tick and holds it
+    /// to receive BANS. Found by measuring, after the filter that depended on this quietly did nothing.
+    ///
+    /// With no secret the MAC is zeros. A gate that is not enforcing ignores it; a gate that IS
+    /// enforcing rejects it, which is the right answer — a node with no secret cannot join a cluster
+    /// that requires one.
     inline bool sendAuth(TCPSocket& s)
     {
         const std::string secret = clusterSecret();
-        if (secret.empty()) return true;
 
         uint8_t nonce[AUTH_NONCE_LEN];
         if (RAND_bytes(nonce, (int)sizeof(nonce)) != 1) return false;
         const uint64_t ts = authNowMs();
-        uint8_t mac[AUTH_MAC_LEN];
-        authMac(secret, nonce, ts, mac);
+        uint8_t mac[AUTH_MAC_LEN] = {0};
+        if (!secret.empty()) authMac(secret, nonce, ts, mac);
 
         Packet p;
         p.pack(PKT_AUTH);
@@ -124,6 +133,7 @@ namespace DGS
         bool consume(int fd, const Packet& p)
         {
             if (p.getType() != PKT_AUTH) return false;
+            m_announced.insert(fd);               // it claims to be a node, checked or not (see isNode)
             if (!enabled()) return true;          // ignored, but still not a payload packet
 
             Packet copy = p;                       // `read` moves a cursor; do not disturb the caller's
@@ -172,7 +182,22 @@ namespace DGS
         }
 
         bool allows(int fd) const { return !enabled() || m_authed.count(fd) != 0; }
-        void forget(int fd) { m_authed.erase(fd); }
+        void forget(int fd) { m_authed.erase(fd); m_announced.erase(fd); }
+
+        /// Did this connection ANNOUNCE ITSELF as a node — regardless of whether the secret was
+        /// checked, or configured at all?
+        ///
+        /// ⚠️ THIS IS NOT `allows()` AND MUST NOT BE USED FOR PERMISSION. `allows()` answers "may this
+        /// do privileged things", and with no secret configured it says yes to everyone. This answers
+        /// a different question — "is this a node or a player" — which a fan-out needs and a permission
+        /// check does not: the social node must not send chat to a zone, whose tick drains that link
+        /// one message at a time and whose reason for holding it is receiving BANS. Measured before
+        /// this existed: chat moved off the head and straight into that queue, where it would have
+        /// delayed the ban path by the entire backlog.
+        ///
+        /// A node says so by sending `PKT_AUTH`, which every node does on every link it opens; a
+        /// player's client never sends one. That works with or without a secret, which is the point.
+        bool isNode(int fd) const { return m_announced.count(fd) != 0; }
 
         /// Says no, once per rejection, so a misconfigured cluster is diagnosable instead of silent.
         void refuse(int fd, int packetType) const
@@ -185,6 +210,7 @@ namespace DGS
         const char*             m_who;
         std::string             m_secret;
         std::set<int>           m_authed;
+        std::set<int>           m_announced;   // sent PKT_AUTH: a node, checked or not (see isNode)
         std::set<std::string>   m_seen;
         std::deque<std::string> m_order;
     };

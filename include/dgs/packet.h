@@ -72,6 +72,12 @@ namespace DGS
 
         void pack(const EntityTransfer& data);
         void pack(const Command& data);
+        void pack(const ActionRequest& data);
+        void pack(const ActionAck& data);
+        bool tryUnpackActionAck(ActionAck& out);
+        /// @return false si el datagrama esta truncado o su `dataSize` miente. Un nodo no puede morir
+        /// por lo que le mande un desconocido, y una accion viene de fuera por definicion.
+        bool tryUnpackActionRequest(ActionRequest& out);
         void pack(const ServerMetrics& data);
         void pack(const ZoneQuery& data);
         void pack(const ZoneResponse& data);

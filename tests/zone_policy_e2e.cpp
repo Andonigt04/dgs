@@ -83,6 +83,7 @@ static std::atomic<int>  g_metricsSeen{0};
 static std::atomic<int>  g_validatorState{-1};   // last ValidatorStatus::state observed
 static std::atomic<int>  g_reqSent{0}, g_reqTimeout{0};
 static std::atomic<int>  g_statusCount{0};
+static std::atomic<int>  g_statusNotOk{0};   // status reports whose state was NOT "ok"
 static std::atomic<bool> g_validatorMute{false}; // the validator accepts but never answers
 static std::atomic<int>  g_socialFD{-1};         // so the main thread can push the ban
 static std::atomic<int>  g_headAccepts{0};       // how many times the head accepted the zone
@@ -163,6 +164,11 @@ static void fakeHead(std::atomic<bool>& ready)
                 g_reqSent    = (int)st.reqSent;
                 g_reqTimeout = (int)st.reqTimeout;
                 ++g_statusCount;
+                // ⚠️ EVERY status is remembered, not just the last one. The state OSCILLATES during an
+                // outage — the breaker trips (2), exhausts its trips and fails open (0), reconnects
+                // (1), trips again — so a single sample after the window is a coin toss. See the
+                // assertion below.
+                if ((int)st.state != 1) ++g_statusNotOk;
                 std::printf("      [status #%d  t=%llu ms] state=%d reqSent=%u reqTimeout=%u\n",
                             g_statusCount.load(), msSinceStart(),
                             (int)st.state, st.reqSent, st.reqTimeout);
@@ -377,6 +383,7 @@ int main(int argc, char** argv)
         // that reported 2 permanently — a broken breaker stuck open looks identical to a working one.
         const int stateBefore   = g_validatorState.load();
         const int statusBefore  = g_statusCount.load();
+        const int notOkBefore   = g_statusNotOk.load();
         const int metricsBefore = g_metricsSeen.load();
         check(stateBefore == 1,
               "BEFORE breaking anything the head sees a HEALTHY arbiter (state=1) — the baseline");
@@ -395,6 +402,7 @@ int main(int argc, char** argv)
         const int stateAfter = g_validatorState.load();
         const unsigned long long worstSilence = worstSilenceMs();
         const int statusDuring  = g_statusCount.load()  - statusBefore;
+        const int notOkDuring   = g_statusNotOk.load()  - notOkBefore;
         const int metricsDuring = g_metricsSeen.load() - metricsBefore;
         std::printf("    validator state as seen by the head: %d -> %d  (0=none · 1=ok · 2=open)\n"
                     "    the zone's own counters: requests=%d  timeouts=%d\n"
@@ -415,8 +423,20 @@ int main(int argc, char** argv)
               "at least one status report reaches the head DURING the outage (the head is not blind)");
 
         // LAYERS 1 AND 2 — the breaker actually trips, and the head is told.
-        check(stateAfter != 1,
-              "LAYERS 1+2: the breaker reports the fault (state leaves 'ok' when the arbiter goes mute)");
+        //
+        // ⚠️ THIS USED TO SAMPLE THE STATE ONCE, AFTER THE WINDOW, and that is a coin toss: the state
+        // OSCILLATES while the arbiter is mute. The breaker trips (2), exhausts `CB_MAX_OPEN` and
+        // fails open (0), the retry reconnects (1) and it starts again. CI caught it exactly that way
+        // — the run printed `[status #2] state=0` during the outage and then read `1 -> 1` at the
+        // ends and failed, with the evidence for the property it was asserting sitting in its own
+        // output four lines above the FAILED line.
+        //
+        // What the layer actually promises is that the head IS TOLD, at some point, that the arbiter
+        // is not answering. That is a property of the stream, so it is measured over the stream.
+        std::printf("    status reports during the outage that were NOT 'ok': %d of %d\n",
+                    notOkDuring, statusDuring);
+        check(notOkDuring >= 1,
+              "LAYERS 1+2: the breaker reports the fault (the head IS told the arbiter is not ok)");
         check(g_reqTimeout.load() > 0,
               "and the timeouts are COUNTED and published (reqTimeout no longer stuck at 0)");
 

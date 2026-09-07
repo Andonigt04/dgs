@@ -85,6 +85,19 @@ add_executable(demo_player tools/demo_player.cpp ${COMMON_SRCS})
 add_executable(load_zone tools/load_zone.cpp ${COMMON_SRCS})
 target_link_libraries(load_zone Threads::Threads)
 
+# The other half of `load_zone`: it starts nothing and populates a cluster that is already up, asking
+# the head which zone each player belongs to so that crossing a border is a real handoff.
+add_executable(fill_world tools/fill_world.cpp ${COMMON_SRCS})
+target_link_libraries(fill_world Threads::Threads)
+
+# ⚠️ A STUB THAT ACCEPTS EVERY PASSWORD, and a separate binary precisely so it cannot end up inside a
+# node by accident. `Client::connect` refuses to proceed without a 200 from `/api/auth/login`, and
+# nothing in this repository implements that endpoint — so no real client can reach a real cluster.
+# This unblocks development and recording; it is in no Dockerfile and no k8s manifest, and it must
+# stay that way.
+add_executable(fake_login_api tools/fake_login_api.cpp)
+target_link_libraries(fake_login_api httplib::httplib OpenSSL::Crypto Threads::Threads)
+
 add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
 target_link_libraries(dgs_client httplib::httplib)
 set_target_properties(dgs_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -194,6 +207,34 @@ target_link_libraries(interest_e2e_test Threads::Threads)
 add_executable(handoff_e2e_test tests/handoff_e2e.cpp ${COMMON_SRCS})
 target_link_libraries(handoff_e2e_test Threads::Threads)
 
+add_executable(world_object_e2e_test tests/world_object_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(world_object_e2e_test Threads::Threads)
+
+# A real zone_node against a fake head that resizes it: the other side of the wire from
+# `orchestrator_test`, which only checks that the resize is SENT.
+add_executable(split_resize_e2e_test tests/split_resize_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(split_resize_e2e_test Threads::Threads)
+
+# Lo que un cliente declara sobre si mismo, contra una zona real.
+add_executable(client_claims_e2e_test tests/client_claims_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(client_claims_e2e_test Threads::Threads)
+
+# Colocar como ACCION: el cliente pide, el validador decide, el servidor crea.
+add_executable(place_action_e2e_test tests/place_action_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(place_action_e2e_test Threads::Threads)
+
+# S1 juzgaba la CONEXION y no la velocidad: paquetes agolpados = pasos legitimos rechazados.
+add_executable(s1_jitter_e2e_test tests/s1_jitter_e2e.cpp ${COMMON_SRCS})
+target_link_libraries(s1_jitter_e2e_test Threads::Threads)
+
+# The real `DGS::Client` against a real head and two real zones: it needs the login API, hence httplib.
+add_executable(client_handoff_e2e_test tests/client_handoff_e2e.cpp src/client.cpp ${COMMON_SRCS})
+target_link_libraries(client_handoff_e2e_test httplib::httplib Threads::Threads)
+
+# Can a player see anybody else? The client read only its TCP link, so the answer was no.
+add_executable(client_world_e2e_test tests/client_world_e2e.cpp src/client.cpp ${COMMON_SRCS})
+target_link_libraries(client_world_e2e_test httplib::httplib Threads::Threads)
+
 add_executable(ghost_e2e_test tests/ghost_e2e.cpp ${COMMON_SRCS})
 target_link_libraries(ghost_e2e_test Threads::Threads)
 
@@ -281,6 +322,30 @@ set_tests_properties(interest_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
 add_test(NAME handoff_e2e COMMAND handoff_e2e_test $<TARGET_FILE:zone_node>)
 set_tests_properties(handoff_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
+add_test(NAME world_object_e2e COMMAND world_object_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(world_object_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
+add_test(NAME split_resize_e2e COMMAND split_resize_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(split_resize_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
+
+add_test(NAME client_claims_e2e COMMAND client_claims_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(client_claims_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
+add_test(NAME place_action_e2e COMMAND place_action_e2e_test
+         $<TARGET_FILE:validador_node> $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules_actions>)
+set_tests_properties(place_action_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
+add_test(NAME s1_jitter_e2e COMMAND s1_jitter_e2e_test $<TARGET_FILE:zone_node>)
+set_tests_properties(s1_jitter_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
+
+add_test(NAME client_handoff_e2e COMMAND client_handoff_e2e_test
+         $<TARGET_FILE:head_server_node> $<TARGET_FILE:zone_node>)
+set_tests_properties(client_handoff_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 240)
+
+add_test(NAME client_world_e2e COMMAND client_world_e2e_test
+         $<TARGET_FILE:head_server_node> $<TARGET_FILE:zone_node>)
+set_tests_properties(client_world_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
 add_test(NAME ghost_e2e COMMAND ghost_e2e_test
          $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules>)

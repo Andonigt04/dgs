@@ -128,22 +128,55 @@ int main(int argc, char** argv)
         _exit(127);
     }
 
-    DGS::TCPSocket A, B;
+    // Three players: A and B share a guild, C does not. C is the counter-proof.
+    DGS::TCPSocket A, B, C;
     bool up = false;
     for (int i = 0; i < 200 && !up; ++i) {
-        if (A.connect("127.0.0.1", kSocialPort) && B.connect("127.0.0.1", kSocialPort)) up = true;
+        if (A.connect("127.0.0.1", kSocialPort) && B.connect("127.0.0.1", kSocialPort)
+            && C.connect("127.0.0.1", kSocialPort)) up = true;
         else std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-    check(up, "the social node accepts two subscribers");
+    check(up, "the social node accepts three subscribers");
 
     if (up) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         DGS::Packet rec;
 
-        // (1) A speaks on the guild channel -> B receives it.
+        // ── Guild membership, and who is on which connection ────────────────────────────────
+        // ⚠️ GUILD CHAT USED TO GO TO EVERY PLAYER ONLINE, and this test pinned that: it sent a guild
+        // message with no guild in existence and asserted a stranger received it. That is not a
+        // bandwidth question but a privacy one — a guild's conversation handed to everybody — and the test
+        // was green throughout.
+        //
+        // Two things have to be true before B can hear A now, and the second is a documented limit
+        // rather than a design: they must share a guild, and B must have SPOKEN at least once. The
+        // social node learns which uuid is behind a connection from the chat it sends, because that is
+        // what the protocol already carries; a connection that has only listened is unknown, and an
+        // unknown connection is not given a guild's conversation.
+        {
+            DGS::SocialDelta j{};
+            j.kind = DGS::SOCIAL_GUILD_JOIN; j.scopeUuid = 100; j.targetUuid = 1;
+            DGS::Packet pj; pj.pack(j);
+            A.send(A.getSocketFD(), pj.getRawData(), pj.getSize());
+            j.targetUuid = 2;
+            DGS::Packet pj2; pj2.pack(j);
+            A.send(A.getSocketFD(), pj2.getRawData(), pj2.getSize());
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        // B and C say who they are, the only way the node can learn it.
+        sendChat(B, 2, DGS::CHAT_GLOBAL, "b is here");
+        sendChat(C, 3, DGS::CHAT_GLOBAL, "c is here");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        while (receiveType(A, 100, rec) != -1) {}   // drain what those two produced
+        while (receiveType(B, 100, rec) != -1) {}
+        while (receiveType(C, 100, rec) != -1) {}
+
+        // (1) A speaks on the guild channel -> B, who shares the guild, receives it.
         sendChat(A, 1, DGS::CHAT_GUILD, "hello");
         const bool gotFirst = receiveType(B, 1500, rec) == DGS::PKT_CHAT;
-        check(gotFirst, "a chat from A reaches B");
+        check(gotFirst, "a guild chat from A reaches B, who is in the guild");
+
         // ⚠️ ONLY UNPACK WHAT ARRIVED. This used to unpack unconditionally, so the FIRST failure threw
         // `Packet read overflow` out of `main` and the process ABORTED — every later check silently
         // never ran, and the output ended in a core dump instead of a verdict.
@@ -176,6 +209,27 @@ int main(int argc, char** argv)
         sendChat(A, 3, DGS::CHAT_LOCAL, "local");
         check(receiveType(B, 600, rec) == -1,
               "the social node does not fan out the LOCAL channel (the owning zone does)");
+
+        // (3b) WHO HEARS A GUILD, now that nothing is on a clock. ⚠️ The timing-sensitive stretch
+        //      above must not be interrupted: the rate limit measures 500 ms between two messages, and
+        //      a check that waits 400 ms for something that must NOT arrive spends most of that window.
+        //      Putting these here cost me a red run to notice.
+        std::this_thread::sleep_for(std::chrono::milliseconds(550));
+        while (receiveType(B, 100, rec) != -1) {}
+        while (receiveType(C, 100, rec) != -1) {}
+
+        sendChat(A, 1, DGS::CHAT_GUILD, "for the guild");
+        check(receiveType(B, 1500, rec) == DGS::PKT_CHAT,
+              "a guild chat reaches the member who shares the guild");
+        check(receiveType(C, 400, rec) == -1,
+              "and NOT a player outside it (a guild's conversation is not fanned out to everybody)");
+
+        // (3c) And the exclusion is about the CHANNEL, not about that player being broken.
+        std::this_thread::sleep_for(std::chrono::milliseconds(550));
+        sendChat(A, 1, DGS::CHAT_GLOBAL, "everyone");
+        check(receiveType(C, 1500, rec) == DGS::PKT_CHAT,
+              "a GLOBAL chat from the same sender DOES reach that same player");
+        while (receiveType(B, 200, rec) != -1) {}   // it reached B too; leave the socket clean
 
         // (4) A social delta IS persisted... and reaches B.
         DGS::SocialDelta d{};

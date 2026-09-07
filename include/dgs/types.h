@@ -12,6 +12,10 @@ namespace DGS
     static constexpr uint32_t MAX_PACKET_SIZE = 65536; // datagram/packet cap (see §4.6 bug 6 and network.h).
     static constexpr uint64_t DEFAULT_LEASE_MS = 30000; // default lease of a zone (see §4.6 bug 1).
     static constexpr uint32_t MAX_REGION_BYTES = 4096;   // region blob inside a PKT_ZONE_REGION (§3.9, transport cap)
+    // Buckets per axis in the population histogram a zone reports with its metrics (see ServerMetrics).
+    // 32 keeps the whole thing to 192 bytes per sample and is plenty: the cut only needs to land in the
+    // right neighbourhood, and the next split refines it.
+    static constexpr uint32_t MAX_SPLIT_BUCKETS = 32;
 
     enum PacketType : uint8_t
     {
@@ -67,6 +71,22 @@ namespace DGS
         // entities routed to them. See `auth.h` for what this does and, more importantly, what it
         // does not (it is not TLS, and the rest of the connection is still in clear).
         PKT_AUTH            = 22,
+        // ⚠️ LO QUE UN JUGADOR PIDE, no lo que afirma. Un `PKT_ENTITY_TRANSFER` es un hecho
+        // consumado: "estoy aqui, tengo esto". Una accion es una PETICION — "quiero poner una mesa
+        // aqui" — y esa diferencia es la que permite que el servidor decida en vez de creer.
+        //
+        // Va al validador con `kind = 1`, que es la ruta que FALLA CERRADO: sin regla que la acepte,
+        // se rechaza. El movimiento puede permitirse fallar abierto porque una posicion mal aceptada
+        // se corrige en el siguiente paquete; una accion crea, destruye o transfiere objetos, y una
+        // colada no se deshace. Esa asimetria ya existia en el validador y no la alcanzaba nadie: la
+        // zona ponia `kind = 0` en todas sus peticiones. Esto es lo que la conecta.
+        PKT_ACTION          = 23,
+        // ⚠️ LA RESPUESTA, que no existia. El cliente pedia algo y no se enteraba NUNCA de si habia
+        // ocurrido: si el servidor decia que no, el objeto se quedaba puesto en su pantalla y en la de
+        // nadie mas. Dos mundos distintos y ni un mensaje. Una peticion sin respuesta no es una
+        // peticion, es una esperanza.
+        PKT_ACTION_ACK      = 24,
+
         PKT_DISCONNECT      = 255
     };
     
@@ -85,7 +105,22 @@ namespace DGS
         STATE_INTERACTABLE  = 1 << 2,
         STATE_DESTRUCTIBLE  = 1 << 3,
         STATE_EMITTING      = 1 << 4,
-        STATE_CONSUMABLE    = 1 << 5
+        STATE_CONSUMABLE    = 1 << 5,
+
+        /// ⚠️ THE WORLD OWNS THIS, NOT A CLIENT — and without it a world could not contain objects.
+        ///
+        /// Every entity is leased to whoever reports it, and `zone_node`'s GC purges anything it has
+        /// not heard from within `ENTITY_LEASE_MS` (3 s by default). For a player who disconnects that
+        /// is exactly right. For a crate on the ground it is fatal: nothing reports a crate, so it
+        /// evaporates three seconds after it appears. Measured — three `ENT_ITEM`s placed once and
+        /// never touched again were served for 3 s and then gone, and a zone that restored them from
+        /// the database lost them again just as fast.
+        ///
+        /// An entity carrying this bit is exempt from the lease GC. It is still broadcast, still
+        /// persisted, still handed over when it crosses a border — it simply does not need anybody to
+        /// keep vouching for it. The bit travels with the entity (it is part of the stored document),
+        /// so it survives a restart the same way its position does.
+        STATE_WORLD_OWNED   = 1 << 6
     };
 
     enum HeadPurpose : uint8_t
@@ -131,6 +166,17 @@ namespace DGS
         uint8_t     data[MAX_ENTITY_DATA];
     };
 
+    // Which axis a CMD_TRANSFER_SERVER resize applies to. A split used to be able to cut on X and
+    // nothing else, so a zone could only ever become a thinner and thinner SLAB: fifty players in one
+    // place on the same X band could not be separated no matter how many times it scaled up. The cut
+    // now goes along whichever axis is longest, which is what turns repeated splits into a grid.
+    enum ResizeAxis : uint8_t
+    {
+        AXIS_X = 0,
+        AXIS_Y = 1,
+        AXIS_Z = 2
+    };
+
     struct Command
     {
         HeadPurpose purpose;
@@ -138,6 +184,10 @@ namespace DGS
         char        addr[MAX_ADDR_LEN];
         int         port;
         float       chunkSizeX, chunkSizeY, chunkSizeZ;
+        // CMD_TRANSFER_SERVER only: which bound `chunkX` is the new maximum OF. Appended at the end so
+        // the existing fields do not shift, and read back only if the datagram actually carries it —
+        // a Command from something built before this field still parses, as AXIS_X.
+        ResizeAxis  resizeAxis;
     };
 
     // Payload of PKT_PERSIST_RANGE: "every entity you have stored inside these chunks". `limit` caps
@@ -176,12 +226,37 @@ namespace DGS
     {
         ZoneInfo node;          // zones (by bounds + addr:port; `fd` does not travel)
         float    ramUsage;      // 0..1
-        float    performance;   // 0..1
+        // ⚠️ NOT 0..1, whatever this said for a long time: `zone_node` puts THE TICK TIME IN
+        // MILLISECONDS here, measured against its own `ZONE_TICK_US` budget (100 ms). The comment
+        // being wrong is not cosmetic — the orchestrator's load signal was written to match it and
+        // ended up demanding that a zone be FAST before it would call it overloaded.
+        float    performance;   // tick time in ms
         uint64_t startTimeS;    // node start epoch (tells a fresh node from a healthy one, §4.6 bug 5)
         uint64_t bytesRx;       // bytes received since start-up
         uint64_t bytesTx;       // bytes sent since start-up
         uint32_t failedTransfers; // failed transfers/validations (timeout or error)
         uint32_t activeEntities;  // entities served (scaling heuristic)
+
+        // ⚠️ WHERE THE LOAD IS, not just how much of it there is. Until this existed the orchestrator
+        // knew a zone's box and one number — `activeEntities` — and nothing else, so a SPLIT had no
+        // choice but to cut the box down the geometric middle. With everybody standing in chunk 3 of a
+        // 0..100 zone that cut lands at 50: the child gets 51..100, empty, and the parent keeps the
+        // whole crowd. It costs a process and relieves nothing, and it takes about five generations
+        // (~2.5 min at one split per 30 s) to walk the cut down to where the people actually are.
+        //
+        // These are three coarse histograms — one per axis — of the entities the zone is simulating,
+        // bucketed across its own box. The orchestrator cuts where the population divides in half
+        // instead of where the box does. Coarse on purpose: 32 buckets is 192 bytes per metrics sample
+        // at 10 Hz, and the cut only has to land in the right neighbourhood — the next split refines it.
+        //
+        // Players, NPCs and items all count the same, because the tick cost they cause is the same:
+        // every simulated entity is broadcast to every interested client. What this does NOT capture is
+        // that the number of CLIENTS also multiplies that cost, so a bucket holding 50 items next to
+        // one player is cheaper than a bucket holding 50 players. Weighting by client count is a
+        // refinement this does not attempt.
+        uint16_t popX[MAX_SPLIT_BUCKETS];
+        uint16_t popY[MAX_SPLIT_BUCKETS];
+        uint16_t popZ[MAX_SPLIT_BUCKETS];
     };
 
     struct ZoneQuery
@@ -258,6 +333,66 @@ namespace DGS
     // --- Validation request/ack (PLAN_DGS_VALIDADOR §2.2) ------------------------------------------------
     // The validator does NOT re-simulate: it compares the client's claim against the state PREDICTED by
     // the owning zone (same rule as §3.6). `requestId` is a per-sender seq → idempotency + anti-replay (§2.3).
+    /// Que pide el jugador. Deliberadamente corto: cada verbo que se anade aqui es superficie de
+    /// ataque, y el que no este no se puede pedir.
+    /// LA REGLA, antes que la lista: una accion es DISCRETA, IRREVERSIBLE y sobre algo que NO ES
+    /// TUYO. El movimiento no cumple ninguna de las tres — es continuo, se autocorrige en el paquete
+    /// siguiente y es sobre uno mismo — y por eso no esta aqui: pasarlo por la ruta que falla cerrado
+    /// seria un viaje de ida y vuelta por paso, y un rechazo se sentiria como un tiron.
+    ///
+    /// Cada verbo que se anade es superficie de ataque, asi que la lista se gana el sitio de uno en
+    /// uno. Estos tres son operaciones GENERICAS sobre una entidad del mundo, que es lo que la zona
+    /// sabe hacer sin conocer el juego. Coger algo al inventario o usar una puerta NO estan: su efecto
+    /// es del juego, y el ABI del modulo solo devuelve un veredicto — no puede aplicar nada todavia.
+    /// ⚠️ LOS MISMOS NUMEROS QUE `ActionVerb` de `game_module.h`, y no por casualidad: ese vocabulario
+    /// ya existia (ACT_DESTROY, ACT_PLACE, ACT_TRANSFER…) y lo lee el modulo de reglas del proyecto.
+    /// Inventar aqui una numeracion paralela habria obligado a traducir en medio, que es donde se
+    /// cuelan los desajustes silenciosos. `types.h` no incluye `game_module.h` a proposito —un cliente
+    /// no necesita el ABI del modulo—, asi que la unica atadura son estos valores.
+    enum ActionKind : uint16_t
+    {
+        ACTION_REMOVE = 2,  ///< ACT_DESTROY: destruir el objeto `target`
+        ACTION_PLACE  = 5,  ///< ACT_PLACE:   crear un objeto del mundo en `pos` (que, en `data`)
+        ACTION_MOVE   = 6,  ///< ACT_MOVE:    mover el objeto `target` a `pos` (arrastrar, no andar)
+        /// ACT_DROP: un objeto SALE de un inventario y se convierte en objeto del mundo. Es lo que
+        /// pasa al tirar algo, y NO es ACTION_PLACE: colocar una pieza de construccion se valida con
+        /// geometria (que no solape, que apoye), y tirar una piedra no tiene ni catalogo ni encaje.
+        /// Meterlos por el mismo verbo obligaria al modulo a adivinar cual es cual por el payload.
+        ACTION_DROP   = 7
+    };
+
+    /// Una peticion de accion, del cliente a SU zona. No lleva uuid del objeto a proposito: quien
+    /// pide no elige la identidad de lo que se cree — la asigna el servidor, o un cliente podria
+    /// sobrescribir la mesa de otro con solo acertar su numero.
+    struct ActionRequest
+    {
+        /// Para que el que pide pueda reconocer la respuesta. Lo elige el CLIENTE y solo le sirve a el:
+        /// el servidor lo devuelve tal cual y no decide nada con el, asi que inventarselo solo confunde
+        /// a quien se lo invento.
+        uint32_t requestId;
+        uint32_t actor;                    ///< quien lo pide (su uuid de sesion)
+        uint16_t action;                   ///< ActionKind
+        /// Sobre QUE, cuando la accion es sobre algo que ya existe (REMOVE, MOVE). Cero en PLACE, que
+        /// crea. Que el objetivo lo elija quien pide es inevitable —hay que decir cual—, y por eso el
+        /// servidor comprueba que exista y que sea del mundo antes de preguntarle a nadie: un uuid
+        /// inventado no puede convertirse en una peticion valida sobre la mesa de otro.
+        uint32_t target;
+        int32_t  chunkX, chunkY, chunkZ;
+        float    pos[3];
+        uint16_t angle;
+        uint16_t dataSize;
+        uint8_t  data[MAX_ENTITY_DATA];    ///< opaco: que objeto, definido por el juego
+    };
+
+    /// Lo que el servidor contesta a una accion. Llega por el mismo enlace UDP y sellado igual.
+    struct ActionAck
+    {
+        uint32_t requestId;   ///< el que mando el cliente
+        uint16_t action;      ///< ActionKind, para no tener que recordar que pediste
+        uint8_t  accepted;    ///< 1 = ocurrio; 0 = el servidor dijo que no
+        uint32_t uuid;        ///< identidad que le dio el servidor (0 si no se acepto)
+    };
+
     struct ValidateRequest
     {
         uint32_t requestId;     // per-sender seq (anti-replay)

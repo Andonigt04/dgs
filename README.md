@@ -230,6 +230,24 @@ Or through the CLI (local or cluster):
 ./build/dgs_cli status
 ```
 
+### The whole thing, in one command
+
+`dgs run` starts one of each node, and one zone cannot show the thing worth showing. For a demo — or
+for looking at the system while it works — `tools/demo_cluster.sh` stands up **two** zones side by side
+and sets the three variables that decide whether anything is visible:
+
+```bash
+./tools/demo_cluster.sh start     # head, persistence, validator, social, zone A (chunk 0), zone B (1..7)
+./tools/demo_cluster.sh status
+./tools/demo_cluster.sh stop
+```
+
+It prints what to run next: `fill_world` for the crowd, `dgs_viewer` for the panel, and a `tail` that
+shows a handoff as it happens. The three variables are `INTEREST_RADIUS_M` (**0 by default = everybody
+hears everybody**), `ENTITY_LEASE_MS` (3 s, which purges props) and `DGS_OBSERVE_TOKEN` (unset = the
+zone refuses every observer). Zone A owns exactly one chunk so the first border a crosser reaches is a
+**node** border, seconds in, rather than one of its own.
+
 ---
 
 ## Capacity, measured
@@ -343,6 +361,27 @@ nobody sends. (And `sendResizeCommand` is zero-initialised.)
 
 ---
 
+## A second node that would not start
+
+`validador_node` did `return 1` if it could not reach the persistence node at start-up. Nothing
+guarantees an order in a cluster — Kubernetes starts pods as it pleases, `docker compose up` starts
+them all at once — and `tools/demo_cluster.sh` reproduced it **every single time**: persistence needs a
+moment to reach Mongo, the validator gave up inside that window and died, and the cluster ran with no
+anti-cheat at all and a validator log two lines long. Five of six processes alive, and the missing one
+was the one that judges.
+
+The rule the rest of the system already follows is written in `zone_node`: *a node must start, and keep
+ticking, whether or not there is a database*. Persistence is where a validator FORWARDS accepted state;
+losing it costs durability, not validation, and validation is what the process is for. It now starts,
+says so on one line, and validates.
+
+> Measured: with no persistence at all it comes up, announces `Persistence unavailable -> validating
+> anyway, accepted state is NOT forwarded`, and keeps running. And **reconnection is not implemented** —
+> if persistence appears later this node will not notice until it is restarted, which is why the demo
+> script waits for persistence before starting it.
+
+---
+
 ## Running the CI without a runner
 
 The workflow had never executed. Not "was failing" — had never run at all, so every claim in it was
@@ -384,7 +423,21 @@ runs every test CMake *registers*, not the ones a job happened to build: it comp
 out of `CMakeLists.txt` and differencing it against the job's target list — a check that now costs
 nothing to repeat.
 
-Once it could run, it found things, which is the entire point of a job nobody had ever executed:
+**And then the pipeline ran for real and found a third thing.** `zone_policy_e2e` failed in the normal
+job with `LAYERS 1+2: the breaker reports the fault` — while its own output, four lines above the
+FAILED line, showed `[status #2] state=0` during the outage. The assertion sampled the state **once**,
+after the window, and the state *oscillates* while the arbiter is mute: the breaker trips (2),
+exhausts `CB_MAX_OPEN` and fails open (0), the retry reconnects (1), and it starts again. A single
+sample is a coin toss. What the layer promises is that the head **is told** at some point, which is a
+property of the stream, so it is measured over the stream now: every status report during the outage
+is counted, and at least one must not be "ok". Forcing the zone to always report "ok" turns it red.
+
+> This also corrects something written here earlier. When the same test failed under TSan, that was put
+> down to the instrumentation slowdown. It was not — it was this, and the slowdown only changed which
+> instant the coin landed on. The exclusion has been removed and the test runs under TSan again.
+
+Once it could run, the TSan job found things, which is the entire point of a job nobody had ever
+executed:
 
 - **`thread_pool_test`, in two steps.** TSan reported a *double lock of a mutex* and a data race on
   the barrier's `std::set`. The shared state was three stack locals captured **by reference** into
@@ -394,20 +447,23 @@ Once it could run, it found things, which is the entire point of a job nobody ha
   **TSan still reported the double lock**, so the construct was the problem rather than where it lived.
   The barrier never needed a mutex: it is atomics now — take a slot, record the thread, wait for the
   count. Clean under TSan, and the counter-proof still comes back as 1 on a one-worker pool.
-- **An open finding in `Client::pollChats`**, four reports on the internals of `m_incomingChats`. What
-  makes it unexplained is that TSan prints `mutexes: write M100` on **both** sides — the reader in
-  `pollChats` and the writer in `recvLoop` hold the same `m_mtx` — and a race under a common mutex is
-  not something TSan normally reports. Either a lifetime or ordering subtlety I have not found, or an
-  artefact of TSan first observing that mutex late (it records its creation at `client.cpp:79`, after
-  the thread was already running). **Not fixed, not guessed at**: `client_e2e` is excluded from the
-  TSan job by name, with that reason written next to the exclusion — which is not the same thing as
-  the `|| true` this repository used to hide verdicts behind.
-- **`zone_policy_e2e` is excluded too, for a plainer reason.** It asserts a *policy over time* — how
-  many validator timeouts inside which window trip the breaker, and what it reports while tripped.
-  Under a 5–10× instrumentation slowdown the zone takes a different and equally correct path: it
-  exhausts its trips and fails open (state 0) where the test expects the breaker still OPEN. That is
-  the clock, not a race. The run that showed it reported **zero** ThreadSanitizer warnings across
-  every other test, which is the number that matters.
+- **`Client::pollChats` — a ThreadSanitizer artefact, established rather than assumed.** Four reports:
+  a *double lock of a mutex* in `recvLoop` and data races on `m_incomingChats`, with TSan printing
+  `mutexes: write M100` on **both** sides — reader and writer hold the same `m_mtx`, which is not
+  something TSan reports. It reproduces **5 runs out of 5 on gcc 11** (Ubuntu 22.04) and **0 out of 6
+  on gcc 16**, and the mutex TSan names is the one `queryZone` takes around `m_zoneCv.wait_for`.
+
+  Reduced to 25 lines with no bug in them — `unique_lock` + `cv.wait_for` on one thread, `lock_guard` +
+  notify on the other — and gcc 11 reports the same double lock. (The first version of that reduction
+  had a real race of its own, a plain `bool stop` written unlocked; with that fixed it still reports.)
+  The explicit-loop form of `wait_for` reports it too, so it is `wait_for` itself: **TSan loses the
+  mutex across its internal unlock/relock, and every later access under it looks unsynchronised.**
+  Nothing to fix in the client; the two tests that link `DGS::Client` — `client_e2e` and
+  `client_handoff_e2e` — are excluded from the TSan job by name, with that reason written next to the
+  exclusion. The second one was checked rather than assumed into the same bucket: run alone under TSan
+  in the CI container it comes back **8 OK · 0 FAILED**, with the handoff completing (transfers 2,
+  acked 2, promotions 2), and the two warnings are that same `recvLoop` double lock. It is excluded
+  because of the instrumentation, not because it is unhappy.
 
 ---
 
@@ -418,9 +474,11 @@ TLS covers the TCP control plane. It left the busiest and most personal traffic 
 exactly the feed the observer token exists to protect, readable by anyone on the path, and forgeable
 because nothing authenticated it either.
 
-Each UDP datagram is sealed with **AES-256-GCM**: `nonce(12) || ciphertext || tag(16)`, 28 bytes of
-overhead (measured: a 53-byte packet leaves as 81). The tag is what makes forgery fail rather than only
-eavesdropping — flipping **one bit** makes the receiver drop it.
+Each UDP datagram is sealed with **AES-256-GCM**: `session(4) || nonce(12) || ciphertext || tag(16)`,
+32 bytes of overhead (measured: a 53-byte packet leaves as 85). The tag is what makes forgery fail
+rather than only eavesdropping — flipping **one bit** makes the receiver drop it — and the session id,
+which travels in the clear, is bound in as additional authenticated data so it cannot be swapped for
+somebody else's.
 
 **Not DTLS, and the reason is measured.** A DTLS session is per peer, and a zone's broadcast is one
 payload to N recipients: the zone would hold N sessions and encrypt the same snapshot N times, throwing
@@ -441,10 +499,20 @@ also caught the node's own `bytesTx` still counting the **plaintext** size, so i
 under-reported by 28 bytes per datagram the moment encryption was switched on — a capacity number
 quietly measuring something other than the wire.
 
-**What this deliberately is not.** It is a **group key**: every client that can talk to the zone holds
-it, so a client could decrypt another client's uplink if it captured it (for the broadcast that changes
-nothing — they all receive it anyway). Per-session keys from the login API are the answer, and are not
-done. And **replay is not prevented**: a captured datagram can be re-sent inside its lifetime. The
+**Two kinds of key, because the broadcast and the uplink are different problems.**
+
+| | key | why |
+|---|---|---|
+| the zone's **broadcast** | the group key, `DGS_UDP_KEY`, session 0 | the same payload goes to N recipients; one key is what lets the zone seal each frame **once** instead of once per recipient |
+| a client's **uplink** | `HMAC-SHA256(DGS_UDP_MASTER, session)` | the servers hold the master and derive; a client is issued only its own key, so it cannot read the player next to it |
+
+The group key alone was the obvious hole: every client holds it, so any client that could capture
+another's uplink could read it. That is closed. **What is still missing is the plumbing, not the
+mechanism**: the login API already authenticates and returns a token, and that is where the session id
+and its key belong — `tests/udp_crypto_test.cpp` computes them exactly as that endpoint would, which is
+the honest way to say the mechanism works and the front door is not wired to it yet.
+
+And **replay is not prevented**: a captured datagram can be re-sent inside its lifetime. The
 layer above already handles that for the traffic that matters — the validator's minimum-dt discard
 exists to reject duplicated and reordered samples — but it is said out loud because a reader would
 otherwise assume GCM's nonce covers replay, and it does not.
@@ -498,6 +566,63 @@ data — and every readiness gate and epoll loop in the repository asks it befor
 The suite runs with TLS **off**, so that was found by standing the real cluster up with certificates
 and watching it: head, persistence, validator, social, zone and four players, which now completes the
 chain end to end with **4 documents in Mongo and no handshake failures**.
+
+**A third disagreement, found later: a closed connection is not "no data".** The readiness gates ask
+`poll(fd) && pending(fd)`. When a peer *dies*, `poll` reports the descriptor readable — that is what
+EOF looks like — and `pending()` answered "no application data", so the node **never called `receive`**
+and never got its 0. `zone_node` then noticed the head was gone only later, through a failed `send`:
+exactly the blindness that [One `send` is one `receive`](#one-send-is-one-receive) records for plain
+TCP, restored by TLS through a different door. Measured with certificates on, `reconnect_e2e` went red
+on "it detects the hang-up as a CLEAN CLOSE". `pending()` now answers *"will a read make progress"*,
+and the end of a connection is progress.
+
+Three spellings of that end, incidentally: `close_notify` is what a polite peer sends, while a node
+that is **killed** sends nothing and the socket just stops — which OpenSSL 3 calls `unexpected eof
+while reading` and OpenSSL 1 an `SSL_ERROR_SYSCALL` with an empty error queue. Only the first looked
+like a close.
+
+### One connection, two threads
+
+`Client` sends from the caller's thread and receives on `recvLoop`, over the **same** `TCPSocket`.
+Without TLS the kernel serialises that and it is correct. With TLS it is not: `SSL_read` and
+`SSL_write` share one record layer, one sequence number and one error queue, and running them at once
+is undefined behaviour — not a lost message. This was written down as a known trap before it was
+fixed, which turned out to understate it. With the locks removed and nothing else changed:
+
+| | |
+|---|---|
+| 6 runs of `tls_test` phase F | **6 detected it** |
+| of those | **3 exited with SIGSEGV** mid-exchange |
+| the other 3 | red, having received **37, 39 and 41** of 200 frames |
+| with the locks in place | 200/200, 0 damaged, over **20 consecutive runs**, and clean under ThreadSanitizer |
+
+Two locks per connection, because they answer different questions: one so that at most one OpenSSL
+call touches an `SSL` at a time, and one so that a whole **frame** (length prefix + payload) is
+written before another writer starts — without the second, two senders produce one message's length
+followed by another message's bytes, and the peer cannot resynchronise. The plain path gets the frame
+lock too; the interleaving problem was never TLS-specific, it was simply unreachable before.
+
+Neither lock is ever held across a wait. A writer parked on a full socket buffer must not stop the
+reader from draining the other direction, or two correct-looking locks build a deadlock. That is why
+TLS descriptors are made **non-blocking** after the handshake and the waiting happens in `poll`, with
+the caller's `SO_RCVTIMEO` read back and honoured — the client's receive loop checks `m_running`
+between timeouts, and without that it would never check it again.
+
+### A handshake with no deadline
+
+`connect(host, port, timeoutMs)` promises to return within `timeoutMs`. It bounded the TCP handshake
+and then called `SSL_connect` on a blocking descriptor: a service that accepts and then says nothing —
+an overloaded node, a hung arbiter, a port held by something that is not us — froze the caller for
+ever, and the caller is a node's tick. This is the same lesson `connectWithDeadline` was written for,
+walked back in by TLS.
+
+The listener had the worse half. `accept()` ran `SSL_accept` on the node's own loop, so **any** peer
+could open a socket, send nothing, and stop that node accepting anybody else. No credentials, no
+traffic, one connection — node authentication does not help, because the handshake happens *before*
+anyone gets to prove who they are. Both are now bounded (`DGS_TLS_HANDSHAKE_MS`, 5 s by default), and
+`tls_test` phase G measures it against a real silent peer: a legitimate client is served **657 ms**
+later. Its counter-proof raises the listener's patience to 2.5 s and confirms an 800 ms client is
+then *not* served — so the deadline is doing the work, not luck.
 
 ---
 
@@ -770,6 +895,297 @@ Reverting the fix turns exactly those two cases red.
 > The counter-proof caught it — with the fix reverted, that phase stayed **green**. It was measuring
 > "was it there at some point" rather than "is it there now".
 
+### And then nobody ever asked for one
+
+All of the above was correct, tested, and **unreachable from the shipped client**.
+
+Only the OWNER can start a handoff: `checkAndTransfer` walks the entities a zone owns and cedes the
+ones whose chunk has left its bounds. So the crossing has to be reported to the zone you are leaving.
+`handoff_e2e` does exactly that — it sends the out-of-bounds chunk to the zone that owns the entity —
+which is why it passes.
+
+`Client::sendTransform` did the opposite. On a chunk change it asked the head **first** and sent the
+next datagram to the new zone, so the previous owner never heard the player had left. It simply
+stopped receiving updates and the lease GC dropped them a few seconds later. Measured with the real
+client, a real head and two real `zone_node`s, walking a player from chunk 0 into chunk 1:
+
+| | |
+|---|---|
+| `out of bounds. Transferring` | **0** |
+| `handoff ACKED` | **0** |
+| `promoted to real` | **0** |
+
+Nothing was broken. Nothing was reached. And the consequence is worse than a missing log line: with no
+handoff, **no server-side state moves**. The new zone rebuilds the entity from the client's own
+datagram, which quietly makes the client the source of truth for its own stats at every border it
+crosses — in a system whose whole third layer exists to stop exactly that.
+
+The client now **announces**: it keeps reporting to the zone it is leaving, carrying the new chunk,
+for `ZONE_ANNOUNCE_MS` (300 ms — six datagrams at 20 Hz, so losing one to UDP does not lose the
+handoff), and only then asks the head. Authority moves when the servers agree it has, not when the
+client decides. `tests/client_handoff_e2e.cpp` measures the whole chain through the real `DGS::Client`
+and its counter-proof is a player who never crosses, who must cause none.
+
+> `client_e2e` had pinned the old order — *"moving to another chunk DOES re-query the head"* — and it
+> was green throughout. A test can hold a contract in place long after the contract became the bug.
+
+### Two more packets that contradicted the last one
+
+Found while writing that test, both silent, both in the same family:
+
+- **`sendTransform` sent a zeroed `Stats`.** The zone's S1 filter allows `maxSpeed * dt + 1 m` and
+  believes the most recent packet, so `maxSpeed` was 0 and the 1 m of slack was the only thing letting
+  anyone move: about **20 m/s at 20 Hz**, for every player in the engine. Anything faster was discarded
+  without a word — indistinguishable from packet loss. `sendStats` could declare a speed and the very
+  next transform erased it.
+- **`sendStats` and `sendInventory` sent a zeroed position**, teleporting the player to the origin of
+  their chunk. S1 rejected them, correctly, so declaring stats was itself unreliable.
+
+The client now remembers both and carries them, and phase C of `client_handoff_e2e` measures it: a
+player who declares 400 m/s gets 16+ of 20 fast steps accepted, one who declares nothing gets 18 of 20
+**rejected**.
+
+> That check is a comparison rather than a zero on purpose. S1 measures `dt` from the **arrival time**
+> of consecutive datagrams, so when packets bunch — which they do the moment the machine is busy — two
+> updates 9 m apart can arrive 1 ms apart and the allowance collapses to the slack no matter how fast
+> the player is entitled to go. Idle: 0 of 20 rejected. Under the full suite: 8 of 20. That jitter
+> sensitivity is S1's own, and it is still there.
+
+---
+
+## A world with things in it
+
+"There are no objects in my database" turned out to be a question about the **lease**, not about
+persistence. Every entity in a zone is leased to whoever reports it, and the GC purges anything not
+heard from within `ENTITY_LEASE_MS` — 3 seconds by default. For a player who disconnects that is the
+point. For a crate on the ground it is fatal: nothing reports a crate.
+
+Measured, three `ENT_ITEM`s placed once through the front door and never touched again:
+
+| | default lease (3 s) | `ENTITY_LEASE_MS=600000` |
+|---|---|---|
+| served at t=1 s | 3 | 3 |
+| served at t=3 s | **0** | 3 |
+| served at t=8 s | 0 | **3** |
+
+Persistence was never the problem. The same items were in Mongo in under a second, and a **fresh
+zone** — nothing injected, nobody connected — restored all three from the database and served them.
+Then lost them again three seconds later, for the same reason.
+
+What was missing was a way to say that an entity belongs to the WORLD rather than to a client.
+`STATE_WORLD_OWNED` is that word: an entity carrying the bit is exempt from the lease GC, and is still
+broadcast, still persisted, still handed over when it crosses a border. The bit is an ordinary field
+of the stored document (`state: 64`), so it survives a restart the way a position does — verified by
+restoring from Mongo into a new zone and watching the items outlive the lease.
+
+`tests/world_object_e2e.cpp` pins both halves, and the second is the first's counter-proof: an item
+**without** the bit is purged on schedule. Without that, "the crate is still there" would also pass on
+a zone whose GC had simply stopped working, which is the more likely bug of the two.
+
+---
+
+## The other half of the client
+
+A player could connect, be routed to a zone, send their position — and stand in an empty world.
+
+`DGS::Client` used its UDP socket to **send** and nothing else. `recvLoop` read the TCP link to the
+head; `m_udp` appeared exactly once in `client.cpp`, inside `sendEntityUDP`. So `pollEntities()` and
+`pollGhosts()` — which is what an engine renders other players from — were fed by nothing, because in a
+real cluster the head routes entity transfers to **zones**, not to clients. The zone's broadcast, the
+entire game plane that interest management and the AEAD sealing were built for, had no reader.
+
+Measured against one live zone at one moment:
+
+| | sent | received |
+|---|---|---|
+| the real `DGS::Client` | 60 transforms | **0 entities, 0 ghosts** |
+| `fill_world`, a raw UDP socket on the same protocol | 320 transforms | **316 datagrams** |
+
+The datagrams were arriving. Nobody read them. Same client, same zone, after the fix: **31 entities**.
+
+Why it stayed invisible: every test that touches the client stands up its own fake and hands it an
+entity over TCP, which pins the plumbing rather than the path. `tests/client_world_e2e.cpp` asks the
+question a player would — *can I see anybody?* — with the counter-proof built in: a player 20 m away
+must show up, one 4 km away must not. Without the second, the first would also pass on a zone shouting
+everything at everybody, and it pins interest management from the only side that matters, the receiving
+one.
+
+> A third thing it pins, because it is a trap rather than a bug: **you hear yourself**. The zone echoes
+> the sender's own entity back, so a game that spawns a remote avatar for every uuid it polls will
+> duplicate its own player.
+
+The reading runs on its own thread. The two sockets block independently — a quiet head must not delay
+the world, and a quiet world must not delay a zone response — and the queue it fills is bounded, because
+it is fed by the whole neighbourhood at 10 Hz and drained by a game that might be paused or loading.
+
+---
+
+## Two things on one wire
+
+### 80 ms of nothing, at every border a player crosses
+
+The question was whether chat could cost the head its job as orchestrator. Answering it needed a
+baseline — how long a zone query takes with the head idle — and the baseline came back at **82 ms on
+loopback**. That was not load. It was `send` writing the 4-byte length prefix and the payload as two
+separate calls: the textbook write-write-read that Nagle's algorithm exists to punish, with the peer's
+delayed-ACK timer sitting on it for 40 ms in each direction.
+
+| | zone query, p50 |
+|---|---|
+| two writes | **82.0 ms** |
+| one end fixed | 41.0 ms |
+| both | **0.07 ms** |
+
+**1170×**, on the path a player takes every time they change chunk. `TCP_NODELAY` was added too and
+then measured to contribute *nothing* on top — the framing was all of it — so it stays only as
+insurance and is not credited with the win. There is no two-write path left at all: the plain link uses
+`writev` (one segment, no copy) and TLS assembles one buffer, because a fallback that wrote twice would
+have left the 40 ms stall waiting for the first message big enough to reach it.
+
+> The first version of that fix gave every connection a fixed 64 kB assembly buffer — 65 MB on a head
+> holding a thousand players, for frames that are seventy bytes. `writev` copies nothing.
+
+### And then the answer to the question
+
+With a real baseline, chat load against the head:
+
+| chatters | msg/s | head CPU | zone query p50 | p95 |
+|---|---|---|---|---|
+| 0 | 0 | ~0 % | 0.07 ms | 0.13 |
+| 48 | 963 | 3.3 % | 0.06 ms | **5.14** |
+| 96 | 1618 | **11.4 %** | **43.60 ms** | 47.10 |
+
+A **600× degradation with the head at eleven per cent of one core**. It never runs out of CPU: it is
+head-of-line blocking. The head's `PKT_CHAT` handler fanned every message to every connection it held —
+other players, and also every zone and validator, which received a packet they do not handle and
+dropped it — so the answer a player waits for arrives *behind* everyone else's conversation on the same
+TCP stream. The probe read **74 chat packets per query** to find its own reply.
+
+Chat now goes to `social_node`, which had the channels, the per-uuid rate limit, the ban list and the
+subscriber fan-out all along, and which nothing was talking to. The client opens its own link there; the
+head has no chat handler left. Same load, measured again:
+
+| | head p50 | head CPU | a listening player | a NODE |
+|---|---|---|---|---|
+| chat through the head | 43.60 ms | 11.4 % | — | received all of it |
+| chat through social | **0.05 ms** | **0.1 %** | 192 messages | **0** |
+
+That last column is the part that nearly made things worse. A zone holds a link to the social node to
+receive **bans**, and it drains that link *one message per tick* — so fanning chat down it would have
+put a ban behind the entire backlog, which is a worse place for it than the head it just left. Chat is
+sent only to connections that never announced themselves as nodes.
+
+> Which needed a fix of its own: `sendAuth` returned early when no secret was configured, so in the
+> default configuration **nothing ever announced itself** and the filter quietly did nothing. It now
+> always sends the packet — that is the "I am a node" part — with the MAC, the part that proves it,
+> zeroed when there is no secret. Found by measuring, not by reading.
+
+> Also found on the way: the listen backlog was **10**. Ninety-six clients connecting at once — which is
+> a restart, not an attack — and the kernel refused most of them.
+
+---
+
+## Each channel where its audience lives
+
+Chat had one route — the head, to everybody — and now it has three, chosen by the only thing that can
+choose: **who is allowed to hear it**.
+
+| channel | served by | because |
+|---|---|---|
+| `LOCAL` | `zone_node` | it is the only process that knows who is NEAR you, and it computes exactly that every tick for the entity broadcast |
+| `GUILD` | `social_node` | it is the only one that knows who is in your guild |
+| `TRADE`, `GLOBAL` | `social_node` | nothing spatial about them |
+
+The split is what keeps both sides simple: **a zone never learns what a guild is, and the social node
+never learns where anybody stands.** Proximity chat rides the player's existing UDP link to their zone,
+sealed like everything else on that plane, filtered by the same `INTEREST_RADIUS_M` as the world, and
+checked against the ban list the zone already keeps for movement. Nothing had to grow a subscription
+model.
+
+`CHAT_LOCAL` had been implemented by **nobody**: the social node returned early for it — "the owning
+zone emits it" — and `zone_node` contained no mention of chat at all. Measured now, from a real client
+through a real zone: the neighbour 20 m away hears it, the player 4 km away hears **0**.
+
+And guild chat was going to **every player online**, which is not a bandwidth question but a privacy
+one. It now reaches guild members only, and `social_e2e` — which had pinned the leak, asserting that a
+stranger received a guild message sent into a guild that did not exist — pins the opposite, with the
+counter-proof that a global message from the same sender still reaches that same stranger.
+
+> How the node knows who is who: from the chat a connection sends, because that already carries the
+> sender's uuid. No new packet, no new protocol. The cost is written under **What is missing**: a
+> player who has only listened is unknown, and is therefore not sent their guild's conversation.
+
+---
+
+## A key a player was never handed
+
+Every key in the system came from the environment. For a node an operator starts that is right; for a
+**player** it is not, and the per-session key is the case that makes it obvious: it exists so that what
+one player says about themselves is not readable by the player standing next to them, which a value
+baked into `DGS_UDP_SESSION` before the process starts — and shared with everyone who can read the unit
+file — does not achieve.
+
+The login response is where a key belongs, and it was being thrown away: `Client::connect` checked the
+status code and ignored the body. So the honest description of per-session keys was "the mechanism
+works, the plumbing to the front door does not exist".
+
+It exists now. `DGS::setUdpSessionKey` takes a key at runtime and is consulted **before** the
+environment, `Client::applyLoginKeys` reads the login response, and a client adopts **two**: the group
+key, because the zone seals its broadcast once for everybody and a client that cannot open it is deaf,
+and its own session key for what it sends. Either may be absent — a login that hands out nothing leaves
+the client exactly where it was.
+
+`client_world_e2e` now runs its entire exchange on an encrypted plane with **no key in the client's
+environment**, which is only possible if the adoption works. Its counter-proof forgets the keys
+mid-run:
+
+| | |
+|---|---|
+| keys from the login | the neighbour 20 m away is seen, the one 4 km away is not |
+| the same client, keys forgotten | **0 uuids heard** |
+
+> The token is still ignored: nothing downstream asks for one. And `DGS_UDP_KEY` remains the fallback
+> for a client that was issued nothing, which is what keeps a plain deployment working.
+
+---
+
+## Filling a cluster that is already running
+
+`load_zone` cannot do this. It stands up its own head, validator and zone, measures them and tears the
+lot down — a benchmark that owns the world it measures, which is no use when you want sixty people in
+a cluster you are already looking at.
+
+`tools/fill_world` is the other half: it starts nothing and drives N players against a live head, the
+way a client does. It **asks the head which zone each player belongs to**, and that is the point — a
+filler with sixty sockets pointed at one UDP port populates the picture and hides the interesting part
+of it, because nobody ever crosses anything.
+
+```bash
+FILL_SPREAD_CHUNKS=8 FILL_CHUNK_BASE=50 FILL_CROSSERS=2 ./build/fill_world 32
+```
+
+```
+fill_world: 32/32 players placed by the head · 8 chunks from 50 · 2 crossers
+  t= 19s  sent 672/s (target 640) · received 21785 · zone queries 40
+```
+
+It prints the rate it **achieved**, not the one it intended: a filler that cannot keep up is showing a
+world that is not the one you think you are recording, and that looks identical to a zone dropping
+people.
+
+Two things it taught, both by being wrong first:
+
+- **A crosser dropped in the middle of a 1 km chunk needs 83 seconds to reach the edge.** Twenty
+  seconds of recording, not one handoff. They start `FILL_CROSS_START_M` from the border now, and they
+  turn around at the far end instead of wrapping — a 7 km jump back to the first chunk is a teleport,
+  which is exactly what S1 exists to reject.
+- **Re-querying the head at the border produced zero handoffs**, which is how the client bug above was
+  found. It announces to the zone it is leaving first.
+
+To see interest management do anything, the players have to be spread out and `INTEREST_RADIUS_M` has
+to be set — it is **0 by default, meaning everybody hears everybody**. With 64 players over 8 chunks,
+measured here: egress 2.67 → 0.17 MB/s and loop 28 808 → 1 980 µs.
+
 ---
 
 ## Restoring a zone
@@ -966,7 +1382,11 @@ distance, which `net_degraded` verifies with a flood of 20 jumps of 100 m at 1 m
 | `SOCIAL_RESTORE_MS` | `2000` | social_node (deadline for the restore answer) |
 | `DGS_CLUSTER_SECRET` | _(unset = ports open)_ | every node (shared secret for node authentication) |
 | `DGS_TLS_CERT` / `DGS_TLS_KEY` / `DGS_TLS_CA` | _(unset = plain TCP)_ | every node (mutual TLS; all three or none) |
-| `DGS_UDP_KEY` | _(unset = plain UDP)_ | zone, clients, viewer (AES-256-GCM on the game plane) |
+| `DGS_TLS_HANDSHAKE_MS` | `5000` | every node (deadline for a TLS handshake, both directions) |
+| `DGS_UDP_KEY` | _(unset = plain UDP)_ | zone, clients, viewer (group key: the broadcast) |
+| `DGS_UDP_MASTER` | _(unset)_ | servers only (derives per-session uplink keys) |
+| `DGS_UDP_SESSION` / `DGS_UDP_SESSION_KEY` | _(unset = group key)_ | a client's own session id and its 64-hex key |
+| `ZONE_ANNOUNCE_MS` | `300` | client (how long a crossing player keeps reporting to the zone it leaves) |
 | `VALIDATOR_COMMAND_MS` | `500` | validador_node (how long it looks for an initial `Command`) |
 | `API_HOST` | `api` | client |
 | `API_PORT` | `8080` | client |
@@ -992,9 +1412,52 @@ Written down because a list of what is not there is worth more than a list of wh
 - **One certificate for the whole cluster, in the test tooling.** `tools/tls/make_certs.sh` issues a
   single shared certificate so mutual TLS can be exercised end to end. A real deployment issues one per
   node from a CA it controls, and rotates them; none of that is here.
-- **The UDP key is one value for the whole world, and does not prevent replay.** A deployment would
-  issue a per-session key from the login API; and a captured datagram can be re-sent inside its
-  lifetime — the validator's minimum-dt discard and S1 are what handle that today.
+- **There is no REAL login API.** `Client::connect` does a `POST /api/auth/login` and refuses to go
+  further on anything but a 200 — before it asks the head for a zone. Grep the repository: that path
+  appears in the client, in the tests that fake it in-process, and in `tools/fake_login_api`, which is a
+  development stub that **accepts every password**, is in no manifest, and must never be deployed. What
+  the endpoint has to *do* is now settled and exercised — it hands out the group key and a per-session
+  UDP key, and the client adopts both — but nothing authenticates anybody, and the token it returns is
+  still ignored downstream.
+- **Nothing has anything to put in `sendInventory` yet.** The path exists end to end now
+  (`Haruka::Network::sendInventory` → `Application` → `Client`) and the zone keeps what it is sent, but
+  no game serialises a backpack into it, so the blob is always empty.
+- **A player who only listens does not hear their guild.** The social node learns which uuid is behind
+  a connection from the chat that connection SENDS — which is what the protocol already carries — so a
+  player who has never spoken is unknown, and an unknown connection is not given a guild's
+  conversation. Erring towards silence is deliberate (the alternative leaks), but the real answer is an
+  identify packet the client sends on connecting, and that is not written.
+- **`TRADE` and `GLOBAL` still go to every player.** Only `GUILD` is filtered by membership. There is
+  no party channel at all: the social node keeps party state and `ChatChannel` has no value for it.
+- **A payload cannot be CLEARED.** `dataSize == 0` now means "unchanged", which is what makes an
+  inventory survive movement — and it leaves no way to say "mine is empty now". Nothing needs it today;
+  it would need a signal of its own.
+- **A full payload does not fit in one datagram.** `MAX_ENTITY_DATA` is 4096 bytes, so an entity
+  carrying a full inventory is a ~4.2 kB UDP datagram: over a typical 1500-byte MTU, it fragments, and
+  a single lost fragment loses the whole thing. Untested, because nothing sends one yet.
+- **UDP replay is not prevented.** A captured datagram can be re-sent inside its lifetime; the
+  validator's minimum-dt discard and S1 are what handle that today.
+- **S1 measures `dt` from the arrival time of consecutive datagrams**, so its allowance
+  (`maxSpeed * dt + 1 m`) collapses to the slack whenever packets bunch up — which they do the moment
+  the machine or the network is busy. Measured on an idle box: 0 of 20 legitimate fast steps rejected.
+  Under the full test suite: 8 of 20. Nothing in the system compensates for it, and a player on a
+  jittery connection is punished for their link rather than for their speed. Flooring `dt` at the tick
+  interval, or trusting a client timestamp bounded by the server's, would both work; neither is done.
+- **Nine tests do not pass with TLS switched on**, and until now nobody had ever asked. Running the
+  whole suite with `DGS_TLS_*` set is a different run from the one CI does, and the first time it was
+  tried it came back **13 red**; the fixes below took it to 9, and the run got twice as fast (288 s →
+  129 s) because most of what was left was something waiting. What remains, classified rather than
+  guessed:
+  - three (`persistence_e2e`, `restore_e2e`, `social_persist_e2e`) probe **MongoDB** with a
+    `TCPSocket`, and TLS here is a **per-process** switch: a socket aimed at a service that is not a
+    DGS node cannot handshake with our CA. That is a design fact worth knowing before someone puts a
+    node behind a TLS-terminating proxy.
+  - `socket_framing` injects a corrupt length with a raw `::send` on the descriptor, underneath TLS. It
+    measures a plain-TCP property and cannot mean anything through a record layer.
+  - the other five (`client_e2e`, `validator_e2e`, `action_e2e`, `handoff_e2e`, `zone_policy_e2e`)
+    are **not diagnosed**. Their harnesses do use `TCPSocket`, so "the fake server speaks plain TCP" is
+    not the explanation; `validator_e2e` fails to connect to the node it spawned and then dies of
+    SIGPIPE. Not investigated further, and saying so is the point.
 - **It has never run on more than one machine.** Every number here is loopback on one box. The k8s and
   terraform manifests exist and have not been exercised against a real cluster.
 - **CI has still never run on GitHub.** The workflow now runs green in a clean `ubuntu:22.04`

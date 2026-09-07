@@ -104,6 +104,64 @@ static int readType(const FakeZone& z)
     return (int)buf[0];
 }
 
+/// Reads one packet and, if it is a resize Command, returns the new maximum it carries. -1 otherwise.
+/// This is what makes the population-cut phase a measurement: the type alone says a split happened,
+/// the VALUE says where it cut.
+static int readResizeTo(const FakeZone& z)
+{
+    uint8_t buf[8192];
+    const int n = g_wire.receive(z.testFd, buf, sizeof(buf));
+    if (n <= 0 || buf[0] != DGS::PKT_COMMAND) return -1;
+    DGS::Packet p; p.setBuffer(buf, (size_t)n);
+    auto cmd = p.unpackCommand();
+    return (cmd.purpose == DGS::CMD_TRANSFER_SERVER) ? cmd.chunkX : -1;
+}
+
+/// Registers a zone with a POPULATION PROFILE: `fill(bucket)` says how many entities are in each of
+/// the 32 buckets of the X axis. Y and Z are left empty, so the cut can only come from X.
+template <typename F>
+static void refreshWithPopulation(DGS::Orchestrator& o, const FakeZone& z,
+                                  int32_t xMin, int32_t xMax, F fill)
+{
+    DGS::ServerMetrics m{};
+    m.node.chunkXMin = xMin; m.node.chunkXMax = xMax;
+    m.node.chunkYMin = 0;    m.node.chunkYMax = 0;
+    m.node.chunkZMin = 0;    m.node.chunkZMax = 0;
+    std::snprintf(m.node.addr, sizeof(m.node.addr), "127.0.0.1");
+    m.node.port = z.port;
+    for (uint32_t b = 0; b < DGS::MAX_SPLIT_BUCKETS; ++b) m.popX[b] = fill(b);
+    o.updateNodeTopology(z.orchFd, m);
+}
+
+/// Como `refresh`, pero diciendo tambien el rango en Y: hace falta para construir topologias que NO
+/// esten alineadas, que es donde la envolvente y la union dejan de ser lo mismo.
+static void refreshBox(DGS::Orchestrator& o, const FakeZone& z,
+                       int32_t xMin, int32_t xMax, int32_t yMin, int32_t yMax)
+{
+    DGS::ServerMetrics m{};
+    m.node.chunkXMin = xMin; m.node.chunkXMax = xMax;
+    m.node.chunkYMin = yMin; m.node.chunkYMax = yMax;
+    m.node.chunkZMin = 0;    m.node.chunkZMax = 99;
+    std::snprintf(m.node.addr, sizeof(m.node.addr), "127.0.0.1");
+    m.node.port = z.port;
+    o.updateNodeTopology(z.orchFd, m);
+}
+
+/// Lee un comando de resize y devuelve el rango que lleva. `outMin/outMax` solo valen si devuelve true.
+/// Es lo que convierte la fase de fusion en una medida: el tipo del paquete dice que ALGO se mando,
+/// el rango dice QUE se mando — y "el superviviente crece hasta cubrir al muerto" es el rango.
+static bool readResizeRange(const FakeZone& z, int32_t& outMin, int32_t& outMax)
+{
+    uint8_t buf[8192];
+    const int n = g_wire.receive(z.testFd, buf, sizeof(buf));
+    if (n <= 0 || buf[0] != DGS::PKT_COMMAND) return false;
+    DGS::Packet p; p.setBuffer(buf, (size_t)n);
+    auto cmd = p.unpackCommand();
+    if (cmd.purpose != DGS::CMD_TRANSFER_SERVER) return false;
+    outMax = cmd.chunkX; outMin = cmd.chunkY;
+    return true;
+}
+
 /// Drains and counts whatever is queued for this zone, so one phase cannot pollute the next.
 static int drainPackets(const FakeZone& z)
 {
@@ -219,6 +277,186 @@ int main()
         check(!inActiveZones(pr, C.orchFd),
               "HIGH then low: the low-priority one does NOT overwrite it (still EVICT)");
 
+        close(A.testFd); close(B.testFd); close(C.testFd);
+    }
+
+    // ══ (3b) MERGE AND SPLIT ARE NOT A PRIORITY QUESTION ══════════════════════════════════════
+    // ⚠️ A ZONE COULD NEVER SCALE UP ONCE IT HAD BEEN IDLE. MERGE outranks SPLIT, the queue holds one
+    // operation per zone, and `enqueueLifecycle` kept the higher-priority one — so a MERGE queued
+    // while the zone was empty sat in that slot and every later SPLIT was discarded in silence.
+    //
+    // Measured before the fix: 80 players in one zone with the shipped defaults, 25 seconds. The head
+    // printed "Umbral alcanzado ... -> encolado SPLIT" 217 times and spawned ZERO children.
+    //
+    // They are not a priority question. They are contradictory statements about the same zone made by
+    // the same evaluation of the same metrics sample — "it is idle, drain it" versus "it is drowning,
+    // divide it" — and the newest one is the true one. Crash and reassign still outrank both, which is
+    // what phase (3) above pins.
+    {
+        DGS::TCPSocket s3b;
+        DGS::Orchestrator mx(s3b);
+        FakeZone A = makeZone(mx, 600, 649);
+        FakeZone B = makeZone(mx, 650, 699);   // a neighbour, so a MERGE would have somewhere to go
+
+        // The order that used to fail: idle first, then loaded.
+        mx.enqueueLifecycle(A.orchFd, DGS::LifecycleOp::LIFECYCLE_MERGE);
+        mx.enqueueLifecycle(A.orchFd, DGS::LifecycleOp::LIFECYCLE_SPLIT);
+        mx.processLifecycleQueue();
+        check(readType(A) == DGS::PKT_COMMAND,
+              "MERGE then SPLIT: the zone is SPLIT — the newer decision replaces the stale one");
+        drainPackets(A);
+
+        // And the other way round, which must also be the newest one and not "the higher priority".
+        // The assertion is that the SPLIT does NOT win, not that a DRAIN goes out: whether a merge
+        // actually proceeds depends on `tryMergeDown`'s own preconditions (a victim, the hysteresis
+        // window, the replica floor), and pinning those here would make this a test of the merge
+        // rather than of the queue rule it is about.
+        mx.enqueueLifecycle(B.orchFd, DGS::LifecycleOp::LIFECYCLE_SPLIT);
+        mx.enqueueLifecycle(B.orchFd, DGS::LifecycleOp::LIFECYCLE_MERGE);
+        check(mx.processLifecycleQueue(), "the queue runs the operation it kept");
+        check(readType(B) != DGS::PKT_COMMAND,
+              "SPLIT then MERGE: the SPLIT does NOT win — same rule, both directions");
+
+        drainPackets(B);
+        close(A.testFd); close(B.testFd);
+    }
+
+    // ══ (3c) THE CUT FOLLOWS THE PEOPLE, NOT THE BOX ══════════════════════════════════════════
+    // A zone splits because of the players in it, and players are not spread evenly across its box.
+    // The orchestrator used to know only the box and one entity COUNT, so it cut down the geometric
+    // middle: with a town in chunks 0..10 of a 0..100 zone the cut landed at 50, the child got 51..100
+    // — empty — and the parent kept every single player. It cost a process and relieved nothing, and
+    // it took about five generations (~2.5 min at one split per 30 s) to walk the cut down to them.
+    //
+    // Zones now report a coarse population histogram per axis and the cut goes where the population
+    // divides in half. The two halves of this phase are each other's counter-proof: the SAME code on a
+    // skewed population must answer near the crowd and on a flat one must answer near the middle. One
+    // of them alone would pass on a constant.
+    {
+        DGS::TCPSocket s3c;
+        DGS::Orchestrator pc(s3c);
+
+        // Skewed: everybody in the first quarter of the box.
+        FakeZone A = makeZone(pc, 0, 100);
+        refreshWithPopulation(pc, A, 0, 100, [](uint32_t b){ return (uint16_t)(b < 8 ? 10 : 0); });
+        drainPackets(A);
+        pc.enqueueLifecycle(A.orchFd, DGS::LifecycleOp::LIFECYCLE_SPLIT);
+        pc.processLifecycleQueue();
+        const int cutSkewed = readResizeTo(A);
+        std::printf("    population in chunks 0..24 of 0..100 -> cut at %d\n", cutSkewed);
+        check(cutSkewed >= 0 && cutSkewed < 25,
+              "a crowd at one end is cut INSIDE the crowd, not at the middle of the box");
+
+        // Flat: the same box, the same code, an even population.
+        FakeZone B = makeZone(pc, 0, 100);
+        refreshWithPopulation(pc, B, 0, 100, [](uint32_t){ return (uint16_t)10; });
+        drainPackets(B);
+        pc.enqueueLifecycle(B.orchFd, DGS::LifecycleOp::LIFECYCLE_SPLIT);
+        pc.processLifecycleQueue();
+        const int cutFlat = readResizeTo(B);
+        std::printf("    an even population over 0..100        -> cut at %d\n", cutFlat);
+        check(cutFlat > 40 && cutFlat < 60,
+              "an even population is cut near the middle — so the one above is a measurement");
+
+        close(A.testFd); close(B.testFd);
+    }
+
+    // ══ (3d) LA FUSION TIENE QUE DEJAR EL MUNDO CUBIERTO ══════════════════════════════════════
+    // Una zona se apaga y otra se queda su region. Si ese traspaso no llega hasta el final, los chunks
+    // de la victima no son de nadie: el head contesta con una `ZoneResponse` vacia y un jugador que
+    // este ahi deja de existir para el mundo. Es el unico hueco de la cadena de escalado que puede
+    // ROMPER EL MUNDO en vez de solo desaprovecharlo, asi que se mide en dos momentos distintos —
+    // y el segundo es el que importa:
+    //
+    //   · JUSTO DESPUES de fusionar, cuando el head acaba de anotar la union en su topologia;
+    //   · y DESPUES DE LA SIGUIENTE MUESTRA DE METRICAS del superviviente, que es lo que pasa 100 ms
+    //     mas tarde en un cluster de verdad. `updateNodeTopology` sobrescribe la caja del head con la
+    //     que reporta la zona, y una zona reporta la suya de siempre: no hay forma de que CREZCA.
+    //
+    // Mirar solo lo primero daria verde a un sistema que pierde la region un decimo de segundo despues.
+    {
+        DGS::TCPSocket s3d;
+        DGS::Orchestrator mg(s3d);
+        FakeZone S = makeZone(mg, 700, 749);   // superviviente
+        FakeZone V = makeZone(mg, 750, 799);   // victima, vecina por una cara
+
+        const int32_t victimChunk = 775;       // en el medio de la victima
+        check(mg.findTargetNode(victimChunk, 5, 5) == V.orchFd,
+              "antes de fusionar, el chunk de la victima es suyo");
+
+        // ⚠️ DOS VECES, PORQUE LA PRIMERA NO FUSIONA: la histeresis exige una ventana de carga baja
+        // sostenida, asi que la primera llamada solo ABRE la ventana y devuelve false — "nunca por una
+        // sola muestra". Un cluster real lo pide diez veces por segundo; pedirlo una vez y concluir
+        // que la fusion no funciona seria medir la histeresis creyendo medir la fusion.
+        for (int i = 0; i < 2; ++i) {
+            mg.enqueueLifecycle(S.orchFd, DGS::LifecycleOp::LIFECYCLE_MERGE);
+            mg.processLifecycleQueue();
+        }
+
+        const int justAfter = mg.findTargetNode(victimChunk, 5, 5);
+        std::printf("    justo tras fusionar, el chunk %d va a fd=%d (superviviente=%d)\n",
+                    victimChunk, justAfter, S.orchFd);
+        check(justAfter == S.orchFd,
+              "3d · tras la fusion, el superviviente cubre la region de la victima");
+
+        // ⚠️ Y ESTO ES LO QUE HACE QUE DURE. Anotarlo en la topologia del head no basta: a los 100 ms
+        // llega la siguiente muestra de metricas y `updateNodeTopology` reescribe la caja del head con
+        // la que reporta la zona. Si a la zona no se le dice que ha crecido, reporta la suya de
+        // siempre y la region de la victima se queda SIN DUENO — medido antes de arreglarlo:
+        // `findTargetNode` devolvia -1.
+        int32_t rMin = 0, rMax = 0;
+        const bool told = readResizeRange(S, rMin, rMax);
+        std::printf("    al superviviente se le manda el rango [%d..%d] (told=%d)\n", rMin, rMax, (int)told);
+        check(told && rMin == 700 && rMax == 799,
+              "3d · y se le DICE a la zona que ha crecido, con el rango de la union");
+
+        // Con esa orden aplicada, la zona reporta la caja nueva y la cobertura se sostiene.
+        refresh(mg, S, rMin, rMax);
+        const int afterMetrics = mg.findTargetNode(victimChunk, 5, 5);
+        std::printf("    tras la siguiente muestra de metricas, va a fd=%d\n", afterMetrics);
+        check(afterMetrics == S.orchFd,
+              "3d · y SIGUE cubierta cuando el superviviente vuelve a reportar (no hay mundo huerfano)");
+
+        drainPackets(S); drainPackets(V);
+        close(S.testFd); close(V.testFd);
+    }
+
+    // ══ (3e) LA ENVOLVENTE NO ES LA UNION ══════════════════════════════════════════════════════
+    // `absorbRegion` calculaba min/max en los tres ejes y se quedaba con la caja que contiene a las
+    // dos. Eso es MAS GRANDE que su union en cuanto no estan alineadas, y lo que sobra no es espacio
+    // vacio: es territorio de un TERCERO. Como `findTargetNode` devuelve la primera coincidencia por
+    // orden de insercion, el superviviente le robaba los chunks a un vecino que seguia vivo, sin un
+    // solo mensaje.
+    //
+    // Aqui A y B se tocan en X pero NO coinciden en Y, asi que su union no es una caja. C ocupa
+    // justo el trozo que la envolvente se inventaria. La comprobacion es sobre C: siga siendo suyo.
+    {
+        DGS::TCPSocket s3e;
+        DGS::Orchestrator bb(s3e);
+        FakeZone A = makeZone(bb, 800, 809);   // makeZone da Y[0..99]
+        FakeZone B = makeZone(bb, 810, 819);
+        FakeZone C = makeZone(bb, 810, 819);
+
+        // B se queda con la mitad baja de Y; C con la alta. A sigue con Y entero.
+        refreshBox(bb, B, 810, 819, 0, 49);
+        refreshBox(bb, C, 810, 819, 50, 99);
+
+        const int32_t stolenChunk = 815;       // en X de B/C, en la Y ALTA -> es de C
+        check(bb.findTargetNode(stolenChunk, 75, 5) == C.orchFd,
+              "antes de nada, el trozo alto es de C");
+
+        for (int i = 0; i < 2; ++i) {
+            bb.enqueueLifecycle(A.orchFd, DGS::LifecycleOp::LIFECYCLE_MERGE);
+            bb.processLifecycleQueue();
+        }
+
+        const int after = bb.findTargetNode(stolenChunk, 75, 5);
+        std::printf("    tras intentar fusionar A con su vecino, el trozo de C va a fd=%d (C=%d)\n",
+                    after, C.orchFd);
+        check(after == C.orchFd,
+              "3e · una union que no es una caja NO se fusiona: nadie le roba su region a un tercero");
+
+        drainPackets(A); drainPackets(B); drainPackets(C);
         close(A.testFd); close(B.testFd); close(C.testFd);
     }
 
@@ -385,7 +623,11 @@ int main()
         m.node.chunkYMin = 0; m.node.chunkYMax = 99;
         m.node.chunkZMin = 0; m.node.chunkZMax = 99;
         m.node.port = A.port;
-        m.ramUsage = 0.99f; m.performance = 0.01f;    // way over every threshold
+        // ⚠️ `performance` is the TICK TIME IN MILLISECONDS, not the 0..1 the struct comment claims.
+        // This line used to read 0.01f "way over every threshold", which under the old inverted signal
+        // (`performance < EVAL_LOAD_PERF`) meant an idle 0.01 ms tick counted as overloaded. 90 ms of a
+        // 100 ms budget is what an actually struggling zone looks like.
+        m.ramUsage = 0.99f; m.performance = 90.0f;    // out of RAM AND missing its tick budget
         m.failedTransfers = 10000;                    // and failing hard
         m.bytesTx = 1000000; m.bytesRx = 1;
 

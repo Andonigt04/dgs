@@ -2,6 +2,7 @@
 #define DGS_NETWORK_H
 
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <netinet/in.h>
@@ -101,16 +102,45 @@ namespace DGS
             // carry several messages, so OpenSSL may hold decrypted bytes that the kernel no longer
             // reports as readable — the classic way a TLS port goes quiet under load. `pending(fd)`
             // exposes that, and every readiness gate in this repository asks it too.
+            //
+            // ⚠️ ONE CONNECTION MAY BE USED FROM TWO THREADS, and TLS does not tolerate what plain TCP
+            // does. `Client` sends from the caller's thread and receives on its own, over this very
+            // object: with no TLS the kernel serialises that and it is correct, but `SSL_read` and
+            // `SSL_write` on the SAME `SSL` share one record layer and one error state — running them
+            // at once is undefined behaviour, not a lost message. So each connection carries its own
+            // locks (see `Conn` in network.cpp) and this class is safe for ONE READER PLUS ONE WRITER,
+            // and for several writers. It is still not safe for several readers: two threads calling
+            // `receive` on the same descriptor split each other's frames, which no lock here can fix.
             bool tlsEnabled() const;
             bool pending(int fd) const;
 
         private:
             int socketFD;
             void*                        m_ctx = nullptr;   // SSL_CTX*
-            std::map<int, void*>         m_ssl;             // fd -> SSL*
-            bool ensureContext(bool server);
-            void dropTls(int fd);
+            mutable std::map<int, void*> m_conn;            // fd -> Conn* (defined in network.cpp)
+            mutable std::mutex           m_connMtx;         // the MAP only; never held across I/O
+            bool  ensureContext(bool server);
+            void  dropTls(int fd);
+            void* linkFor(int fd, bool create) const;
     };
+
+    /// Adopts a UDP key handed out at RUNTIME, which is how a client is supposed to get one.
+    ///
+    /// ⚠️ EVERY KEY USED TO COME FROM THE ENVIRONMENT, and that is fine for a node started by an
+    /// operator and wrong for a player. A session key exists so that what one player says about
+    /// themselves is not readable by the player next to them; handing it out through `DGS_UDP_SESSION`
+    /// means it is decided before the process starts and shared by everyone who can read the unit file.
+    /// The login response is where it belongs, and this is what lets the client take it from there.
+    ///
+    /// `session` 0 is the GROUP key — the zone's broadcast, which every client must be able to open, so
+    /// a client typically adopts two: the group key to read the world and its own to write to it.
+    /// `keyHex` is 64 hex characters (the raw 32-byte key, NOT a passphrase: hashing one end and not
+    /// the other is a mismatch whose only symptom is silence). An empty `keyHex` forgets that session.
+    /// @return false if the key is malformed, in which case nothing is changed.
+    ///
+    /// Runtime keys are consulted BEFORE the environment, so a login can override a deployment default,
+    /// and they are process-wide because the sealing is.
+    bool setUdpSessionKey(uint32_t session, const std::string& keyHex);
 
     /// Is the UDP game plane encrypted in this process? (`DGS_UDP_KEY`)
     bool udpCryptoEnabled();
