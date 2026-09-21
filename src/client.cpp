@@ -6,6 +6,9 @@
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>   // TCP_INFO: el RTT que mide el kernel (ver Client::stats)
+#include <algorithm>
 
 namespace DGS
 {
@@ -273,7 +276,9 @@ namespace DGS
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             m_zoneAnswered = false;
+            const auto tQ0 = std::chrono::steady_clock::now();
             m_tcp.send(m_tcp.getSocketFD(), qp.getRawData(), qp.getSize());
+            m_txBytes += qp.getSize();
 
             if (!m_zoneCv.wait_for(lk, std::chrono::seconds(3), [this] { return m_zoneAnswered; }))
             {
@@ -282,14 +287,18 @@ namespace DGS
             }
             const ZoneResponse zone = m_zoneResp;
             lk.unlock();
+            recordHeadRtt(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tQ0).count());
             return applyZone(zone);
         }
 
         // Before the receive thread exists (during `connect`) this thread is the only reader.
+        const auto tQ0 = std::chrono::steady_clock::now();
         m_tcp.send(m_tcp.getSocketFD(), qp.getRawData(), qp.getSize());
+        m_txBytes += qp.getSize();
 
         uint8_t buf[256];
         int bytes = m_tcp.receive(m_tcp.getSocketFD(), buf, sizeof(buf));
+        if (bytes > 0) { m_rxBytes += (uint64_t)bytes; recordHeadRtt(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tQ0).count()); }
         if (bytes <= 0)
         {
             std::cerr << "[Client] No ZoneResponse received" << std::endl;
@@ -309,7 +318,7 @@ namespace DGS
         // what lets the zone recognise it without comparing sizes.
         Packet p;
         p.pack(e);
-        m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize());
+        if (m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize())) m_txBytes += p.getSize();
     }
 
     /// Milliseconds a crossing player keeps reporting to the zone it is LEAVING. Six datagrams at
@@ -428,6 +437,7 @@ namespace DGS
         // entre no haberse enviado, no haber llegado y haber sido rechazado. Si el envio falla hay
         // que decirlo: es la unica peticion que se manda UNA vez.
         const bool ok = m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize());
+        if (ok) m_txBytes += p.getSize();
         std::cerr << "[Client] accion " << (int)action << " req=" << a.requestId
                   << " actor=" << actor << " -> " << m_zoneAddr << ":" << m_zonePort
                   << " (" << p.getSize() << " bytes)" << (ok ? "" : "  ENVIO FALLIDO") << std::endl;
@@ -478,7 +488,7 @@ namespace DGS
         if (channel == CHAT_LOCAL)
         {
             if (m_zonePort != 0)
-                m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize());
+                if (m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize())) m_txBytes += p.getSize();
             return;
         }
 
@@ -487,7 +497,7 @@ namespace DGS
         // per-uuid rate limit and the ban list live, and it was the one thing in this system nothing
         // was talking to.
         if (!m_socialUp) return;
-        m_social.send(m_social.getSocketFD(), p.getRawData(), p.getSize());
+        if (m_social.send(m_social.getSocketFD(), p.getRawData(), p.getSize())) m_txBytes += p.getSize();
     }
 
     /// Reads the chat the social node fans out. Its own thread for the same reason the world has one:
@@ -498,6 +508,7 @@ namespace DGS
         while (m_running)
         {
             const int bytes = m_social.receive(m_social.getSocketFD(), buf, sizeof(buf));
+            if (bytes > 0) m_rxBytes += (uint64_t)bytes;
             if (bytes <= 0) continue;   // the 200 ms deadline, or the node hung up
 
             Packet p;
@@ -539,6 +550,7 @@ namespace DGS
         while (m_running)
         {
             const int n = m_udp.receive(buf.data(), buf.size(), from, port);
+            if (n > 0) m_rxBytes += (uint64_t)n;
             // <= 0 is the ordinary case here: the 200 ms deadline expiring, or a datagram that failed
             // its tag. Neither is worth a log line ten times a second.
             if (n <= 0) continue;
@@ -585,6 +597,30 @@ namespace DGS
                         m_actionAcks.push_back(ackIn);
                     break;
                 }
+                case PKT_PONG:
+                {
+                    uint32_t seq = 0; uint64_t tNs = 0;
+                    if (!p.tryUnpackPing(seq, tNs)) break;
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> sl(m_statMtx);
+                    for (auto it = m_pingsInFlight.begin(); it != m_pingsInFlight.end(); ++it)
+                        if (it->seq == seq)
+                        {
+                            const float ms = std::chrono::duration<float, std::milli>(now - it->at).count();
+                            m_pingsInFlight.erase(it);
+                            m_stats.zoneRttMs = ms;
+                            if (m_stats.zoneRttSamples == 0) m_stats.zoneRttMinMs = m_stats.zoneRttMaxMs = m_stats.zoneRttAvgMs = ms;
+                            else
+                            {
+                                m_stats.zoneRttMinMs = std::min(m_stats.zoneRttMinMs, ms);
+                                m_stats.zoneRttMaxMs = std::max(m_stats.zoneRttMaxMs, ms);
+                                m_stats.zoneRttAvgMs += (ms - m_stats.zoneRttAvgMs) / 16.0f;
+                            }
+                            ++m_stats.zoneRttSamples;
+                            break;
+                        }
+                    break;
+                }
                 default: break;   // the zone sends nothing else on this plane today
             }
         }
@@ -598,6 +634,7 @@ namespace DGS
         {
             int bytes = m_tcp.receive(m_tcp.getSocketFD(), buf, sizeof(buf));
             if (bytes <= 0) continue;
+            m_rxBytes += (uint64_t)bytes;
 
             Packet p;
             p.setBuffer(buf, bytes);
@@ -627,5 +664,76 @@ namespace DGS
                 default: break;
             }
         }
+    }
+
+    void Client::recordHeadRtt(float ms)
+    {
+        if (!(ms >= 0.0f)) return;
+        std::lock_guard<std::mutex> lk(m_statMtx);
+        m_stats.headRttMs = ms;
+        if (m_stats.headRttSamples == 0) { m_stats.headRttMinMs = m_stats.headRttMaxMs = m_stats.headRttAvgMs = ms; }
+        else
+        {
+            m_stats.headRttMinMs = std::min(m_stats.headRttMinMs, ms);
+            m_stats.headRttMaxMs = std::max(m_stats.headRttMaxMs, ms);
+            // Media movil exponencial (16 muestras): una consulta lenta no arrastra la media para siempre.
+            m_stats.headRttAvgMs += (ms - m_stats.headRttAvgMs) / 16.0f;
+        }
+        ++m_stats.headRttSamples;
+    }
+
+    void Client::pingZone()
+    {
+        if (!m_running.load() || !hasZone()) return;
+        const auto now = std::chrono::steady_clock::now();
+        uint32_t seq;
+        {
+            std::lock_guard<std::mutex> lk(m_statMtx);
+            seq = ++m_pingSeq;
+            // Los que llevan mas de 2 s sin respuesta se dan por perdidos (y se sueltan: la lista no crece).
+            for (auto it = m_pingsInFlight.begin(); it != m_pingsInFlight.end();)
+                if (std::chrono::duration<float>(now - it->at).count() > 2.0f) { ++m_stats.pingsLost; it = m_pingsInFlight.erase(it); }
+                else ++it;
+            m_pingsInFlight.push_back({ seq, now });
+            ++m_stats.pingsSent;
+            m_lastPingAt = now;
+        }
+        Packet p;
+        p.packPing(PKT_PING, seq, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+        if (m_udp.send(m_zoneAddr, m_zonePort, p.getRawData(), p.getSize())) m_txBytes += p.getSize();
+    }
+
+    Client::LinkStats Client::stats()
+    {
+        // (3) la zona, por su propio plano: un ping por segundo si nadie lo ha mandado antes.
+        if (m_running.load() && hasZone() &&
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - m_lastPingAt).count() >= 1.0f)
+            pingZone();
+        // (2) el RTT que mide el kernel sobre el enlace TCP al head: gratis y sin protocolo. Solo se
+        // actualiza cuando fluye algo, asi que entre consultas de zona es la ultima medida.
+#ifdef __linux__
+        if (m_running.load())
+        {
+            struct tcp_info ti{};
+            socklen_t len = sizeof(ti);
+            if (getsockopt(m_tcp.getSocketFD(), IPPROTO_TCP, TCP_INFO, &ti, &len) == 0 && ti.tcpi_rtt > 0)
+            {
+                const float ms = (float)ti.tcpi_rtt / 1000.0f;
+                // No se acumula como muestra si no ha cambiado: el kernel repite el mismo numero
+                // mientras el enlace esta callado, y eso inflaria la media con copias.
+                bool changed;
+                { std::lock_guard<std::mutex> lk(m_statMtx); changed = std::fabs(ms - m_lastKernelRttMs) > 1e-3f; m_lastKernelRttMs = ms; }
+                if (changed) recordHeadRtt(ms);
+            }
+        }
+#endif
+        LinkStats s;
+        {
+            std::lock_guard<std::mutex> lk(m_statMtx);
+            s = m_stats;
+        }
+        s.txBytes = m_txBytes.load();
+        s.rxBytes = m_rxBytes.load();
+        return s;
     }
 }

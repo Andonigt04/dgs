@@ -139,6 +139,32 @@ namespace DGS
             return m_zonePort ? (m_zoneAddr + ":" + std::to_string(m_zonePort)) : std::string();
         }
 
+        /// LO QUE PASA POR EL CABLE, para un panel de depuracion. Bytes acumulados de TODOS los
+        /// enlaces (head TCP, zona UDP, social TCP), en las dos direcciones, y la latencia al HEAD.
+        ///
+        /// La latencia sale de dos fuentes y ninguna toca el protocolo: (1) cada consulta de zona se
+        /// cronometra (pregunta → respuesta, lo que el head tarda de verdad en contestar), y (2) al
+        /// llamar a `stats()` se lee el RTT que el kernel mide sobre el enlace TCP (`TCP_INFO`; Linux).
+        /// El kernel solo lo actualiza cuando fluye algo por ese enlace, asi que entre consultas de
+        /// zona la cifra es la ultima medida, no la actual. -1 = sin muestra todavia. La zona (UDP) no
+        /// se mide: haria falta un ping/pong en el protocolo.
+        struct LinkStats
+        {
+            uint64_t txBytes = 0, rxBytes = 0;
+            float    headRttMs = -1.0f;                                   ///< ultima muestra
+            float    headRttMinMs = -1.0f, headRttAvgMs = -1.0f, headRttMaxMs = -1.0f;
+            uint32_t headRttSamples = 0;
+            /// LA ZONA (UDP): ping/pong por el enlace del juego (ver `pingZone`). -1 = sin muestra.
+            float    zoneRttMs = -1.0f;
+            float    zoneRttMinMs = -1.0f, zoneRttAvgMs = -1.0f, zoneRttMaxMs = -1.0f;
+            uint32_t zoneRttSamples = 0, pingsSent = 0, pingsLost = 0;
+        };
+        LinkStats stats();
+        /// Manda UN ping a la zona (sin efecto si no hay zona). Quien lo llama decide la cadencia;
+        /// `stats()` lo hace sola cada segundo si nadie lo ha hecho. Un ping sin pong en 2 s cuenta
+        /// como perdido.
+        void pingZone();
+
     private:
         TCPSocket m_tcp;     // → HeadServer  (control: which zone covers my chunk)
         UDPSocket m_udp;     // → ZoneServer  (the game plane: transforms out, the world in)
@@ -186,6 +212,18 @@ namespace DGS
         // rechazado por S1) y el otro los `Stats` en blanco (velocidad 0, todo movimiento rechazado).
         // Con una sola llamada no hay dos versiones de la misma entidad que puedan discrepar, asi que
         // no hay nada que recordar.
+
+        // Contadores del cable (ver `stats`). Atomicos: los hilos de recepcion y el que envia son distintos.
+        std::atomic<uint64_t> m_txBytes{0}, m_rxBytes{0};
+        std::mutex            m_statMtx;
+        LinkStats             m_stats;
+        float                 m_lastKernelRttMs = -1.0f;
+        void recordZoneRtt(float ms);
+        uint32_t m_pingSeq = 0;
+        std::chrono::steady_clock::time_point m_lastPingAt{};
+        struct PingOut { uint32_t seq; std::chrono::steady_clock::time_point at; };
+        std::vector<PingOut> m_pingsInFlight;   // bajo m_statMtx
+        void recordHeadRtt(float ms);
 
         std::thread       m_recvThread;
         // ⚠️ A SECOND THREAD, BECAUSE THE WORLD ARRIVES ON A DIFFERENT SOCKET. `m_udp` was used to SEND

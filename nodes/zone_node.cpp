@@ -1241,6 +1241,22 @@ int main()
                 }
                 continue;
             }
+            // ── PING DE LATENCIA ─────────────────────────────────────────────────────────────
+            // Eco del mismo payload, sellado, al remitente. El sello ya se comprobo al recibir (un
+            // datagrama que no lo abre no llega aqui), asi que no es un amplificador abierto: solo
+            // contesta a quien tiene la clave de la zona, y con el mismo tamaño que recibio.
+            else if (udpBuf[0] == DGS::PKT_PING)
+            {
+                DGS::Packet ping; ping.setBuffer(udpBuf, (size_t)udpBytes);
+                uint32_t seq = 0; uint64_t tNs = 0;
+                if (!ping.tryUnpackPing(seq, tNs)) { statRejected++; continue; }
+                DGS::Packet pong; pong.packPing(DGS::PKT_PONG, seq, tNs);
+                std::vector<uint8_t> sealedPong;
+                DGS::sealForUdp(pong.getRawData(), pong.getSize(), sealedPong);
+                udp_zone_node.sendRaw(clientAddr, clientPort, sealedPong.data(), sealedPong.size());
+                g_bytesTx += DGS::udpWireSize(pong.getSize());
+                continue;
+            }
             else if (udpBuf[0] == DGS::PKT_ENTITY_TRANSFER)
             {
                 DGS::EntityTransfer e{};

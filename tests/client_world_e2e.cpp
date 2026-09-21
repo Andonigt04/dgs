@@ -259,6 +259,23 @@ int main(int argc, char** argv)
     check(seen.count(kMe) == 1,
           "C · and you hear YOURSELF: the zone echoes the sender, so a game must skip its own uuid");
 
+    // ══ F. Latencia a la zona: ping/pong por el plano UDP ════════════════════════════════════════
+    // Tres pings a 100 ms; la zona devuelve el eco sellado y el cliente mide. En loopback tiene que
+    // dar por debajo de 50 ms y ninguno perdido. CONTRAPRUEBA (mas abajo, con las claves olvidadas):
+    // el pong sigue llegando pero no se abre, asi que el ping se da por PERDIDO.
+    if (up)
+    {
+        for (int i = 0; i < 3; ++i) { client.pingZone(); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+        const auto st = client.stats();
+        std::printf("    zona: %u pings, %u muestras, rtt ultimo %.2f ms (min %.2f avg %.2f max %.2f), perdidos %u · tx %llu rx %llu bytes\n",
+                    st.pingsSent, st.zoneRttSamples, st.zoneRttMs, st.zoneRttMinMs, st.zoneRttAvgMs, st.zoneRttMaxMs, st.pingsLost,
+                    (unsigned long long)st.txBytes, (unsigned long long)st.rxBytes);
+        check(st.zoneRttSamples == 3 && st.zoneRttMs >= 0.0f && st.zoneRttMaxMs < 50.0f,
+              "F · tres pings a la zona, tres pongs, RTT < 50 ms en loopback");
+        check(st.pingsLost == 0, "F · ninguno perdido");
+        check(st.txBytes > 0 && st.rxBytes > 0, "F · los contadores del cable cuentan (tx y rx > 0)");
+    }
+
     // ══ E. Proximity chat ════════════════════════════════════════════════════════════════════════
     // ⚠️ `CHAT_LOCAL` WAS IMPLEMENTED BY NOBODY. The social node returns early for it — "the owning
     // zone emits it" — and the zone had zero mentions of chat: a message on that channel went nowhere
@@ -336,6 +353,17 @@ int main(int argc, char** argv)
         std::printf("    with the keys forgotten the client hears %zu uuids\n", deaf.size());
         check(deaf.empty(),
               "D · and forgetting them makes it DEAF (so the keys were what made it work)");
+        // ...y el ping tampoco: el pong llega sellado con una clave que ya no tenemos.
+        // (`stats()` manda un ping por si sola cada segundo, asi que puede haber mas de uno en vuelo.)
+        const auto st1 = client.stats();
+        client.pingZone();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+        client.pingZone();   // este es el que da por perdidos a los de antes (> 2 s sin pong)
+        const auto st2 = client.stats();
+        std::printf("    con las claves olvidadas: perdidos %u -> %u, muestras %u -> %u\n",
+                    st1.pingsLost, st2.pingsLost, st1.zoneRttSamples, st2.zoneRttSamples);
+        check(st2.pingsLost > st1.pingsLost && st2.zoneRttSamples == st1.zoneRttSamples,
+              "F' · contraprueba: sin las claves el ping se da por PERDIDO y no hay muestra nueva");
     }
 
     client.disconnect();

@@ -96,6 +96,13 @@ namespace DGS
         void pack(const SocialDelta& data);
         void pack(const AccountAction& data);
         void pack(const PacketType& t) { clear(); write<PacketType>(t); }
+        /// PING/PONG de latencia (PKT_PING/PKT_PONG): secuencia + reloj del que pregunta, en ns.
+        void packPing(PacketType t, uint32_t seq, uint64_t tNs) { clear(); write<PacketType>(t); write<uint32_t>(seq); write<uint64_t>(tNs); }
+        bool tryUnpackPing(uint32_t& seq, uint64_t& tNs)
+        {
+            if (buffer.size() < 1 + sizeof(uint32_t) + sizeof(uint64_t)) return false;
+            readPos = 1; seq = read<uint32_t>(); tNs = read<uint64_t>(); return true;
+        }
         /// Ask persistence for one entity's last stored state. Payload is just the uuid — the answer is
         /// a PKT_ENTITY_TRANSFER, or a bare PKT_NONE when there is nothing stored for it.
         void packPersistQuery(uint32_t uuid) { clear(); write<PacketType>(PKT_PERSIST_QUERY); write<uint32_t>(uuid); }

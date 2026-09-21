@@ -86,6 +86,12 @@ namespace DGS
         // nadie mas. Dos mundos distintos y ni un mensaje. Una peticion sin respuesta no es una
         // peticion, es una esperanza.
         PKT_ACTION_ACK      = 24,
+        // LATENCIA A LA ZONA (UDP). El cliente manda un PING (secuencia + su reloj) y la zona devuelve
+        // el MISMO payload como PONG, sellado como todo lo demas de ese plano. El cliente resta su
+        // reloj: ida y vuelta real por el enlace que lleva el juego (el RTT del head por TCP mide
+        // otro cable). La zona no guarda nada ni contesta a quien no puede abrir el sello.
+        PKT_PING            = 25,
+        PKT_PONG            = 26,
 
         PKT_DISCONNECT      = 255
     };
