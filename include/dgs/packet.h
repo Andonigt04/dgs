@@ -103,6 +103,48 @@ namespace DGS
             if (buffer.size() < 1 + sizeof(uint32_t) + sizeof(uint64_t)) return false;
             readPos = 1; seq = read<uint32_t>(); tNs = read<uint64_t>(); return true;
         }
+        /// ACK de un PKT_OBSERVE (la zona confirma o rechaza al observador). `accepted` 1 = suscrito
+        /// (y `leaseMs` dice cuanto vence), 0 = rechazado con `reason` ("no token"/"token"/"limit").
+        void packObserveAck(uint8_t accepted, uint32_t leaseMs, const std::string& reason)
+        {
+            clear();
+            write<PacketType>(PKT_OBSERVE_ACK);
+            write<uint8_t>(accepted);
+            write<uint32_t>(leaseMs);
+            writeString(reason);
+        }
+        bool tryUnpackObserveAck(uint8_t& accepted, uint32_t& leaseMs, std::string& reason)
+        {
+            try
+            {
+                if (buffer.size() < 1 + sizeof(uint8_t) + sizeof(uint32_t)) return false;
+                readPos = 1;
+                accepted = read<uint8_t>();
+                leaseMs  = read<uint32_t>();
+                reason   = readString();
+                return true;
+            } catch (const std::exception&) { return false; }
+        }
+        /// EL HEAD pide a la zona cubrir un chunk que nadie cubre (PKT_RELOCATE_ZONE). Payload:
+        /// chunkX/Y/Z. La zona ESTIRA su caja (min/max por eje) hasta incluir ese chunk; el head
+        /// aplica exactamente la misma aritmetica a su copia para poder rutar la consulta YA.
+        void packRelocateZone(int32_t chunkX, int32_t chunkY, int32_t chunkZ)
+        {
+            clear();
+            write<PacketType>(PKT_RELOCATE_ZONE);
+            write<int32_t>(chunkX);
+            write<int32_t>(chunkY);
+            write<int32_t>(chunkZ);
+        }
+        bool tryUnpackRelocateZone(int32_t& chunkX, int32_t& chunkY, int32_t& chunkZ)
+        {
+            if (buffer.size() < 1 + 3 * sizeof(int32_t)) return false;
+            readPos = 1;
+            chunkX = read<int32_t>();
+            chunkY = read<int32_t>();
+            chunkZ = read<int32_t>();
+            return true;
+        }
         /// Ask persistence for one entity's last stored state. Payload is just the uuid — the answer is
         /// a PKT_ENTITY_TRANSFER, or a bare PKT_NONE when there is nothing stored for it.
         void packPersistQuery(uint32_t uuid) { clear(); write<PacketType>(PKT_PERSIST_QUERY); write<uint32_t>(uuid); }

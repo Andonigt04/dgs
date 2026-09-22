@@ -65,12 +65,32 @@ int main()
         // The client now refuses an empty response; this is the other half, the server saying why.
         if (r.port == 0 || r.addr[0] == '\0')
         {
-            static uint64_t misses = 0;
-            ++misses;
-            std::cout << "[HeadServer] NO ZONE covers chunk=(" << q.chunkX << "," << q.chunkY
-                      << "," << q.chunkZ << ")  uuid=" << q.uuid
-                      << "  activeZones=" << orchestrator.activeZones.size()
-                      << "  misses=" << misses << std::endl;
+            // ⚠️ "LA ZONA VIENE A DONDE ESTA EL JUGADOR": un miss ya no es un "vete a otro sitio".
+            // El head estira la caja de una zona hasta cubrir el chunk, se lo dice con
+            // `PKT_RELOCATE_ZONE` y contesta LA RUTA YA — `relocateZoneTo` actualiza la copia local
+            // con la misma aritmetica (min/max) que aplicara la zona, asi que la respuesta no miente.
+            const int relocated = orchestrator.relocateZoneTo(q.chunkX, q.chunkY, q.chunkZ);
+            if (relocated >= 0)
+            {
+                DGS::Packet rel; rel.packRelocateZone(q.chunkX, q.chunkY, q.chunkZ);
+                serverSocket.send(relocated, rel.getRawData(), rel.getSize());
+                r = orchestrator.findZoneResponse(q.chunkX, q.chunkY, q.chunkZ);
+                static uint64_t relocates = 0;
+                ++relocates;
+                std::cout << "[HeadServer] chunk=(" << q.chunkX << "," << q.chunkY << ","
+                          << q.chunkZ << ") uuid=" << q.uuid
+                          << " not covered by any zone: RELOCATED a zone to serve it"
+                          << " (fd=" << relocated << ", relocates=" << relocates << ")" << std::endl;
+            }
+            else
+            {
+                static uint64_t misses = 0;
+                ++misses;
+                std::cout << "[HeadServer] NO ZONE covers chunk=(" << q.chunkX << "," << q.chunkY
+                          << "," << q.chunkZ << ")  uuid=" << q.uuid
+                          << "  activeZones=" << orchestrator.activeZones.size()
+                          << "  misses=" << misses << std::endl;
+            }
         }
 
         DGS::Packet resp;

@@ -52,6 +52,46 @@ namespace DGS
         return addr;
     }
 
+    /// ⚠️ EL `inet_pton` DE `send`/`sendRaw` SE LLAMABA SIN MIRAR SI FUNCIONABA, y ese es el fallo
+    /// silencioso del que todos los demas sintomas eran humo. Si el literal prometido no parsea en la
+    /// familia de ESTE socket — una zona anunciada en IPv6 (`MY_POD_IP`) contra un cliente build IPv4,
+    /// o el "se conecta a ::1 y no ve nada" clasico — el destino quedaba a `0.0.0.0` y el datagrama se
+    /// hundia SIN una sola linea en ningun log: ni en el cliente (solo no sube `txBytes`) ni en el
+    /// servidor. Aqui devuelve false, el llamador ve "not sent", y hay una linea que dice QUE paso.
+    /// @param dest ya con `family` y `port` puestos por el llamador.
+    static bool resolveDest(const std::string& address, SocketAddrType& dest)
+    {
+#ifdef HARUKA_IPV6
+        // ⚠️ glibc NO acepta un literal IPv4 desnudo ("127.0.0.1") en `inet_pton(AF_INET6, ...)` — solo
+        // la forma v4-mapeada "::ffff:a.b.c.d". La zona del demo anuncia `MY_POD_IP=127.0.0.1` y el
+        // build IPv6 lo REchazaba: el hello del viewer (y el transform del cliente v6) se hundia,
+        // y por eso la zona "no registra" a nadie. Un socket IPv6 llega a un peer IPv4 por la
+        // v4-mapeada (dual-stack, V6ONLY=0 en Linux), asi que un literal v4 se envuelve.
+        if (inet_pton(AF_INET6, address.c_str(), &dest.sin6_addr) == 1) return true;
+        if (address.find(':') == std::string::npos)
+        {
+            const std::string mapped = "::ffff:" + address;
+            if (inet_pton(AF_INET6, mapped.c_str(), &dest.sin6_addr) == 1) return true;
+        }
+        std::cerr << "[UDPSocket] send: '" << address << "' no parsea en IPv6 (build HARUKA_IPV6)"
+                  << std::endl;
+        return false;
+#else
+        if (inet_pton(AF_INET, address.c_str(), &dest.sin_addr) == 1) return true;
+        // Un origen grabado por un nodo IPv6 trae la forma "::ffff:a.b.c.d" (v4-mapeada). Para el
+        // destino de un socket v4 la direccion v4 que lleva dentro es la que vale: es el caso real de
+        // "zona v6, cliente v4" que se perdia sin dejar rastro en ninguna parte.
+        if (address.rfind("::ffff:", 0) == 0 &&
+            inet_pton(AF_INET, address.c_str() + 7, &dest.sin_addr) == 1) return true;
+        std::cerr << "[UDPSocket] send: '" << address << "' no parsea en IPv4"
+                  << (address.find(':') != std::string::npos
+                          ? " (parece IPv6; este build es solo IPv4)"
+                          : "")
+                  << std::endl;
+        return false;
+#endif
+    }
+
     UDPSocket::UDPSocket()
     {
         socketFD = socket(AF_FAMILY, SOCK_DGRAM, 0);
@@ -369,12 +409,11 @@ namespace DGS
 #ifdef HARUKA_IPV6
         destAddr.sin6_family = AF_FAMILY;
         destAddr.sin6_port = htons(port);
-        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin6_addr);
 #else
         destAddr.sin_family = AF_FAMILY;
         destAddr.sin_port = htons(port);
-        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin_addr);
 #endif
+        if (!resolveDest(address, destAddr)) return false;
 
         // Sealed when a key is configured. The zone encrypts each broadcast frame ONCE and sends the
         // same bytes to everybody, which is what keeps the N-fan-out affordable.
@@ -398,12 +437,11 @@ namespace DGS
 #ifdef HARUKA_IPV6
         destAddr.sin6_family = AF_FAMILY;
         destAddr.sin6_port = htons(port);
-        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin6_addr);
 #else
         destAddr.sin_family = AF_FAMILY;
         destAddr.sin_port = htons(port);
-        inet_pton(AF_FAMILY, address.c_str(), &destAddr.sin_addr);
 #endif
+        if (!resolveDest(address, destAddr)) return false;
         const ssize_t sent = sendto(socketFD, data, size, 0,
                                     (struct sockaddr*)&destAddr, sizeof(destAddr));
         return sent == (ssize_t)size;

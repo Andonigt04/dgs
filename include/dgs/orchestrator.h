@@ -178,6 +178,43 @@ namespace DGS
                 return ZoneResponse{};
             }
 
+            /// "LA ZONA VIENE A DONDE ESTA EL JUGADOR" (PKT_RELOCATE_ZONE). Cuando una consulta de
+            /// chunk no encuentra cobertura, en vez de devolver el vacio (que deja al cliente "conectado
+            /// pero sin zona", logueando solo una linea que nadie lee), se pide a una zona que AMPLIE su
+            /// caja hasta cubrir ese chunk — y aqui se ESTRIA la copia del head con la misma aritmetica
+            /// que aplicara la zona, para que la respuesta a la consulta sea la ruta correcta AL INSTANTE,
+            /// sin esperar al siguiente PKT_METRICS. Solo estira (min/max por eje), nunca encoge: expandir
+            /// no desaloja nada de lo que la zona ya sirve, y la monotonia evita que reubicaciones
+            /// consecutivas se pisen.
+            ///
+            /// @return el fd de la zona a la que hay que mandar el PKT_RELOCATE_ZONE, o -1 si no hay
+            ///         ninguna utilizable (entonces el miss se queda como estaba, y asi se avisa).
+            int relocateZoneTo(int32_t chunkX, int32_t chunkY, int32_t chunkZ)
+            {
+                // Prefer a zone that already covers the target's Y and Z: then only X needs extending,
+                // which preserves whatever axis neighbours the current box. If none fits, any routable zone.
+                ZoneInfo* best = nullptr;
+                for (auto& zone : activeZones)
+                {
+                    if (!isRoutable(zone.fd)) continue;
+                    const bool yz = chunkY >= zone.chunkYMin && chunkY <= zone.chunkYMax &&
+                                    chunkZ >= zone.chunkZMin && chunkZ <= zone.chunkZMax;
+                    if (yz) { best = &zone; break; }
+                }
+                if (!best)
+                    for (auto& zone : activeZones)
+                        if (isRoutable(zone.fd)) { best = &zone; break; }
+                if (!best) return -1;
+
+                best->chunkXMin = std::clamp(std::min(best->chunkXMin, chunkX), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                best->chunkXMax = std::clamp(std::max(best->chunkXMax, chunkX), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                best->chunkYMin = std::clamp(std::min(best->chunkYMin, chunkY), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                best->chunkYMax = std::clamp(std::max(best->chunkYMax, chunkY), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                best->chunkZMin = std::clamp(std::min(best->chunkZMin, chunkZ), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                best->chunkZMax = std::clamp(std::max(best->chunkZMax, chunkZ), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                return best->fd;
+            }
+
             std::vector<int> findNeighbors(int fd, NeighborMode mode = NeighborMode::FACE)
             {
                 const ZoneInfo* origin = nullptr;

@@ -949,7 +949,24 @@ int main()
             // network for the observer plane; this is the floor, not the ceiling.
             if (udpBytes >= 1 && udpBuf[0] == DGS::PKT_OBSERVE)
             {
-                if (observeToken.empty()) { statRejected++; continue; }   // fail closed
+                // ⚠️ HASTA AHORA ESTO FALLABA EN SILENCIO PARA EL QUE MIRABA: un token vacio, distinto
+                // o el tope de observadores solo imprimian en el stdout de la ZONA, y el viewer seguia
+                // contando "observing N" por los hellos que EL habia mandado. Cada desenlace contesta
+                // ahora un PKT_OBSERVE_ACK por el mismo plano sellado que el feed: el viewer no puede
+                // confundir un rechazo con "no hay nada que ver". El que subscribe se entera al instante,
+                // sin esperar a que algo se mueva.
+                auto observeAck = [&](uint8_t accepted, uint32_t leaseMs, const std::string& reason) {
+                    DGS::Packet ack; ack.packObserveAck(accepted, leaseMs, reason);
+                    std::vector<uint8_t> wire;
+                    DGS::sealForUdp(ack.getRawData(), ack.getSize(), wire);
+                    udp_zone_node.sendRaw(clientAddr, clientPort, wire.data(), wire.size());
+                };
+                if (observeToken.empty())
+                {
+                    statRejected++;
+                    observeAck(0, 0, "no token");   // fail closed...
+                    continue;
+                }
 
                 std::string offered;
                 try {
@@ -972,6 +989,7 @@ int main()
                 {
                     statRejected++;
                     std::cout << "[ZoneNode] observer REJECTED (bad token) " << key << std::endl;
+                    observeAck(0, 0, "token");
                     continue;
                 }
                 // A cap even for authenticated observers: each one multiplies the zone's egress by a
@@ -981,11 +999,13 @@ int main()
                     statRejected++;
                     std::cout << "[ZoneNode] observer REJECTED (limit " << OBSERVER_MAX << ") "
                               << key << std::endl;
+                    observeAck(0, 0, "limit");
                     continue;
                 }
                 if (!observers.count(key))
                     std::cout << "[ZoneNode] observer subscribed " << key << std::endl;
                 observers[key] = { { clientAddr, clientPort }, nowMs() + OBSERVER_LEASE_MS };
+                observeAck(1, OBSERVER_LEASE_MS, "");
             }
             // ── LOCAL CHAT (§3.7 `CHAT_LOCAL`) ──────────────────────────────────────────────────
             // ⚠️ THIS CHANNEL WAS IMPLEMENTED BY NOBODY. The social node returns early for it with the
@@ -1269,7 +1289,16 @@ int main()
                     statRejected++;
                     continue;
                 }
+                // ⚠️ "QUIEN ENTRA, QUE SE SEPA". Un jugador nuevo en ESTA zona se veia en ningun lado:
+                // el panel del cliente y el viewer pedian que la difusion lo trajera, pero si el
+                // transform nunca llegaba por el enlace UDP (clave equivocada, familia de socket,
+                // cliente apuntando a otro head) la zona guardaba silencio y el "entidades 0" parecia un
+                // fallo del viewer cuando era que nadie habia llegado. Solo la primera vez que aparece.
+                const bool isNewPlayer = clientMap.count(e.uuid) == 0;
                 clientMap[e.uuid] = { clientAddr, clientPort };
+                if (isNewPlayer)
+                    std::cout << "[ZoneNode] player 0x" << std::hex << e.uuid << std::dec
+                              << " registered (" << clientAddr << ":" << clientPort << ")" << std::endl;
 
                 // ⚠️ LO QUE UN CLIENTE DECLARA SOBRE SI MISMO NO VALE NADA, Y HASTA AQUI VALIA TODO.
                 // Este datagrama viene por el enlace UDP de un JUGADOR (los traspasos entre zonas van
@@ -1700,6 +1729,36 @@ int main()
 
                         ghostEntities[ghost.uuid] = ghost;
                         ghostLastSeen[ghost.uuid] = nowMs();
+                        break;
+                    }
+                    case DGS::PKT_RELOCATE_ZONE:
+                    {
+                        // EL HEAD nos pide cubrir un chunk que ningun nodo cubria (ver el handler de
+                        // PKT_ZONE_QUERY en head_server_node). ESTIRAMOS la caja por ejes hasta incluir
+                        // ese chunk — la misma aritmetica (min/max) que el head aplico a su copia en
+                        // `relocateZoneTo`, asi que su ruta ya no miente. Solo se estira, nunca se
+                        // encoge: expandir no desaloja lo que esta caja ya sirve, y el siguiente
+                        // PKT_METRICS le ensena al head los numeros reales (que coinciden).
+                        // Un chunk que YA estaba dentro no ocurre (el head no pide lo que cubre), pero
+                        // si llega, no hay nada que hacer.
+                        int32_t rx = 0, ry = 0, rz = 0;
+                        if (!pRecv.tryUnpackRelocateZone(rx, ry, rz)) break;
+                        const bool inside = rx >= xMin && rx <= xMax &&
+                                            ry >= yMin && ry <= yMax &&
+                                            rz >= zMin && rz <= zMax;
+                        if (!inside)
+                        {
+                            xMin = std::clamp(std::min(xMin, rx), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            xMax = std::clamp(std::max(xMax, rx), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            yMin = std::clamp(std::min(yMin, ry), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            yMax = std::clamp(std::max(yMax, ry), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            zMin = std::clamp(std::min(zMin, rz), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            zMax = std::clamp(std::max(zMax, rz), -DGS::CHUNK_COORD_LIMIT, DGS::CHUNK_COORD_LIMIT);
+                            std::cout << "[ZoneNode] relocating to cover chunk=(" << rx << "," << ry
+                                      << "," << rz << ") · box now X[" << xMin << ".." << xMax
+                                      << "] Y[" << yMin << ".." << yMax << "] Z[" << zMin
+                                      << ".." << zMax << "]" << std::endl;
+                        }
                         break;
                     }
                     case DGS::PKT_COMMAND:

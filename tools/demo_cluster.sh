@@ -27,30 +27,37 @@ LOG=${DGS_LOG_DIR:-./demo-logs}
 PIDFILE="$LOG/demo.pids"
 
 CHUNK_M=${CHUNK_SIZE_M:-1000}
-# ⚠️ WHERE THE PLAYERS ACTUALLY ARE. A zone only answers for the chunks it covers, and a game does not
-# spawn at the origin: Survival puts a character on the surface of a planet whose centre is 1.46e8 m
-# away, which is chunk 146089. Against a cluster covering chunks 0..7 the head has no zone, answers
-# with an empty `ZoneResponse`, and the client used to accept it and send its position to nowhere.
-#
-# THAT IS NO LONGER SOMETHING YOU HAVE TO GET RIGHT. Zone B is now open-ended (X0+1 .. 1000000)
-# instead of X0+1..X0+7, so a client spawning anywhere positive is served without anyone guessing.
-# DEMO_CHUNK_X only decides where `fill_world`'s crowd and the A/B border go — it is a camera
-# position, not a requirement.
-#
-# To point the crowd at your player, read the game's own log line and divide by the chunk size:
-#     [Character] Created (local) at 1.46089e+08, 3.28956e+06, 4.19002e+06   ->  DEMO_CHUNK_X=146089
-# Y and Z are covered by a deliberately wide box below, so only X needs saying.
-CHUNK_X0=${DEMO_CHUNK_X:-0}
-# ⚠️ 500 m NO CUBRE UN CHUNK, y con este clúster eso significa un mundo vacío. El juego aparece en
-# el ORIGEN de su chunk y `fill_world` patrulla alrededor del CENTRO (500 m adentro): 707 m en
-# diagonal, fuera de un radio de 500. Medido con una sonda plantada en el punto exacto donde nace el
-# personaje: "0 other entities seen" — conectado, enrutado a la zona correcta, y solo en el mundo.
-# La diagonal de un chunk de 1000 m son 1414 m, así que 1500 garantiza que ves a todo el que comparte
-# tu chunk. Sigue siendo interest management (no es 0, que es el defecto del zone_node y el que hace
-# que 64 jugadores cuesten 28 ms de bucle en vez de 2); solo es un radio que cabe la escena.
-RADIUS=${INTEREST_RADIUS_M:-1500}
+# ⚠️ WHERE THE CROWD GOES = WHERE THE PLAYERS ARE. A zone only broadcasts its OWN entities: a client
+# in zone B (its spawn) never receives zone A's entities, whatever the interest radius (0 included).
+# Survival always spawns at chunk 146089, so the crowd starts THERE by default; the A/B split remains
+# (A owns exactly chunk 146089, B owns 146090..1000000) so the handoff demo still exists. If one of
+# your games spawns elsewhere, say it: DEMO_CHUNK_X=<chunk> (the game's own log "Created (local) at
+# X" divided by the chunk size) moves the crowd AND the border to it. Y and Z are a wide box below,
+# so only X needs saying.
+CHUNK_X0=${DEMO_CHUNK_X:-146089}
+# ⚠️ RADIO DE INTERES: EL DEFECTO ES 0, NO 1500. El demo existe para VER el cluster, y con un radio
+# >0 un jugador que nace a 146 millones de metros del crowd (Survival: chunk 146089; el crowd en
+# 0..7) no ve NADA — screeneo correcto, pero el demo parece vacío y el panel "jugadores 0". Con 0
+# nadie queda filtrado: todo el mundo recibe a todo el mundo, se ve y se cuenta. Cuesta más de loop
+# (64 jugadores: ~28 ms con 0 frente a ~2 ms con radio — justo por eso existe el filtro), pero para
+# un demo el precio es la escena. Para demostrar el filtro real: INTEREST_RADIUS_M=1500 lo activa
+# (la diagonal de un chunk de 1000 m son 1414 m, 1500 garantiza ver a tu chunk).
+RADIUS=${INTEREST_RADIUS_M:-0}
 LEASE=${ENTITY_LEASE_MS:-60000}
 TOKEN=${DGS_OBSERVE_TOKEN:-demo-token}
+
+# ⚠️ LAN POR DEFECTO: el clúster debe responder AUNQUE el cliente entre por su IP de LAN, no solo por
+# loopback. `fake_login_api` enlaza por defecto a 127.0.0.1, así que un cliente de la LAN ve "refused"
+# y "no entra en DGS". Aquí se autodetecta la IP de salida (la del route por defecto) y se anuncia
+# esa: MY_POD_IP (dónde están las zonas) y SOCIAL_HOST (lo que devuelve el login). Overrides:
+# LAN_IP=192.168.x.y o MY_POD_IP=... (desde el inicio: `MY_POD_IP=192.168.0.23 LAN_IP=... ./demo start`)
+if [ -z "${LAN_IP:-}" ]; then
+    LAN_IP=$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p')
+fi
+LAN_IP=${LAN_IP:-127.0.0.1}
+MY_POD_IP=${MY_POD_IP:-$LAN_IP}
+SOCIAL_HOST=${SOCIAL_HOST:-$LAN_IP}
+export MY_POD_IP SOCIAL_HOST
 
 HEAD_PORT=42424
 ZONE_A_UDP=42425
@@ -59,17 +66,24 @@ VALID_TCP=42428
 PERS_PORT=42429
 SOCIAL_PORT=42430
 
-start_node() {   # start_node <name> <logfile> <env assignments...>
+start_node() {   # start_node <name> <logfile> [ENV=...]... [-- ARG...]
     local name=$1 log=$2; shift 2
     if [ ! -x "$BIN/$name" ]; then
         echo "  - $name: not built, skipped"
         return
     fi
+    # `fill_world` y `dgs_viewer` reciben argumentos posicionales; un "--" corta las asignaciones de
+    # entorno de los argumentos del binario.
+    local pre=() args=() sep=0 a
+    for a in "$@"; do
+        if [ "$a" = "--" ]; then sep=1; continue; fi
+        if [ "$sep" -eq 0 ]; then pre+=("$a"); else args+=("$a"); fi
+    done
     # ⚠️ RUN THEM FROM THE LOG DIRECTORY. Several nodes write a CSV of their own next to wherever they
     # were started, so launching them from the repo root drops `headserver_log.csv` and friends into
     # the working tree on every demo.
     local abs; abs=$(cd "$(dirname "$BIN/$name")" && pwd)/$name
-    ( cd "$LOG" && export "$@" && exec "$abs" ) > "$LOG/$log" 2>&1 &
+    ( cd "$LOG" && export "${pre[@]}" && exec "$abs" "${args[@]}" ) > "$LOG/$log" 2>&1 &
     echo $! >> "$PIDFILE"
     echo "  + $name (pid $!) -> $LOG/$log"
 }
@@ -109,7 +123,7 @@ cmd_start() {
     local COMMON=(
         "HEAD_SERVER_HOST=127.0.0.1" "HEAD_SERVER_PORT=$HEAD_PORT"
         "VALIDATOR_HOST=127.0.0.1"   "VALIDATOR_TCP_PORT=$VALID_TCP"
-        "SOCIAL_HOST=127.0.0.1"      "SOCIAL_TCP_PORT=$SOCIAL_PORT"
+        "SOCIAL_HOST=$SOCIAL_HOST"      "SOCIAL_TCP_PORT=$SOCIAL_PORT"
         "PERSISTENCE_HOST=127.0.0.1" "PERSISTENCE_PORT=$PERS_PORT"
         "MY_POD_IP=${MY_POD_IP:-127.0.0.1}"
     )
@@ -135,7 +149,7 @@ cmd_start() {
     # inheritance so it is visible in this file. Without it every client starts its own simulation
     # clock at zero and two players who launched minutes apart are in different hours of the day.
     #   WORLD_TIME_SCALE=200 ./tools/demo_cluster.sh start   -> a day goes by in about seven minutes
-    start_node fake_login_api api.log "FAKE_API_HOST=${FAKE_API_HOST:-127.0.0.1}" \
+    start_node fake_login_api api.log "FAKE_API_HOST=${FAKE_API_HOST:-0.0.0.0}" \
         "DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group}" "DGS_UDP_MASTER=${DGS_UDP_MASTER:-demo-master}" \
         "WORLD_TIME_SCALE=${WORLD_TIME_SCALE:-1.0}" "WORLD_START_S=${WORLD_START_S:-0.0}"
     start_node head_server_node head.log "${COMMON[@]}"
@@ -181,29 +195,38 @@ cmd_start() {
         exit 1
     fi
 
+    # ⚠️ THE CROWD IS PART OF THE DEMO, NOT A HAND-ROLLED STEP. It used to live in the "next:" block
+    # as a command to paste, and a demo whose `start` produces a world with NOBODY in it looks broken:
+    # the game logs in fine, is routed fine, and the panel says "jugadores 0" — every symptom of a
+    # problem while there is none to fix. `fill_world` does not log in, so the sealed plane needs the
+    # GROUP key here or every datagram it sends is silently dropped.
+    start_node fill_world fillworld.log "${COMMON[@]}" \
+        "DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group}" \
+        "FILL_SPREAD_CHUNKS=8" "FILL_CHUNK_BASE=$CHUNK_X0" "FILL_CROSSERS=2" "CHUNK_SIZE_M=$CHUNK_M.0" \
+        -- "32"
+
     cat <<EOF
 
 cluster up: zone A owns chunk x=${CHUNK_X0}, zone B owns x=$((CHUNK_X0+1))..1000000
   (chunk = ${CHUNK_M} m · y and z: -1000000..1000000)
   a client anywhere at x>=${CHUNK_X0} is served; DEMO_CHUNK_X only moves the crowd and the A/B border
   interest radius ${RADIUS} m · entity lease ${LEASE} ms · observer token "$TOKEN"
+  en el menu del juego: api ${LAN_IP}:8080 y head ${LAN_IP}:42424   <- funciona tambien por la LAN
 
 next:
-  # the crowd — 32 players over 8 chunks, 2 of them crossing the A/B border every ~17 s
-  # ⚠️ DGS_UDP_KEY IS NOT OPTIONAL HERE, and this line used to be printed without it. The game plane
-  #    is sealed, a real client gets the key from the login, and \`fill_world\` does not log in — so
-  #    without it every datagram it sends is dropped by the zone and the world stays EMPTY. It fails
-  #    silently and looks exactly like a filler that is running fine: measured, "sent 252/s ·
-  #    received 0" with the head reporting entities=0. With the key: received 2875, entities climbing.
-  DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group} \\
-  FILL_SPREAD_CHUNKS=8 FILL_CHUNK_BASE=${CHUNK_X0} FILL_CROSSERS=2 CHUNK_SIZE_M=${CHUNK_M} \\
-    $BIN/fill_world 32
+  # the crowd (32 players) was already started by \`demo_cluster.sh start\` — if you don't see its
+  # "placed by the head" line, look at $LOG/fillworld.log. 2 of the 32 cross the A/B border every ~17 s.
 
-  # a game client can now log in: the menu's defaults (127.0.0.1:42424, api 127.0.0.1:8080) match
-  #   the game plane is ENCRYPTED and the client needs no key: the login hands it both
+  # a game client can now log in to the print above (${LAN_IP}:8080 / ${LAN_IP}:42424 — no hace falta
+  # que sea el loopback: apuntar a la IP LAN funciona igual). ⚠️ the game plane is ENCRYPTED and the
+  # client needs no key: the login hands it both.
 
   # the viewer, in a corner of the screen
-  DGS_OBSERVE_TOKEN=$TOKEN DGS_CHUNK_SIZE=${CHUNK_M}.0 $BIN/dgs_viewer 127.0.0.1 $HEAD_PORT
+  # ⚠️ DGS_UDP_KEY IS NOT OPTIONAL HERE, and this line used to be printed without it. The game plane
+  #    is sealed and the zones here hold the GROUP key, so a viewer without it sent an UNSIGNED hello
+  #    (dropped by the zone) and parsed the zone's SEALED broadcast as garbage: "observing 2" with an
+  #    empty screen, no representation. With the group key it subscribes and the feed opens.
+  DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group} DGS_OBSERVE_TOKEN=$TOKEN DGS_CHUNK_SIZE=${CHUNK_M}.0 $BIN/dgs_viewer 127.0.0.1 $HEAD_PORT
 
   # watch a handoff happen
   tail -f $LOG/zoneA.log | grep --line-buffered -E "out of bounds|handoff ACKED"

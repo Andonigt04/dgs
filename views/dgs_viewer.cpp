@@ -19,6 +19,7 @@
 //
 //     [head] --ZoneListResponse (TCP)--> [viewer]   the boxes: who serves what
 //     [zone] <--PKT_OBSERVE + token (UDP)- [viewer]   "add me to your broadcast"
+//     [zone] --PKT_OBSERVE_ACK (UDP)--> [viewer]   subscribed / rejected (+ lease)
 //     [zone] --EntityTransfer / GhostDelta--> [viewer]   the moving objects
 //
 // What is on screen, and why each distinction is worth pixels:
@@ -51,6 +52,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <set>
 
 static uint64_t nowMs()
 {
@@ -119,7 +121,12 @@ int main(int argc, char* argv[])
     std::mutex       mtx;
     std::atomic<bool> quit{false};
     std::atomic<bool> headUp{false};
-    std::atomic<int>  observedZones{0};
+    // La zona confirma cada PKT_OBSERVE con un PKT_OBSERVE_ACK (v27). "observing" cuenta SOLO lo
+    // confirmado: un token distinto en la zona, una zona sin token, o el tope de observadores se ven
+    // aqui como rechazos, en lugar de verse como "observing N" que no mueve nada. Los sets los escribe
+    // el hilo del feed (bajo mtx) y los cuenta el hilo del render despues de copiarlos bajo la misma.
+    std::set<std::string>  ackedZones, rejectedZones;   // "addr:port" por zona
+    std::atomic<int>       observedAcked{0}, observedRejected{0};
 
     DGS::TCPSocket head;
     if (!head.connect(headHost, headPort))
@@ -200,12 +207,39 @@ int main(int argc, char* argv[])
                 { std::lock_guard<std::mutex> lk(mtx); zs = state.zones(); }
                 for (const auto& z : zs)
                     udp.send(z.addr, z.port, hello.getRawData(), hello.getSize());
-                observedZones = (int)zs.size();
             }
 
             const int n = udp.receive(buf, sizeof(buf), from, port);
             if (n > 0)
             {
+                // El ACK del observador viaja por el mismo feed sellado: la zona lo confirma justo al
+                // responder, asi que aqui se ve "zonas Z (observing A · rechazadas R)" y no un numero
+                // de hellos. Un ACK no tiene nada que pintar en la escena: se cuenta y se descarta.
+                if (buf[0] == DGS::PKT_OBSERVE_ACK)
+                {
+                    uint8_t accepted = 0; uint32_t leaseMs = 0; std::string reason;
+                    DGS::Packet ack; ack.setBuffer(buf, n);
+                    if (ack.tryUnpackObserveAck(accepted, leaseMs, reason))
+                    {
+                        const std::string key = from + ":" + std::to_string(port);
+                        std::lock_guard<std::mutex> lk(mtx);
+                        const bool wasAcked    = ackedZones.count(key) != 0;
+                        const bool wasRejected = rejectedZones.count(key) != 0;
+                        (accepted ? ackedZones : rejectedZones).insert(key);
+                        (accepted ? rejectedZones : ackedZones).erase(key);
+                        observedAcked    = (int)ackedZones.size();
+                        observedRejected = (int)rejectedZones.size();
+                        if (!accepted && !wasRejected)
+                            std::cerr << "[Viewer] zona " << key << " rechazo la suscripcion"
+                                      << (reason.empty() ? "" : (": " + reason)) << std::endl;
+                        else if (accepted && !wasAcked)
+                            std::cout << "[Viewer] zona " << key
+                                      << " suscrita (lease " << leaseMs << " ms)" << std::endl;
+                        else if (accepted && wasRejected)   // se ponia bien, es la transicion util
+                            std::cout << "[Viewer] zona " << key << " ahora SI observa" << std::endl;
+                    }
+                    continue;
+                }
                 std::lock_guard<std::mutex> lk(mtx);
                 state.onDatagram(buf, n, nowMs());
             }
@@ -346,9 +380,9 @@ int main(int argc, char* argv[])
         for (const auto& e : ents) if (e.ghost) ++ghosts;
         const int sh = GetScreenHeight();
         DrawRectangle(0, sh - 46, GetScreenWidth(), 46, ColorAlpha(BLACK, 0.75f));
-        DrawText(TextFormat("head %s:%d  %s   zones %d (observing %d)   entities %d (%d ghosts)   chunk %.0f",
+        DrawText(TextFormat("head %s:%d  %s   zones %d (observing %d · rejected %d)   entities %d (%d ghosts)   chunk %.0f",
                             headHost, headPort, headUp ? "UP" : "DOWN",
-                            (int)zs.size(), observedZones.load(),
+                            (int)zs.size(), observedAcked.load(), observedRejected.load(),
                             (int)ents.size() - ghosts, ghosts, chunkSize),
                  8, sh - 40, 14, headUp ? RAYWHITE : RED);
         DrawText("0 all · 1-6 single view · G ghosts · TAB list", 8, sh - 20, 12, GRAY);

@@ -16,6 +16,12 @@ namespace DGS
     // 32 keeps the whole thing to 192 bytes per sample and is plenty: the cut only needs to land in the
     // right neighbourhood, and the next split refines it.
     static constexpr uint32_t MAX_SPLIT_BUCKETS = 32;
+    /// ⚠️ LIMITE SEGURO de las coordenadas de chunk (ver la nota de zone_node en los bounds por
+    /// defecto): ±1e6 chunks es a lo que aguantan sin desbordar la aritmetica de `isNearBorder`
+    /// (`xMax - threshold`), del drenaje (`(xMin + xMax) / 2`) y del hash de region (`xMin * 31 +
+    /// yMin * 17`). PKT_RELOCATE_ZONE ESTIRA la caja de una zona y se recorta a este rango — la zona
+    /// y el head aplican el MISMO clamp, o sus copias discreparian.
+    static constexpr int32_t CHUNK_COORD_LIMIT = 1000000;
 
     enum PacketType : uint8_t
     {
@@ -92,6 +98,19 @@ namespace DGS
         // otro cable). La zona no guarda nada ni contesta a quien no puede abrir el sello.
         PKT_PING            = 25,
         PKT_PONG            = 26,
+        // LA ZONA CONTESTA a un PKT_OBSERVE. Hasta ahora el viewer contaba las SUBSCRIPCIONES por lo
+        // que ENVIABA, y un token distinto (o una zona que lo exige y no lo tiene) rechazaba en
+        // silencio: la zona logueaba "observer REJECTED" en SU stdout y el viewer seguia diciendo
+        // "observing N". `accepted=1` + `leaseMs` lo cierra: el viewer solo cuenta lo que la zona
+        // le confirma, y sabe cuanto tarda en re-subscribirse. `reason` es para el que mira:
+        // "no token" / "token" / "limit".
+        PKT_OBSERVE_ACK     = 27,
+        // EL HEAD PIDE A UNA ZONA QUE AMPLIE SU CAJA hasta cubrir un chunk que nadie cubre, y le
+        // contesta la ruta al cliente EN EL MISMO instante (el head optimiza su copia de la caja).
+        // Es "la zona viene a donde este el jugador" en vez de exigir acertar el spawn. La zona solo
+        // ESTIRA un minimo/maximo por eje hasta incluir el chunk; nunca encoge, para no desalojar lo
+        // que ya sirve. Payload: 3 x int32 (chunkX, chunkY, chunkZ).
+        PKT_RELOCATE_ZONE   = 28,
 
         PKT_DISCONNECT      = 255
     };

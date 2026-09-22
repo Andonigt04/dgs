@@ -333,7 +333,13 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 int r;
                 while ((r = viewer.receive(rb, sizeof(rb), rfrom, rport)) > 0)
-                    { ++snapshots; rxBytes += (uint64_t)r; }
+                {
+                    // Un PKT_OBSERVE_ACK (v27) NO es un broadcast: la zona contesta cada subscripcion,
+                    // y contar las confirmaciones aqui inflaria la frecuencia de tick medida y la media
+                    // de bytes por datagrama — y podria maquillar un tick lento. El feed es lo que se pincha.
+                    if (rb[0] == DGS::PKT_OBSERVE_ACK) continue;
+                    ++snapshots; rxBytes += (uint64_t)r;
+                }
             }
             const double secs = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - tr0).count();
