@@ -493,6 +493,50 @@ namespace DGS
 
         return bytesRecived;
     }
+
+    std::string TCPSocket::localAddress(int fd) const
+    {
+        struct sockaddr_storage sa{};
+        socklen_t len = sizeof(sa);
+        if (::getsockname(fd, (struct sockaddr*)&sa, &len) != 0) return {};
+
+        char host[INET6_ADDRSTRLEN] = {0};
+#ifdef HARUKA_IPV6
+        if (sa.ss_family == AF_INET6)
+        {
+            sockaddr_in6* s6 = (sockaddr_in6*)&sa;
+            // ⚠️ UN PEER IPv4 SOBRE UN LISTENER DUAL-STACK SE VE COMO "::ffff:a.b.c.d". Mandar eso
+            // como respuesta rompe `ZoneResponse.addr[MAX_ADDR_LEN]=16` — la forma v4-mapeada no cabe
+            // y se truncaba a "::ffff:192.168.0." silenciosamente. Para el DESTINO vale la v4 pelada:
+            // tanto el cliente build-IPv4 como el IPv6 (que la reenvuelve en `resolveDest`) la usan.
+            if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr))
+            {
+                if (!inet_ntop(AF_INET, &s6->sin6_addr.s6_addr[12], host, sizeof(host))) return {};
+            }
+            else
+            {
+                if (IN6_IS_ADDR_UNSPECIFIED(&s6->sin6_addr)) return {};
+                if (!inet_ntop(AF_INET6, &s6->sin6_addr, host, sizeof(host))) return {};
+            }
+        }
+        else if (sa.ss_family == AF_INET)
+        {
+            sockaddr_in* s4 = (sockaddr_in*)&sa;
+            if (!inet_ntop(AF_INET, &s4->sin_addr, host, sizeof(host))) return {};
+        }
+        else return {};
+#else
+        if (sa.ss_family != AF_INET) return {};
+        sockaddr_in* s4 = (sockaddr_in*)&sa;
+        if (s4->sin_addr.s_addr == htonl(INADDR_ANY)) return {};
+        if (!inet_ntop(AF_INET, &s4->sin_addr, host, sizeof(host))) return {};
+#endif
+        // "255.255.255.255"+null es lo maximo que un `ZoneResponse.addr[16]` puede llevar; una IPv6
+        // global (hasta 46 chars) NO cabe y no debe anunciarse por ahí: en ese caso se devuelve vacio
+        // y el head conserva la ruta que la propia zona anuncio.
+        if (std::strlen(host) + 1 > DGS::MAX_ADDR_LEN) return {};
+        return host;
+    }
     
     // ── TLS ─────────────────────────────────────────────────────────────────────────────────────
     // Node authentication decided who may connect; this decides what anyone on the path can read or

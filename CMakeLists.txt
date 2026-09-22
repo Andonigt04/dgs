@@ -9,7 +9,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 add_library(httplib INTERFACE)
-target_include_directories(httplib INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
+# ⚠️ CMAKE_CURRENT_SOURCE_DIR y no CMAKE_SOURCE_DIR: como subproyecto (FetchContent del motor/juego),
+# CMAKE_SOURCE_DIR apunta a la raiz del proyecto CONSUMIDOR y third_party dejaba de existir.
+target_include_directories(httplib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_compile_definitions(httplib INTERFACE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(httplib INTERFACE OpenSSL::SSL OpenSSL::Crypto)
 add_library(httplib::httplib ALIAS httplib)
@@ -47,11 +49,18 @@ if (HARUKA_USE_IPV6)
     add_compile_definitions(HARUKA_IPV6)
 endif()
 
+# Server side vs client-only. `dgs_client` (+ `httplib`) es TODO lo que consume el juego/motor; los
+# nodos, tools, viewer y tests son del lado server. El juego trae este proyecto via FetchContent con
+# esto OFF (lo fuerza el CMake del motor) para que su build compile SOLO la libreria del cliente.
+option(DGS_BUILD_NODES "Build server nodes, tools, viewer and tests" ON)
+
 set(COMMON_SRCS src/packet.cpp src/network.cpp)
 
 # `network.cpp` speaks TLS now, so every target that links it needs OpenSSL. Declared once here rather
 # than remembered at each of the twenty-odd targets, which is how one gets forgotten.
 link_libraries(OpenSSL::SSL OpenSSL::Crypto)
+
+if (DGS_BUILD_NODES)
 
 add_executable(head_server_node nodes/head_server_node.cpp ${COMMON_SRCS})
 target_link_libraries(head_server_node httplib::httplib OpenSSL::Crypto)   # HMAC for node auth
@@ -98,12 +107,16 @@ target_link_libraries(fill_world Threads::Threads)
 add_executable(fake_login_api tools/fake_login_api.cpp)
 target_link_libraries(fake_login_api httplib::httplib OpenSSL::Crypto Threads::Threads)
 
+endif() # DGS_BUILD_NODES
+
 add_library(dgs_client STATIC src/client.cpp ${COMMON_SRCS})
 target_link_libraries(dgs_client httplib::httplib)
 set_target_properties(dgs_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 install(TARGETS dgs_client ARCHIVE DESTINATION external/dgs/sdk)
 install(DIRECTORY include/ DESTINATION external/dgs/include)
+
+if (DGS_BUILD_NODES)
 
 # The viewer needs raylib; its DATA layer (`views/viewer_state.h`) does not, and that is on purpose:
 # the feed is tested headless by `viewer_e2e` whether or not anyone can build a window here.
@@ -373,3 +386,5 @@ endif()
 set_tests_properties(ping_pong validator_e2e zone_e2e reconnect_e2e action_e2e ghost_e2e social_e2e net_degraded zone_policy_e2e head_routing_e2e
                      PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
 set_tests_properties(wire socket_framing robust thread_pool logger spawn_parity PROPERTIES TIMEOUT 60)
+
+endif() # DGS_BUILD_NODES

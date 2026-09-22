@@ -1,0 +1,50 @@
+name: CD — dgs client release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev g++ cmake ninja-build
+
+      - name: Configure (client only)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDGS_BUILD_NODES=OFF
+
+      - name: Build libdgs_client.a
+        run: cmake --build build --target dgs_client -j"$(nproc)"
+
+      # The whole point of building from source: a stale prebuilt sdk sent packets with old
+      # network.cpp code while the server ran the new one ("cli lo ve todo bien, la zona nada").
+      # Fails loudly if the current code is not in the artefact.
+      - name: Verify symbols (localAddress fix present)
+        run: nm -C build/libdgs_client.a | grep -q 'TCPSocket::localAddress' || { echo "FALTA localAddress"; exit 1; }
+
+      - name: Stage SDK bundle
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          mkdir -p sdk
+          cp build/libdgs_client.a "sdk/libdgs_client-${tag}.a"
+          cp -r include sdk/include
+          tar -C sdk -czf sdk/dgs-sdk-"${tag}".tar.gz libdgs_client-${tag}.a include
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          gh release view "dgs-client-${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create "dgs-client-${tag}" --repo "${{ github.repository }}" \
+                 --title "dgs client ${tag}" --notes "SDK del cliente (libdgs_client.a + cabeceras) para el juego. La opción LOCAL del motor compila de `../dgs`; este release es para builds reproducibles via DGS_GIT_TAG=${tag}."
+          gh release upload "dgs-client-${tag}" --repo "${{ github.repository }}" sdk/* --clobber

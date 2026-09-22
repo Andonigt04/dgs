@@ -81,6 +81,12 @@ namespace DGS
             bool send(int fd, const uint8_t* data, size_t size);
             int receive(int fd, uint8_t* buffer, size_t size);
 
+            /// The LOCAL address of an accepted connection — i.e. the address the peer used to reach
+            /// this node. Empty when the kernel has not assigned one worth advertising (a bare `::`,
+            /// typically). This is what lets a single-host cluster answer a zone query with the exact
+            /// address the client proved reachable, whichever of its NICs the client dialed.
+            std::string localAddress(int fd) const;
+
             void closeClient(int fd);
 
             int getSocketFD() { return socketFD; }

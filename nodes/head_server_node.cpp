@@ -9,6 +9,9 @@
 #include <sys/epoll.h>
 #include <algorithm>
 #include <ctime>
+#include <cstring>
+#include <cstdlib>
+#include <string>
 
 int main()
 {
@@ -90,6 +93,38 @@ int main()
                           << "," << q.chunkZ << ")  uuid=" << q.uuid
                           << "  activeZones=" << orchestrator.activeZones.size()
                           << "  misses=" << misses << std::endl;
+            }
+        }
+
+        // ➡️ "LA ZONA DEBE RESPONDER POR LA MISMA DIRECCION POR LA QUE EL CLIENTE TE LLEGO".
+        // En un clúster de un solo host, zona, head y login viven en la misma máquina: la dirección
+        // con la que el CLIENTE llegó a este head es, por construcción, una por la que la zona le
+        // responde tambien. El `MY_POD_IP` que anunció la zona puede ser OTRO interfaz del host (un
+        // portatil con Wi-Fi + Ethernet tiene dos IPs, y el `ip route get 1.1.1.1` del demo elige una)
+        // — y entonces el cliente manda sus datagramas a una IP que no es por la que le llega nada.
+        // Silencio total: la zona loguea "no player registered", el cliente "zona no me oye", y ni
+        // firewall ni rutas lo explican porque ambas IPs son del mismo host.
+        // Solo se pisotea la ruta anunciada cuando la zona está EN ESTE host (anuncia la misma IP que
+        // yo, o un loopback pelado): un clúster distribuido, donde cada zona anuncia su propia IP,
+        // conserva su ruta. También se aplica a una zona que acabe de RELOCATARSE a este bloque: el
+        // caso típico del spawn, donde el head estira una zona para servir a un jugador nuevo.
+        if (r.port > 0 && r.addr[0] != '\0')
+        {
+            const char* pod  = std::getenv("MY_POD_IP");
+            const std::string mine = (pod && *pod) ? pod : "127.0.0.1";
+            const bool headAddr     = mine != "127.0.0.1" && std::string(r.addr) == mine;
+            const bool bareLoopback = std::string(r.addr) == "127.0.0.1" || std::string(r.addr) == "::1";
+            if (headAddr || bareLoopback)
+            {
+                const std::string local = serverSocket.localAddress(fd);
+                if (!local.empty())
+                {
+                    std::strncpy(r.addr, local.c_str(), sizeof(r.addr) - 1);
+                    r.addr[sizeof(r.addr) - 1] = '\0';
+                    std::cout << "[HeadServer] zona para uuid=" << q.uuid
+                              << " contestada en " << local
+                              << " (la direccion que el cliente uso para el head)" << std::endl;
+                }
             }
         }
 
