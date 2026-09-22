@@ -111,7 +111,7 @@ cmd_start() {
         "VALIDATOR_HOST=127.0.0.1"   "VALIDATOR_TCP_PORT=$VALID_TCP"
         "SOCIAL_HOST=127.0.0.1"      "SOCIAL_TCP_PORT=$SOCIAL_PORT"
         "PERSISTENCE_HOST=127.0.0.1" "PERSISTENCE_PORT=$PERS_PORT"
-        "MY_POD_IP=127.0.0.1"
+        "MY_POD_IP=${MY_POD_IP:-127.0.0.1}"
     )
     local ZONE_COMMON=(
         # Wide on Y and Z on purpose: the interesting border for a demo is one axis, and a player who
@@ -135,7 +135,7 @@ cmd_start() {
     # inheritance so it is visible in this file. Without it every client starts its own simulation
     # clock at zero and two players who launched minutes apart are in different hours of the day.
     #   WORLD_TIME_SCALE=200 ./tools/demo_cluster.sh start   -> a day goes by in about seven minutes
-    start_node fake_login_api api.log "FAKE_API_HOST=127.0.0.1" \
+    start_node fake_login_api api.log "FAKE_API_HOST=${FAKE_API_HOST:-127.0.0.1}" \
         "DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group}" "DGS_UDP_MASTER=${DGS_UDP_MASTER:-demo-master}" \
         "WORLD_TIME_SCALE=${WORLD_TIME_SCALE:-1.0}" "WORLD_START_S=${WORLD_START_S:-0.0}"
     start_node head_server_node head.log "${COMMON[@]}"
@@ -191,7 +191,7 @@ cluster up: zone A owns chunk x=${CHUNK_X0}, zone B owns x=$((CHUNK_X0+1))..1000
 next:
   # the crowd — 32 players over 8 chunks, 2 of them crossing the A/B border every ~17 s
   # ⚠️ DGS_UDP_KEY IS NOT OPTIONAL HERE, and this line used to be printed without it. The game plane
-  #    is sealed, a real client gets the key from the login, and `fill_world` does not log in — so
+  #    is sealed, a real client gets the key from the login, and \`fill_world\` does not log in — so
   #    without it every datagram it sends is dropped by the zone and the world stays EMPTY. It fails
   #    silently and looks exactly like a filler that is running fine: measured, "sent 252/s ·
   #    received 0" with the head reporting entities=0. With the key: received 2875, entities climbing.

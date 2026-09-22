@@ -360,7 +360,7 @@ static void answerSocialQuery(mongocxx::database& db, DGS::TCPSocket& sock, int 
             // already released.
             a.durationS = (until == 0) ? 0u : (uint32_t)((until - now) / 1000 + 1);
             auto r = doc.find("reason");
-            if (r != doc.end() && r->type() == bsoncxx::type::k_utf8)
+            if (r != doc.end() && r->type() == bsoncxx::type::k_string)
                 std::snprintf(a.reason, sizeof(a.reason), "%s", std::string(r->get_string().value).c_str());
             DGS::Packet p; p.pack(a); push(p);
         }
