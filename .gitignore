@@ -3,3 +3,4 @@ build*/
 *.csv
 demo-logs/
 logs/
+*.log

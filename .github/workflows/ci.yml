@@ -174,7 +174,7 @@ jobs:
         run: ctest --test-dir build-tsan --output-on-failure -E '^client_(e2e|handoff_e2e|world_e2e)$'
 
   docker-build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: build-and-test
 
     steps:

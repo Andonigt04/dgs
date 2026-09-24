@@ -845,6 +845,18 @@ int main()
     if (!restoreEnabled) std::cout << "[ZoneNode] restore disabled (ZONE_RESTORE=0)" << std::endl;
     spawnLink(restoreEnabled);
 
+    // The Validator ACK lane.
+    // ⚠️ TCP IS A STREAM: several ACKs arrive inside one `recv`. The old code parsed ONE message per
+    // receive and silently threw the rest away — with a crowd's REQ cadence that discarded ~15 of
+    // every 16 answers, every verdict was "UNANSWERED" while it had long since been sent, and the
+    // node reconnected in a loop (head.log: anti-flapping, zones drained, entities 0, empty feed).
+    // Frames here are a FIXED size (type byte + requestId + verdict + weight); step through a whole
+    // receive doing one frame at a time and keep any partial tail for the next turn (a frame may
+    // straddle two recvs). See `DGS::Packet::pack(const ValidateAck&)`.
+    constexpr size_t kAckFrameSize = 1 + 4 + 1 + 2;
+    uint8_t  ackAcc[8 * 64];
+    size_t   ackAccLen = 0;
+
     while (true)
     {
         const auto tickStart = std::chrono::steady_clock::now();
@@ -1346,9 +1358,12 @@ int main()
                         continue;   // neither propagated nor sent for validation
                     }
 
-                    // Breaker closed and a validator present: ask for a verdict.
+                    // Breaker closed and a validator present: ask for a verdict. Never let the
+                    // in-flight queue grow unbounded: if the ACK lane lags, back OFF the asking
+                    // (S1 still gates) instead of piling REQs the pipe cannot drain in time.
                     auto lastReq = lastReqMs.find(e.uuid);
-                    bool shouldAsk = circuitBreakerOk() &&
+                    bool shouldAsk = pendingValid.size() < 64 &&
+                                     circuitBreakerOk() &&
                                      (lastReq == lastReqMs.end() || (now - lastReq->second) >= 30);
                     if (shouldAsk)
                     {
@@ -1446,110 +1461,121 @@ int main()
         }
 
         // Receive the Validator's ACK (request-ack P2)
-        if (validated)
+        // Drain the WHOLE lane every turn — one message a turn could never keep up with the REQ
+        // cadence, the 500 ms deadline blew, and the node counted as UNANSWERED verdicts that had
+        // already arrived. Consume every complete frame per turn. Drains even if the breaker is
+        // open: a socket that still delivers answers should credit them.
+        while (readable(tcp_validator, tcp_validator.getSocketFD(), 0))
         {
-            DGS::Packet ackP;
-            uint8_t ackBuf[128];
-            int av = readable(tcp_validator, tcp_validator.getSocketFD(), 0)
-                     ? tcp_validator.receive(tcp_validator.getSocketFD(), ackBuf, sizeof(ackBuf))
-                     : -1;
-            if (av > 0) g_bytesRx += (uint64_t)av;
-            if (av > 0)
-            {
-                ackP.setBuffer(ackBuf, av);
-                if (ackP.getType() == DGS::PKT_VALIDATE_ACK)
-                {
-                    auto ack_ = ackP.unpackValidateAck();
-                    auto it = pendingValid.find(ack_.requestId);
-                    if (it != pendingValid.end())
-                    {
-                        uint32_t uuid = it->second.entity.uuid;
-                        const bool     it2Apply  = it->second.applyOnAccept;
-                        const uint16_t it2Action = it->second.pendingAction;
-                        const uint32_t it2Actor  = it->second.actor;
-                        const uint32_t it2ReqId  = it->second.clientReqId;
-                        const DGS::EntityTransfer appliedEntity = it->second.entity;
-                        pendingValid.erase(it);
+            int av = tcp_validator.receive(tcp_validator.getSocketFD(),
+                                           ackAcc + ackAccLen, sizeof(ackAcc) - ackAccLen);
+            if (av <= 0) break;
+            ackAccLen += (size_t)av;
+            g_bytesRx += (uint64_t)av;
 
-                        // ⚠️ CONTESTARLE. Una peticion sin respuesta no es una peticion: el cliente
-                        // pedia colocar o tirar algo, lo ponia ya en su pantalla —prediccion optimista,
-                        // que es lo correcto para que se sienta inmediato— y NUNCA se enteraba de si
-                        // habia ocurrido. Si el servidor decia que no, el objeto se quedaba en su
-                        // mundo y en el de nadie mas. Dos mundos distintos y ni un mensaje.
-                        if (it2Apply)
+            size_t pos = 0;
+            while (ackAccLen - pos >= kAckFrameSize)
+            {
+                if (ackAcc[pos] != DGS::PKT_VALIDATE_ACK) { ++pos; continue; }  // resync one byte
+                DGS::Packet ackP;
+                ackP.setBuffer(ackAcc + pos, kAckFrameSize);
+                auto ack_ = ackP.unpackValidateAck();
+                pos += kAckFrameSize;
+
+                auto it = pendingValid.find(ack_.requestId);
+                if (it == pendingValid.end()) continue;
+                {
+                    uint32_t uuid = it->second.entity.uuid;
+                    const bool     it2Apply  = it->second.applyOnAccept;
+                    const uint16_t it2Action = it->second.pendingAction;
+                    const uint32_t it2Actor  = it->second.actor;
+                    const uint32_t it2ReqId  = it->second.clientReqId;
+                    const DGS::EntityTransfer appliedEntity = it->second.entity;
+                    pendingValid.erase(it);
+
+                    // ⚠️ CONTESTARLE. Una peticion sin respuesta no es una peticion: el cliente
+                    // pedia colocar o tirar algo, lo ponia ya en su pantalla —prediccion optimista,
+                    // que es lo correcto para que se sienta inmediato— y NUNCA se enteraba de si
+                    // habia ocurrido. Si el servidor decia que no, el objeto se quedaba en su
+                    // mundo y en el de nadie mas. Dos mundos distintos y ni un mensaje.
+                    if (it2Apply)
+                    {
+                        auto cli = clientMap.find(it2Actor);
+                        if (cli != clientMap.end())
                         {
-                            auto cli = clientMap.find(it2Actor);
-                            if (cli != clientMap.end())
-                            {
-                                DGS::ActionAck ack{};
-                                ack.requestId = it2ReqId;
-                                ack.action    = it2Action;
-                                ack.accepted  = (ack_.verdict == 0) ? 0 : 1;
-                                ack.uuid      = (ack_.verdict == 0) ? 0u : appliedEntity.uuid;
-                                DGS::Packet pAck; pAck.pack(ack);
-                                std::vector<uint8_t> sealedAck;
-                                DGS::sealForUdp(pAck.getRawData(), pAck.getSize(), sealedAck);
-                                udp_zone_node.sendRaw(cli->second.first, cli->second.second,
-                                                      sealedAck.data(), sealedAck.size());
-                                g_bytesTx += DGS::udpWireSize(pAck.getSize());
-                            }
-                        }
-                        if (ack_.verdict == 0)
-                        {
-                            std::cout << "[ZoneNode] VALIDATOR: VIOLATION uuid=" << uuid
-                                      << " weight=" << ack_.weight << std::endl;
-                            statViolations++;
-                            // Evict from the local registry
-                            for (auto ite = entities.begin(); ite != entities.end();)
-                                if (ite->uuid == uuid) ite = entities.erase(ite);
-                                else ++ite;
-                            lastPosition.erase(uuid);
-                        }
-                        else
-                        {
-                            // Una accion pendiente: AHORA existe, y no antes.
-                            if (it2Apply)
-                            {
-                                if (it2Action == DGS::ACTION_REMOVE)
-                                {
-                                    for (auto ie = entities.begin(); ie != entities.end();)
-                                        if (ie->uuid == appliedEntity.uuid) ie = entities.erase(ie);
-                                        else ++ie;
-                                    lastPosition.erase(appliedEntity.uuid);
-                                    std::cout << "[ZoneNode] ACCION ACEPTADA: destruido uuid="
-                                              << appliedEntity.uuid << std::endl;
-                                }
-                                else
-                                {
-                                    // PLACE crea; MOVE reemplaza al que ya estaba por la version
-                                    // movida. Los dos acaban igual: la entidad que el validador
-                                    // aprobo, y ninguna otra.
-                                    bool replaced = false;
-                                    for (auto& ie : entities)
-                                        if (ie.uuid == appliedEntity.uuid) { ie = appliedEntity; replaced = true; break; }
-                                    if (!replaced) entities.push_back(appliedEntity);
-                                    // Un lease normal, no `now + 0`. El bit es lo que lo mantiene
-                                    // vivo y lo que lo hace persistible; el lease solo tiene que no
-                                    // nacer caducado, o toda comprobacion de propiedad dice que no.
-                                    entityOwnedUntil[appliedEntity.uuid] = nowMs() + (uint64_t)std::atoi(
-                                        std::getenv("ENTITY_LEASE_MS") ? std::getenv("ENTITY_LEASE_MS") : "3000");
-                                    std::cout << "[ZoneNode] ACCION ACEPTADA: "
-                                              << (replaced ? "movido" : "creado") << " uuid="
-                                              << appliedEntity.uuid << std::endl;
-                                }
-                            }
-                            // Good verdict → close the breaker.
-                            // ⚠️ AND RESET THE TRIP COUNTER. Without this `cbOpenCount` only ever grew:
-                            // 3 timeouts across the whole life of the process were enough to exhaust it
-                            // FOREVER, and from then on the branch that OPENS the circuit never ran
-                            // again — the node fell straight through to fail-open and reconnected in a
-                            // loop. Measured: 11 unanswered validations in a row and the head still saw
-                            // `state = 1` (ok). The counter must measure CONSECUTIVE failures, not ones
-                            // accumulated since start-up.
-                            cbState = 0; cbOpenUntil = 0; cbOpenCount = 0;
+                            DGS::ActionAck ack{};
+                            ack.requestId = it2ReqId;
+                            ack.action    = it2Action;
+                            ack.accepted  = (ack_.verdict == 0) ? 0 : 1;
+                            ack.uuid      = (ack_.verdict == 0) ? 0u : appliedEntity.uuid;
+                            DGS::Packet pAck; pAck.pack(ack);
+                            std::vector<uint8_t> sealedAck;
+                            DGS::sealForUdp(pAck.getRawData(), pAck.getSize(), sealedAck);
+                            udp_zone_node.sendRaw(cli->second.first, cli->second.second,
+                                                  sealedAck.data(), sealedAck.size());
+                            g_bytesTx += DGS::udpWireSize(pAck.getSize());
                         }
                     }
+                    if (ack_.verdict == 0)
+                    {
+                        std::cout << "[ZoneNode] VALIDATOR: VIOLATION uuid=" << uuid
+                                  << " weight=" << ack_.weight << std::endl;
+                        statViolations++;
+                        // Evict from the local registry
+                        for (auto ite = entities.begin(); ite != entities.end();)
+                            if (ite->uuid == uuid) ite = entities.erase(ite);
+                            else ++ite;
+                        lastPosition.erase(uuid);
+                    }
+                    else
+                    {
+                        // Una accion pendiente: AHORA existe, y no antes.
+                        if (it2Apply)
+                        {
+                            if (it2Action == DGS::ACTION_REMOVE)
+                            {
+                                for (auto ie = entities.begin(); ie != entities.end();)
+                                    if (ie->uuid == appliedEntity.uuid) ie = entities.erase(ie);
+                                    else ++ie;
+                                lastPosition.erase(appliedEntity.uuid);
+                                std::cout << "[ZoneNode] ACCION ACEPTADA: destruido uuid="
+                                          << appliedEntity.uuid << std::endl;
+                            }
+                            else
+                            {
+                                // PLACE crea; MOVE reemplaza al que ya estaba por la version
+                                // movida. Los dos acaban igual: la entidad que el validador
+                                // aprobo, y ninguna otra.
+                                bool replaced = false;
+                                for (auto& ie : entities)
+                                    if (ie.uuid == appliedEntity.uuid) { ie = appliedEntity; replaced = true; break; }
+                                if (!replaced) entities.push_back(appliedEntity);
+                                // Un lease normal, no `now + 0`. El bit es lo que lo mantiene
+                                // vivo y lo que lo hace persistible; el lease solo tiene que no
+                                // nacer caducado, o toda comprobacion de propiedad dice que no.
+                                entityOwnedUntil[appliedEntity.uuid] = nowMs() + (uint64_t)std::atoi(
+                                    std::getenv("ENTITY_LEASE_MS") ? std::getenv("ENTITY_LEASE_MS") : "3000");
+                                std::cout << "[ZoneNode] ACCION ACEPTADA: "
+                                          << (replaced ? "movido" : "creado") << " uuid="
+                                          << appliedEntity.uuid << std::endl;
+                            }
+                        }
+                        // Good verdict → close the breaker.
+                        // ⚠️ AND RESET THE TRIP COUNTER. Without this `cbOpenCount` only ever grew:
+                        // 3 timeouts across the whole life of the process were enough to exhaust it
+                        // FOREVER, and from then on the branch that OPENS the circuit never ran
+                        // again — the node fell straight through to fail-open and reconnected in a
+                        // loop. Measured: 11 unanswered validations in a row and the head still saw
+                        // `state = 1` (ok). The counter must measure CONSECUTIVE failures, not ones
+                        // accumulated since start-up.
+                        cbState = 0; cbOpenUntil = 0; cbOpenCount = 0;
+                    }
                 }
+            }
+            if (pos > 0)
+            {
+                std::memmove(ackAcc, ackAcc + pos, ackAccLen - pos);
+                ackAccLen -= pos;
             }
         }
 

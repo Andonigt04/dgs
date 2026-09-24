@@ -2,15 +2,20 @@ FROM ubuntu:22.04 AS dgs-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+# ⚠️ APT UNDER BUILDX IS FLIGHTY: `apt-get update` returns 100 on transient repo/network hiccups.
+# Retry once before giving up, and install separately so a bad update never masquerades as a
+# missing package. `ca-certificates` must be present BEFORE any curl is invoked.
+RUN apt-get update -qq || (sleep 5 && apt-get update -qq) \
+ && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     git \
     libssl-dev \
     libsasl2-dev \
     pkg-config \
+    ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 # mongocxx driver
 RUN curl -L https://github.com/mongodb/mongo-cxx-driver/releases/download/r4.0.0/mongo-cxx-driver-r4.0.0.tar.gz \

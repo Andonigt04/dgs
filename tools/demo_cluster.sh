@@ -126,6 +126,12 @@ cmd_start() {
         "SOCIAL_HOST=$SOCIAL_HOST"      "SOCIAL_TCP_PORT=$SOCIAL_PORT"
         "PERSISTENCE_HOST=127.0.0.1" "PERSISTENCE_PORT=$PERS_PORT"
         "MY_POD_IP=${MY_POD_IP:-127.0.0.1}"
+        # ⚠️ CHUNK SIZE IS THE VALIDATOR'S TOO, NOT ONLY THE ZONES'. The validator reads
+        # `CHUNK_SIZE_*` from its OWN environment (default 1.0) to run `lastG` against `chunkX·cs+pos`;
+        # with no sizes it built every claim as chunkX·1.0+pos (~146 km off every global baseline) and
+        # judged the whole world a teleport. Same forgetting as `GAME_MODULE_SO` — two nodes read the
+        # world, one of them was never told its size.
+        "CHUNK_SIZE_X=$CHUNK_M.0" "CHUNK_SIZE_Y=$CHUNK_M.0" "CHUNK_SIZE_Z=$CHUNK_M.0"
     )
     # ⚠️ SIN MODULO DE REGLAS NO SE PUEDE COLOCAR NADA, y eso es correcto pero hay que decirlo. El
     # validador falla CERRADO en las acciones: sin regla que las acepte, rechaza. El modulo existe
@@ -144,7 +150,6 @@ cmd_start() {
         # falls outside the box on the other two is a silent failure, not an experiment.
         "CHUNK_Y_MIN=-1000000" "CHUNK_Y_MAX=1000000"
         "CHUNK_Z_MIN=-1000000" "CHUNK_Z_MAX=1000000"
-        "CHUNK_SIZE_X=$CHUNK_M.0" "CHUNK_SIZE_Y=$CHUNK_M.0" "CHUNK_SIZE_Z=$CHUNK_M.0"
         "INTEREST_RADIUS_M=$RADIUS" "ENTITY_LEASE_MS=$LEASE"
         "DGS_OBSERVE_TOKEN=$TOKEN" "ZONE_PERSIST_MS=1000"
         # The game plane, encrypted. The zone holds the GROUP key (it seals its broadcast once with it
@@ -186,7 +191,14 @@ cmd_start() {
     # (`libharuka_rules.so`, que construye el motor) y lo unico que faltaba era que estuviera donde el
     # nodo corre — los nodos se lanzan desde el directorio de logs, asi que la ruta tiene que ser
     # absoluta o `dlopen` no lo encuentra y el log dice "no rules module".
-    start_node validador_node   validator.log  "${COMMON[@]}" "GAME_MODULE_SO=$RULES"
+    # ⚠️ DEMO SIN VALIDADOR: `DGS_DEMO_NO_VALIDATOR=1` arranca el clúster en fail-open (S1 local),
+    # sin el árbitro. Es el modo de escape para un demo vivo cuando el bucle REQ/ACK no esté
+    # saneado: las zonas no conectan (P2 falla → validated=false) y el cortocircuito nunca se abre.
+    if [ "${DGS_DEMO_NO_VALIDATOR:-0}" != "1" ]; then
+        start_node validador_node   validator.log  "${COMMON[@]}" "GAME_MODULE_SO=$RULES"
+    else
+        echo "  · validador: DESACTIVADO (DGS_DEMO_NO_VALIDATOR=1) — validación fail-open, solo S1"
+    fi
     start_node social_node      social.log     "${COMMON[@]}"
     sleep 1
     start_node zone_node zoneA.log "${COMMON[@]}" "${ZONE_COMMON[@]}" \
