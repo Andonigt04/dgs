@@ -23,7 +23,8 @@
 //     [zone] --EntityTransfer / GhostDelta--> [viewer]   the moving objects
 //
 // What is on screen, and why each distinction is worth pixels:
-//   · a box per zone, coloured by node, labelled with addr:port and its live entity count;
+//   · a box per zone, coloured by node, labelled with addr:port, its live entity count and its live
+//     feed rate (dat/s of real client traffic — the box lights up with the zone's load);
 //   · a REAL entity as a solid cube in its owning zone's colour — the node that simulates it;
 //   · a GHOST as a wireframe, because it is a neighbour's projection of something it does not own:
 //     the whole architecture lives or dies on that difference;
@@ -35,9 +36,12 @@
 //
 // Usage:  dgs_viewer [head-host] [head-port]      env: DGS_CHUNK_SIZE (default 1000)
 //                                                      DGS_OBSERVE_TOKEN (required by the zones)
+//                                                      DGS_UDP_KEY (required: the feed is sealed)
 // Keys:   0 all six views · 1..6 one view · G toggle ghosts · TAB entity list.
 // Latency: the RTT shown in the status bar is the zone's answer to the observer HELLO (PKT_OBSERVE ->
-// PKT_OBSERVE_ACK, one probe per zone every ~2 s) — a live, uncooperative "baja latencia" measurement.
+// PKT_OBSERVE_ACK, one probe per zone every ~2 s). The FEED line below it is the REAL traffic: every
+// entity datagram the zones broadcast (what clients actually generate), counted as dat/s and kB/s,
+// and per-zone load lights up the world boxes — the "objetos con posiciones" moving is that feed.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/types.h"
 #include "include/dgs/network.h"
@@ -93,7 +97,7 @@ static Color zoneColor(int i, int total)
     return ColorFromHSV(i * (360.0f / std::max(total, 1)), 0.8f, 1.0f);
 }
 
-static void drawZoneCube(const DGS::ZoneInfoPublic& z, int i, int total)
+static void drawZoneCube(const DGS::ZoneInfoPublic& z, int i, int total, float load)
 {
     const Vector3 c = zoneCenter(z);
     // +1: the bounds are INCLUSIVE ([min,max] chunks), so a zone covering 0..49 is 50 chunks wide.
@@ -102,8 +106,9 @@ static void drawZoneCube(const DGS::ZoneInfoPublic& z, int i, int total)
                         (float)(z.chunkYMax - z.chunkYMin + 1),
                         (float)(z.chunkZMax - z.chunkZMin + 1) };
     const Color col = zoneColor(i, total);
-    DrawCube(c, s.x, s.y, s.z, ColorAlpha(col, 0.08f));
-    DrawCubeWires(c, s.x, s.y, s.z, col);
+    // load (0..1) = live feed traffic of the zone: the box lights up with what its clients are doing.
+    DrawCube(c, s.x, s.y, s.z, ColorAlpha(col, 0.04f + 0.10f * load));
+    DrawCubeWires(c, s.x, s.y, s.z, ColorAlpha(col, 0.35f + 0.65f * load));
 }
 
 int main(int argc, char* argv[])
@@ -137,6 +142,11 @@ int main(int argc, char* argv[])
     // en la barra de estado: la prueba de "baja latencia" que pide el video, sin colaborar con nada.
     std::atomic<int>       rttLastMs{-1}, rttMinMs{-1};
     std::atomic<long long> rttSamples{0}, rttSumMs{0};
+    // Trafico REAL del feed: cada datagrama de entidad que llega de una zona (no la sonda del hello).
+    // Se acumula por "addr:port" en ventanas de ~1 s y se publica en feedRates (guardado por mtx) como
+    // (B/s, dat/s); los totales de la ventana van en atómicos para la barra de estado.
+    std::map<std::string, std::pair<long long,long long>> feedRates;   // ep -> (B/s, dat/s), bajo mtx
+    std::atomic<long long> feedBytesSec{0}, feedDatagramsSec{0};
 
     DGS::TCPSocket head;
     if (!head.connect(headHost, headPort))
@@ -203,6 +213,10 @@ int main(int argc, char* argv[])
         DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE); hello.writeString(token);
         std::map<std::string, uint64_t> sentAt;   // "addr:port" -> momento del ultimo HELLO
         uint64_t lastHello = 0;
+        // Ventana de trafico real del feed: acumula (bytes, datagramas) por "addr:port" y cada ~1 s
+        // publica la tasa en feedRates (bajo mtx) para que el render la pinte en el mundo.
+        std::map<std::string, std::pair<long long,long long>> feedBurst;
+        uint64_t feedWinStart = nowMs();
         uint8_t  buf[sizeof(DGS::EntityTransfer) * 2];
         std::string from; int port = 0;
 
@@ -268,6 +282,39 @@ int main(int argc, char* argv[])
                 std::lock_guard<std::mutex> lk(mtx);
                 state.onDatagram(buf, n, nowMs());
             }
+            // Feed real: cualquier datagrama de entidad (lo que generan los clientes) cuenta como
+            // trafico. Se acumula por zona y cada ~1 s se publica la tasa (B/s, dat/s).
+            if (n > 0 && buf[0] != DGS::PKT_OBSERVE_ACK)
+            {
+                const std::string feedEp = from + ":" + std::to_string(port);
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    std::pair<long long,long long>& burst = feedBurst[feedEp];
+                    burst.first += n; burst.second += 1;
+                }
+                const uint64_t tNow = nowMs();
+                if (tNow - feedWinStart >= 1000)
+                {
+                    const double winMs = (double)(tNow - feedWinStart);
+                    std::map<std::string, std::pair<long long,long long>> rolled;
+                    long long totB = 0, totD = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx);
+                        for (const auto& kv : feedBurst)
+                        {
+                            const long long bps = (long long)(kv.second.first * 1000.0 / winMs);
+                            const long long dps = (long long)(kv.second.second * 1000.0 / winMs);
+                            rolled[kv.first] = { bps, dps };
+                            totB += bps; totD += dps;
+                        }
+                        feedBurst.clear();
+                        feedRates.swap(rolled);
+                    }
+                    feedBytesSec.store(totB);
+                    feedDatagramsSec.store(totD);
+                    feedWinStart = tNow;
+                }
+            }
             { std::lock_guard<std::mutex> lk(mtx); state.expire(nowMs()); }
         }
     });
@@ -303,12 +350,14 @@ int main(int argc, char* argv[])
         std::vector<DGS::ZoneInfoPublic> zs;
         std::vector<DGS::ViewedEntity>   ents;
         std::vector<int>                 owner;
+        std::map<std::string, std::pair<long long,long long>> rates;
         {
             std::lock_guard<std::mutex> lk(mtx);
             zs   = state.zones();
             ents = state.entities();
             owner.reserve(ents.size());
             for (const auto& e : ents) owner.push_back(state.zoneOf(e));
+            rates = feedRates;
         }
 
         // Frame the world on the zones; with none yet, on whatever is moving — otherwise connecting
@@ -348,7 +397,14 @@ int main(int argc, char* argv[])
         auto renderScene = [&](Camera3D cam, int w, int h)
         {
             BeginMode3D(cam);
-            for (int i = 0; i < (int)zs.size(); i++) drawZoneCube(zs[i], i, (int)zs.size());
+            for (int i = 0; i < (int)zs.size(); i++)
+            {
+                // Traffic load: 300 dat/s = the zone is saturated (its clients all talking to it).
+                auto it = rates.find(std::string(zs[i].addr) + ":" + std::to_string(zs[i].port));
+                const float load = (it == rates.end()) ? 0.0f
+                                 : std::min(1.0f, (float)it->second.second / 300.0f);
+                drawZoneCube(zs[i], i, (int)zs.size(), load);
+            }
 
             for (size_t i = 0; i < ents.size(); i++)
             {
@@ -370,7 +426,9 @@ int main(int argc, char* argv[])
                 int live = 0;
                 for (size_t k = 0; k < ents.size(); k++) if (owner[k] == i && !ents[k].ghost) ++live;
                 const Vector2 sp = GetWorldToScreenEx(zoneCenter(zs[i]), cam, w, h);
-                DrawText(TextFormat("%s:%d  [%d]", zs[i].addr, zs[i].port, live),
+                auto it = rates.find(std::string(zs[i].addr) + ":" + std::to_string(zs[i].port));
+                const long long dps = (it == rates.end()) ? 0 : it->second.second;
+                DrawText(TextFormat("%s:%d  [%d]  %lld dat/s", zs[i].addr, zs[i].port, live, dps),
                          (int)sp.x, (int)sp.y, 10, zoneColor(i, (int)zs.size()));
             }
         };
@@ -412,13 +470,18 @@ int main(int argc, char* argv[])
                           (long long)nRtt);
         else
             std::snprintf(rttBuf, sizeof(rttBuf), "--");
-        DrawRectangle(0, sh - 46, GetScreenWidth(), 46, ColorAlpha(BLACK, 0.75f));
+        DrawRectangle(0, sh - 70, GetScreenWidth(), 70, ColorAlpha(BLACK, 0.75f));
         DrawText(TextFormat("head %s:%d  %s   zones %d (observing %d · rejected %d)   entities %d (%d ghosts)   chunk %.0f   RTT %s",
                             headHost, headPort, headUp ? "UP" : "DOWN",
                             (int)zs.size(), observedAcked.load(), observedRejected.load(),
                             (int)ents.size() - ghosts, ghosts, chunkSize, rttBuf),
-                 8, sh - 40, 14, headUp ? (nRtt > 0 ? RAYWHITE : YELLOW) : RED);
-        DrawText("0 all · 1-6 single view · G ghosts · TAB list", 8, sh - 20, 12, GRAY);
+                 8, sh - 64, 14, headUp ? (nRtt > 0 ? RAYWHITE : YELLOW) : RED);
+        const long long feedDps = feedDatagramsSec.load();
+        const float    feedKBs = (float)(feedBytesSec.load() / 1000.0);
+        DrawText(TextFormat("FEED (trafico real de clientes): %lld dat/s · %.1f kB/s   %s",
+                            feedDps, feedKBs, feedDps > 0 ? "" : "(sin feed: revisa DGS_UDP_KEY en el viewer)"),
+                 8, sh - 44, 12, feedDps > 0 ? GREEN : GRAY);
+        DrawText("0 all · 1-6 single view · G ghosts · TAB list", 8, sh - 26, 12, GRAY);
 
         if (zs.empty())
             DrawText("no zones registered with the head yet", 8, 8, 16, ORANGE);

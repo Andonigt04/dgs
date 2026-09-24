@@ -1,15 +1,30 @@
 # DGS — Distributed Game Server
 
-A high-performance distributed game server in **C++17**, aimed at MMOs with galactic-scale worlds.
+A high-performance distributed game server in **C++17**, aimed at large scale of objects.
 Microservices over **epoll** (Linux), TCP/UDP, Kubernetes orchestration, and a real-time anti-cheat
 **validator**. The design motto is *"one owner per data type"*: every entity has a single owner that
 simulates it, and the rest of the world sees it as a *ghost*.
 
+
+
+## Why this exists
+
+DGS is written to be watched while it works. The point is a pair of eyes on the world: `dgs_viewer`
+connects to the head, draws every zone as a box, and fills it with the entities that are actually
+moving — real ones solid, ghosts as wireframes, anything a zone does not cover in red. You do not
+reason about splits, handoffs and traffic; you see them, and the features that stayed are the ones that
+showed in that window.
+
+That watchability is the demo: `tools/demo_cluster.sh` up, `dgs_viewer` on a corner screen, and the
+system introduces itself. What it cannot say yet is in parentheses all over this
+file (and consolidated in **What is missing**): it has never run on more than one machine (every number
+here is loopback), the login is a stub that accepts every password (and must never ship), the observer
+feed travels in clear over the wire, and the cluster does not publish per-player latency — a viewer
+measures its own probe, not a client's.
+
 ---
 
 ## Architecture
-
-<img src="image.drawio.png" />
 
 The central idea is **ownership, not broadcast**: for each entity there is exactly one authoritative
 node (the one holding the *lease*), and its neighbours project it as a ghost in the meantime. The
@@ -1276,8 +1291,29 @@ the port"*, not *"anyone who can read the wire"* — on an untrusted path it is 
 The answer to that is DTLS or a private network for the observer plane, and it is not done. Nothing
 between the nodes themselves is authenticated or encrypted either (see **What is missing**).
 
+Both numbers on the status bar are live, and they mean different things:
+
+- **RTT** — the round trip of the viewer's own observer HELLO (`PKT_OBSERVE` → `PKT_OBSERVE_ACK`, one
+  probe per zone every ~2 s). It crosses the zone's socket under the crowd's real traffic, so it rises
+  when a zone saturates — but it is the viewer's probe, not a player's link (the cluster publishes no
+  per-player latency; a real client measures its own via `Application::networkLinkStats`).
+- **FEED** — the real traffic: every entity datagram the zones broadcast is counted per zone in a ~1 s
+  window (dat/s and kB/s). That is what the clients generate; it lights up the owning zone's box in the
+  world (full brightness at 300 dat/s — arbitrary, recalibrate it against the real tick if the bars
+  never move) and the zone's label shows its own dat/s under the live count.
+
+Parentheticals, because the picture is not the whole story: the crowd that produces that FEED is
+`fill_world`, which does **not** log in (it talks directly with the group key), so the numbers are real
+traffic of the same shape without the auth path; the feed is sealed, so a viewer needs `DGS_UDP_KEY`
+matching the zones' or it decodes garbage and the FEED line stays grey (a rejected observer is exactly
+that: `DGS_OBSERVE_TOKEN` wrong or unset leaves the line yellow); the demo runs `INTEREST_RADIUS_M=0`
+(everyone hears everyone — what makes the numbers interesting and the zone loop cost ~28 ms at 64
+players); and the RTT probe ticks on the observer's 2 s lease cadence, so it is a floor for the demo,
+not a throughput benchmark.
+
 ```bash
 export DGS_OBSERVE_TOKEN=$(head -c 24 /dev/urandom | base64)   # same value for zones and viewer
+export DGS_UDP_KEY=demo-group                                  # same value for zones, crowd and viewer
 
 # a world with something in it
 ./build/head_server_node &
@@ -1287,11 +1323,14 @@ HEAD_SERVER_HOST=127.0.0.1 GAME_MODULE_SO=./build/stub_rules.so ./build/zone_nod
 
 ./build/demo_player 127.0.0.1 42420 8 &   # eight entities walking in circles
 ./build/dgs_viewer                        # 0 all views · 1-6 one view · G ghosts · TAB list
+                                           # status bar: RTT (observer probe) · FEED (real traffic dat/s)
 ```
 
 `dgs_viewer` needs raylib; without it every other target still builds. `DGS_CHUNK_SIZE` (default 1000)
 has to match the zone's `CHUNK_SIZE_*`, because chunk size is not on the wire — the head only hands it
-to the nodes in their initial `Command`.
+to the nodes in their initial `Command`. `DGS_UDP_KEY` is not optional on the viewer: the feed plane is
+sealed with the group key, and a viewer without it receives an unsigned HELLO the zone drops and parses
+the sealed broadcast as garbage — "observing N" with an empty screen, no reprimand.
 
 ---
 
