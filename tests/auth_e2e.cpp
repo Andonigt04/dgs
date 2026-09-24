@@ -14,9 +14,13 @@
 //   A. WITH the secret, a real zone registers and the head serves it — otherwise "the impostor was
 //      refused" would also pass on a head that refuses everybody, which is not authentication, it is
 //      an outage.
-//   B. WITHOUT it, an impostor sending exactly the same registration is refused.
+//   B. WITHOUT it, an impostor sending exactly the same registration is refused — measured as "chunk
+//      550 is never routed to the impostor". It has to be phrased that way: the head can RELOCATE a
+//      legitimate zone onto the chunk (the "la zona viene al jugador" rule), so "the head answered
+//      with a route" is no longer the same as "the registration was accepted".
 //   C. A CAPTURED credential replayed a second time is refused — the nonce cache — so listening on
-//      the wire once does not buy permanent access.
+//      the wire once does not buy permanent access. Same oracle as B: the chunk is never routed to
+//      the replayer, even though relocation may serve it through the legitimate zone.
 //   D. With no secret configured at all, everything is allowed. That is the documented default (a
 //      cluster that refuses to start is an outage, not a fix) and it must be a DECISION that shows in
 //      the node's own log, not an accident.
@@ -58,25 +62,32 @@ static uint64_t nowMs()
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static const int kGoodPort     = 40001;   // lo que anuncia la zona legitimada (A/D)
+static const int kImpostorPort = 40002;   // B: la misma registracion sin secreto
+static const int kReplayPort   = 40003;   // C: la misma credencial capturada, repetida
+
 /// Registers as a zone would: one ServerMetrics claiming a chunk range. That single packet is what
-/// makes the head start routing entities to whoever sent it.
-static DGS::Packet registration(int32_t xMin, int32_t xMax)
+/// makes the head start routing entities to whoever sent it. Each actor claims a DIFFERENT port: the
+/// head rewrites the advertised IP to the one the asker used, so the only thing that still identifies
+/// who answered a route is the port.
+static DGS::Packet registration(int32_t xMin, int32_t xMax, int port)
 {
     DGS::ServerMetrics m{};
     m.node.chunkXMin = xMin; m.node.chunkXMax = xMax;
     m.node.chunkYMin = 0;    m.node.chunkYMax = 100;
     m.node.chunkZMin = 0;    m.node.chunkZMax = 100;
     std::snprintf(m.node.addr, sizeof(m.node.addr), "127.0.0.1");
-    m.node.port     = 40000;
+    m.node.port     = port;
     m.startTimeS    = 1;
     m.activeEntities = 0;
     DGS::Packet p; p.pack(m);
     return p;
 }
 
-/// Asks the head which zone covers a chunk. This is the observable: the head only answers with a real
-/// address for a chunk some REGISTERED zone claims.
-static bool zoneKnown(DGS::TCPSocket& s, int32_t chunkX)
+/// Asks the head which zone covers a chunk, and returns the WHOLE answer. Relocation means "answered
+/// with a route" is no longer proof of "registered", so the tests compare the port against the actor
+/// that claimed it.
+static DGS::ZoneResponse zoneRoute(DGS::TCPSocket& s, int32_t chunkX)
 {
     DGS::ZoneQuery q{};
     q.uuid = 1; q.chunkX = chunkX; q.chunkY = 0; q.chunkZ = 0;
@@ -85,12 +96,12 @@ static bool zoneKnown(DGS::TCPSocket& s, int32_t chunkX)
 
     { timeval tv{}; tv.tv_sec = 1; setsockopt(s.getSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
     uint8_t buf[4096];
+    DGS::ZoneResponse zr{};
     const int n = s.receive(s.getSocketFD(), buf, sizeof(buf));
-    if (n <= 0) return false;
+    if (n <= 0) return zr;
     DGS::Packet r; r.setBuffer(buf, (size_t)n);
-    if (r.getType() != DGS::PKT_ZONE_RESPONSE) return false;
-    const DGS::ZoneResponse zr = r.unpackZoneResponse();
-    return zr.port != 0 && zr.addr[0] != '\0';
+    if (r.getType() != DGS::PKT_ZONE_RESPONSE) return zr;
+    return r.unpackZoneResponse();
 }
 
 static pid_t startHead(const char* path, const char* secret)
@@ -154,39 +165,39 @@ int main(int argc, char** argv)
             good.send(good.getSocketFD(), credential.getRawData(), credential.getSize());
         }
 
-        DGS::Packet reg = registration(0, 100);
+        DGS::Packet reg = registration(0, 100, kGoodPort);
         good.send(good.getSocketFD(), reg.getRawData(), reg.getSize());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
         DGS::TCPSocket asker;
         waitPort(asker, kHead, 100);
-        const bool served = zoneKnown(asker, 50);
+        const bool served = zoneRoute(asker, 50).port == kGoodPort;
         check(served, "A · a node WITH the secret registers, and the head routes chunk 50 to it");
 
         // ── B. The impostor: the same registration, no credential ────────────────────────────────
         DGS::TCPSocket rogue;
         waitPort(rogue, kHead, 100);
-        DGS::Packet steal = registration(500, 600);
+        DGS::Packet steal = registration(500, 600, kImpostorPort);
         rogue.send(rogue.getSocketFD(), steal.getRawData(), steal.getSize());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
         DGS::TCPSocket asker2;
         waitPort(asker2, kHead, 100);
-        const bool stolen = zoneKnown(asker2, 550);
+        const bool stolen = zoneRoute(asker2, 550).port == kImpostorPort;
         check(!stolen,
-              "B · the SAME registration without the secret is refused: chunk 550 is routed nowhere");
+              "B · the SAME registration without the secret is refused: chunk 550 is never routed to the impostor");
 
         // ── C. Replay: the very credential that worked, sent again ───────────────────────────────
         DGS::TCPSocket replayer;
         waitPort(replayer, kHead, 100);
         replayer.send(replayer.getSocketFD(), credential.getRawData(), credential.getSize());
-        DGS::Packet steal2 = registration(700, 800);
+        DGS::Packet steal2 = registration(700, 800, kReplayPort);
         replayer.send(replayer.getSocketFD(), steal2.getRawData(), steal2.getSize());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
         DGS::TCPSocket asker3;
         waitPort(asker3, kHead, 100);
-        const bool replayed = zoneKnown(asker3, 750);
+        const bool replayed = zoneRoute(asker3, 750).port == kReplayPort;
         check(!replayed,
               "C · a CAPTURED credential replayed does not work twice (the nonce is remembered)");
 
@@ -203,13 +214,13 @@ int main(int argc, char** argv)
 
         DGS::TCPSocket anyone;
         const bool up = waitPort(anyone, kHead, 300);
-        DGS::Packet reg = registration(0, 100);
+        DGS::Packet reg = registration(0, 100, kGoodPort);
         if (up) anyone.send(anyone.getSocketFD(), reg.getRawData(), reg.getSize());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
         DGS::TCPSocket asker;
         waitPort(asker, kHead, 100);
-        const bool open = up && zoneKnown(asker, 50);
+        const bool open = up && zoneRoute(asker, 50).port == kGoodPort;
         check(open,
               "D · with NO secret configured the port is open, as documented (and the node says so)");
 
