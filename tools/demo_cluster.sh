@@ -127,6 +127,18 @@ cmd_start() {
         "PERSISTENCE_HOST=127.0.0.1" "PERSISTENCE_PORT=$PERS_PORT"
         "MY_POD_IP=${MY_POD_IP:-127.0.0.1}"
     )
+    # ⚠️ SIN MODULO DE REGLAS NO SE PUEDE COLOCAR NADA, y eso es correcto pero hay que decirlo. El
+    # validador falla CERRADO en las acciones: sin regla que las acepte, rechaza. El modulo existe
+    # (`libharuka_rules.so`, que construye el motor) y lo unico que faltaba era que estuviera donde el
+    # nodo corre — los nodos se lanzan desde el directorio de logs, asi que la ruta tiene que ser
+    # absoluta o `dlopen` no lo encuentra y el log dice "no rules module". Las ZONAS la necesitan
+    # igual que el validador (zone_node.cpp hace dlopen(GAME_MODULE_SO) tambien).
+    local RULES=${GAME_MODULE_SO:-$(cd "$(dirname "$0")/../../haruka-cpp/build" 2>/dev/null && pwd)/libharuka_rules.so}
+    if [ -r "$RULES" ]; then
+        echo "  · reglas: $RULES (validador y zonas)"
+    else
+        echo "  · reglas: NO ENCONTRADAS ($RULES) -> las acciones se rechazaran (fail-closed)"
+    fi
     local ZONE_COMMON=(
         # Wide on Y and Z on purpose: the interesting border for a demo is one axis, and a player who
         # falls outside the box on the other two is a silent failure, not an experiment.
@@ -139,6 +151,11 @@ cmd_start() {
         # for everybody) and the MASTER (it derives any client's session key to open their uplink). No
         # client needs either in its environment: the login hands them out.
         "DGS_UDP_KEY=${DGS_UDP_KEY:-demo-group}" "DGS_UDP_MASTER=${DGS_UDP_MASTER:-demo-master}"
+        # ⚠️ RULES FOR THE ZONES TOO, NOT ONLY THE VALIDATOR. Both `validador_node.cpp` and
+        # `zone_node.cpp` dlopen GAME_MODULE_SO; without it a zone logs "no rules module ... S1 only"
+        # and does not simulate. It used to be passed only to the validator, and zones silently ran
+        # degraded. The path is ABSOLUTE on purpose: nodes launch from the logs directory.
+        "GAME_MODULE_SO=$RULES"
     )
 
     echo "starting the demo cluster:"
@@ -169,12 +186,6 @@ cmd_start() {
     # (`libharuka_rules.so`, que construye el motor) y lo unico que faltaba era que estuviera donde el
     # nodo corre — los nodos se lanzan desde el directorio de logs, asi que la ruta tiene que ser
     # absoluta o `dlopen` no lo encuentra y el log dice "no rules module".
-    local RULES=${GAME_MODULE_SO:-$(cd "$(dirname "$0")/../../haruka-cpp/build" 2>/dev/null && pwd)/libharuka_rules.so}
-    if [ -r "$RULES" ]; then
-        echo "  · reglas: $RULES"
-    else
-        echo "  · reglas: NO ENCONTRADAS ($RULES) -> las acciones se rechazaran (fail-closed)"
-    fi
     start_node validador_node   validator.log  "${COMMON[@]}" "GAME_MODULE_SO=$RULES"
     start_node social_node      social.log     "${COMMON[@]}"
     sleep 1

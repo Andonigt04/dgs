@@ -86,6 +86,7 @@ jobs:
             zone_policy_e2e_test head_routing_e2e_test orchestrator_test client_e2e_test \
             viewer_e2e_test restore_e2e_test handoff_e2e_test social_persist_e2e_test interest_e2e_test \
             world_object_e2e_test client_handoff_e2e_test client_world_e2e_test \
+            split_resize_e2e_test client_claims_e2e_test place_action_e2e_test s1_jitter_e2e_test \
             stub_rules stub_rules_actions
 
       # ⚠️ NO `|| true`. Three of the four tests used to run as `timeout 5 ... || true`, so their
@@ -144,7 +145,8 @@ jobs:
             reconnect_e2e_test action_e2e_test ghost_e2e_test viewer_e2e_test interest_e2e_test \
             social_e2e_test net_degraded_test \
             zone_policy_e2e_test head_routing_e2e_test handoff_e2e_test \
-            world_object_e2e_test client_handoff_e2e_test client_world_e2e_test stub_rules_actions
+            world_object_e2e_test client_handoff_e2e_test client_world_e2e_test stub_rules_actions \
+            split_resize_e2e_test client_claims_e2e_test place_action_e2e_test s1_jitter_e2e_test
 
       - name: Generate TLS certificates for the tests
         run: ./tools/tls/make_certs.sh /tmp/dgs-tls
