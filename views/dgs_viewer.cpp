@@ -35,7 +35,9 @@
 //
 // Usage:  dgs_viewer [head-host] [head-port]      env: DGS_CHUNK_SIZE (default 1000)
 //                                                      DGS_OBSERVE_TOKEN (required by the zones)
-// Keys:   0 all six views · 1..6 one view · G toggle ghosts · TAB entity list
+// Keys:   0 all six views · 1..6 one view · G toggle ghosts · TAB entity list.
+// Latency: the RTT shown in the status bar is the zone's answer to the observer HELLO (PKT_OBSERVE ->
+// PKT_OBSERVE_ACK, one probe per zone every ~2 s) — a live, uncooperative "baja latencia" measurement.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/types.h"
 #include "include/dgs/network.h"
@@ -53,6 +55,9 @@
 #include <chrono>
 #include <algorithm>
 #include <set>
+#include <map>
+#include <string>
+#include <cstdio>
 
 static uint64_t nowMs()
 {
@@ -127,6 +132,11 @@ int main(int argc, char* argv[])
     // el hilo del feed (bajo mtx) y los cuenta el hilo del render despues de copiarlos bajo la misma.
     std::set<std::string>  ackedZones, rejectedZones;   // "addr:port" por zona
     std::atomic<int>       observedAcked{0}, observedRejected{0};
+    // RTT de la suscripcion: la zona contesta CADA hello con un PKT_OBSERVE_ACK, asi que el round-trip
+    // HELLO->ACK es la latencia de red que ve el feed (un sample por zona cada ~2 s). Se pinta en vivo
+    // en la barra de estado: la prueba de "baja latencia" que pide el video, sin colaborar con nada.
+    std::atomic<int>       rttLastMs{-1}, rttMinMs{-1};
+    std::atomic<long long> rttSamples{0}, rttSumMs{0};
 
     DGS::TCPSocket head;
     if (!head.connect(headHost, headPort))
@@ -191,6 +201,7 @@ int main(int argc, char* argv[])
                          "subscription and nothing will move on screen." << std::endl;
 
         DGS::Packet hello; hello.pack(DGS::PKT_OBSERVE); hello.writeString(token);
+        std::map<std::string, uint64_t> sentAt;   // "addr:port" -> momento del ultimo HELLO
         uint64_t lastHello = 0;
         uint8_t  buf[sizeof(DGS::EntityTransfer) * 2];
         std::string from; int port = 0;
@@ -206,7 +217,10 @@ int main(int argc, char* argv[])
                 std::vector<DGS::ZoneInfoPublic> zs;
                 { std::lock_guard<std::mutex> lk(mtx); zs = state.zones(); }
                 for (const auto& z : zs)
+                {
                     udp.send(z.addr, z.port, hello.getRawData(), hello.getSize());
+                    sentAt[std::string(z.addr) + ":" + std::to_string(z.port)] = nowMs();
+                }
             }
 
             const int n = udp.receive(buf, sizeof(buf), from, port);
@@ -222,6 +236,17 @@ int main(int argc, char* argv[])
                     if (ack.tryUnpackObserveAck(accepted, leaseMs, reason))
                     {
                         const std::string key = from + ":" + std::to_string(port);
+                        const auto it = sentAt.find(key);
+                        if (it != sentAt.end())
+                        {
+                            const int rtt = (int)(nowMs() - it->second);
+                            sentAt.erase(it);
+                            rttLastMs = rtt;
+                            rttSamples.fetch_add(1);
+                            rttSumMs.fetch_add(rtt);
+                            int m = rttMinMs.load();
+                            while ((m < 0 || rtt < m) && !rttMinMs.compare_exchange_weak(m, rtt)) {}
+                        }
                         std::lock_guard<std::mutex> lk(mtx);
                         const bool wasAcked    = ackedZones.count(key) != 0;
                         const bool wasRejected = rejectedZones.count(key) != 0;
@@ -379,12 +404,20 @@ int main(int argc, char* argv[])
         int ghosts = 0;
         for (const auto& e : ents) if (e.ghost) ++ghosts;
         const int sh = GetScreenHeight();
+        char rttBuf[96];
+        const long long nRtt = rttSamples.load();
+        if (nRtt > 0)
+            std::snprintf(rttBuf, sizeof(rttBuf), "%d ms last (avg %d · min %d · %lld probes)",
+                          rttLastMs.load(), (int)(rttSumMs.load() / nRtt), rttMinMs.load(),
+                          (long long)nRtt);
+        else
+            std::snprintf(rttBuf, sizeof(rttBuf), "--");
         DrawRectangle(0, sh - 46, GetScreenWidth(), 46, ColorAlpha(BLACK, 0.75f));
-        DrawText(TextFormat("head %s:%d  %s   zones %d (observing %d · rejected %d)   entities %d (%d ghosts)   chunk %.0f",
+        DrawText(TextFormat("head %s:%d  %s   zones %d (observing %d · rejected %d)   entities %d (%d ghosts)   chunk %.0f   RTT %s",
                             headHost, headPort, headUp ? "UP" : "DOWN",
                             (int)zs.size(), observedAcked.load(), observedRejected.load(),
-                            (int)ents.size() - ghosts, ghosts, chunkSize),
-                 8, sh - 40, 14, headUp ? RAYWHITE : RED);
+                            (int)ents.size() - ghosts, ghosts, chunkSize, rttBuf),
+                 8, sh - 40, 14, headUp ? (nRtt > 0 ? RAYWHITE : YELLOW) : RED);
         DrawText("0 all · 1-6 single view · G ghosts · TAB list", 8, sh - 20, 12, GRAY);
 
         if (zs.empty())
