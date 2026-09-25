@@ -364,7 +364,7 @@ they do not answer it.
 
 ```bash
 cmake -S . -B build -DDGS_LOAD_TESTS=ON
-ctest --test-dir build -L carga            # the three rows above, ~30 s
+ctest --test-dir build -L load            # the three rows above, ~30 s
 # or by hand, any population:
 LOAD_MIN_N=1000 LOAD_HZ=20 LOAD_SPREAD_CHUNKS=100 LOAD_INTEREST_M=500 LOAD_DRAIN_MAX=4096 \
   ./build/load_zone ./build/zone_node ./build/stub_rules.so 1000 10

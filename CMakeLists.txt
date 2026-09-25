@@ -154,10 +154,10 @@ add_executable(socket_framing_test tests/socket_framing_test.cpp ${COMMON_SRCS})
 target_link_libraries(socket_framing_test Threads::Threads)
 
 add_executable(wire_test tests/wire_test.cpp ${COMMON_SRCS})
-# 1000 jugadores, y el doble de carga por los dos ejes. No levanta clientes: PROYECTA a partir de las
-# cifras medidas con `tools/load_zone`, y se calibra contra ellas antes de proyectar nada. Puro CPU,
-# sin sockets ni nodos, asi que corre en cada push y tambien bajo TSan. El banco de verdad —1000
-# sockets contra un `zone_node`— es `tools/load_zone` y se lanza a mano (ver LOAD_* en el README).
+# 1000 players, and twice the load on both axes. It stands up no clients: it PROJECTS from the
+# figures measured with `tools/load_zone`, and calibrates against them before projecting anything.
+# Pure CPU, no sockets and no nodes, so it runs on every push and under TSan too. The real bench —
+# 1000 sockets against a `zone_node` — is `tools/load_zone`, launched by hand (LOAD_* in the README).
 add_executable(load_model_test tests/load_model.cpp ${COMMON_SRCS})
 add_executable(robust_test tests/robust_test.cpp ${COMMON_SRCS})
 target_link_libraries(robust_test ${CMAKE_DL_LIBS})   # dlopen of the rules module (determinism)
@@ -305,17 +305,17 @@ enable_testing()
 add_test(NAME cli COMMAND cli_test $<TARGET_FILE:dgs>)
 set_tests_properties(cli PROPERTIES TIMEOUT 60)
 
-# El recolector que sube las cifras de los tests al resumen del job (`tools/ci_test_summary.py`) se
-# prueba a si mismo, y corre aqui como un test mas. Un script de CI sin test es el sitio clasico
-# donde el panel dice "todo verde" porque el que parsea se ha roto y devuelve una lista vacia: su
-# `--selftest` incluye esa contraprueba (un XML sin tests NO se canta como exito).
+# The collector that puts the tests' figures on the job summary (`tools/ci_test_summary.py`) tests
+# itself, and runs here as one more test. A CI script with no test is the classic place where the
+# dashboard says "all green" because the parser broke and returns an empty list: its `--selftest`
+# includes that counter-proof (an XML with no tests is NOT reported as a success).
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(NAME ci_summary
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci_test_summary.py --selftest)
     set_tests_properties(ci_summary PROPERTIES TIMEOUT 60)
 else()
-    message(STATUS "Python3 no encontrado: el test `ci_summary` no se registra (el resumen de CI si lo usa)")
+    message(STATUS "Python3 not found: the `ci_summary` test is not registered (CI's summary still uses it)")
 endif()
 
 add_test(NAME udp_crypto COMMAND udp_crypto_test)
@@ -330,33 +330,34 @@ add_test(NAME socket_framing COMMAND socket_framing_test)
 add_test(NAME wire        COMMAND wire_test)
 add_test(NAME load_model  COMMAND load_model_test)
 
-# ── CARGA DE VERDAD: 1000 jugadores, y el doble por los dos ejes ─────────────────────────────────
-# Estos SI levantan la zona y 1000 (o 2000) sockets UDP. Fuera del `ctest` por defecto a proposito:
-# duran minutos, piden descriptores y memoria, y en una maquina compartida —un runner de CI de dos
-# nucleos -- lo que miden es el runner y no la zona. El binario se construye SIEMPRE (un objetivo que
-# nadie compila se pudre en silencio); lo que se activa con la opcion es REGISTRARLOS.
+# ── REAL LOAD: 1000 players, and twice that on both axes ─────────────────────────────────────────
+# These DO stand up the zone and 1000 (or 2000) UDP sockets. Out of the default `ctest` on purpose:
+# they take minutes, they want file descriptors and memory, and on a shared machine — a two-core CI
+# runner — what they measure is the runner and not the zone. The binary is built ALWAYS (a target
+# nobody compiles rots in silence); what the option switches on is REGISTERING them.
 #
-#   cmake -S . -B build -DDGS_LOAD_TESTS=ON && ctest --test-dir build -L carga
+#   cmake -S . -B build -DDGS_LOAD_TESTS=ON && ctest --test-dir build -L load
 #
-# ⚠️ LOS DOS AJUSTES DEL ENTORNO NO SON DECORACION, y cada uno es una pared medida:
-#   · LOAD_SPREAD_CHUNKS — amontonados, 1000 jugadores son 10^6 datagramas por tick (la difusion es
-#     N²). `tests/load_model` dice que hacen falta ~70 chunks para 1000 y ~277 para 2000.
-#   · LOAD_DRAIN_MAX — la zona drena 256 datagramas por tick por defecto = 2 560/s = 128 jugadores a
-#     20 Hz. Sin subirlo, 1000 clientes llenan la cola y la fila no mide la difusion sino el tope.
-# El veredicto NO exige el tick nominal (a 1000 se sabe que va tarde): exige que el nodo siga vivo y
-# siga sirviendo a todo el mundo. Ir lento es una cifra; perder entidades es una regresion.
-option(DGS_LOAD_TESTS "Registrar los bancos de carga (1000/2000 jugadores, minutos por test)" OFF)
+# ⚠️ THE TWO ENVIRONMENT SETTINGS ARE NOT DECORATION, and each one is a measured wall:
+#   · LOAD_SPREAD_CHUNKS — in a crowd, 1000 players are 10^6 datagrams per tick (the broadcast is
+#     N²). `tests/load_model` says ~70 chunks are needed for 1000 and ~277 for 2000.
+#   · LOAD_DRAIN_MAX — the zone drains 256 datagrams per tick by default = 2560/s = 128 players at
+#     20 Hz. Without raising it, 1000 clients fill the queue and the row measures the cap, not the
+#     broadcast.
+# The verdict does NOT demand the nominal tick (at 1000 it is known to be late): it demands that the
+# node stay alive and keep serving everybody. Being slow is a figure; losing entities is a regression.
+option(DGS_LOAD_TESTS "Register the load benches (1000/2000 players, minutes per test)" OFF)
 if (DGS_LOAD_TESTS)
-    function(dgs_add_load_test nombre poblacion hz chunks segundos limite)
-        add_test(NAME ${nombre} COMMAND load_zone
-                 $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules> ${poblacion} ${segundos})
-        set_tests_properties(${nombre} PROPERTIES
-            LABELS "carga" RUN_SERIAL TRUE TIMEOUT ${limite}
-            ENVIRONMENT "LOAD_VERDICT=1;LOAD_MIN_N=${poblacion};LOAD_HZ=${hz};LOAD_SPREAD_CHUNKS=${chunks};LOAD_INTEREST_M=500;LOAD_DRAIN_MAX=4096")
+    function(dgs_add_load_test name population hz chunks seconds limit)
+        add_test(NAME ${name} COMMAND load_zone
+                 $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules> ${population} ${seconds})
+        set_tests_properties(${name} PROPERTIES
+            LABELS "load" RUN_SERIAL TRUE TIMEOUT ${limit}
+            ENVIRONMENT "LOAD_VERDICT=1;LOAD_MIN_N=${population};LOAD_HZ=${hz};LOAD_SPREAD_CHUNKS=${chunks};LOAD_INTEREST_M=500;LOAD_DRAIN_MAX=4096")
     endfunction()
-    dgs_add_load_test(carga_1000_20hz 1000 20 100 10 300)
-    dgs_add_load_test(carga_1000_40hz 1000 40 100 10 300)   # el doble de RITMO
-    dgs_add_load_test(carga_2000_20hz 2000 20 300 10 420)   # el doble de GENTE
+    dgs_add_load_test(load_1000_20hz 1000 20 100 10 300)
+    dgs_add_load_test(load_1000_40hz 1000 40 100 10 300)   # twice the RATE
+    dgs_add_load_test(load_2000_20hz 2000 20 300 10 420)   # twice the PEOPLE
 endif()
 add_test(NAME robust      COMMAND robust_test)
 add_test(NAME thread_pool COMMAND thread_pool_test)

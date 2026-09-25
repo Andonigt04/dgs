@@ -22,28 +22,28 @@
 //
 //   load_zone [zone-bin] [stub.so] [max-clients] [seconds-per-step]
 //
-// ── 1000 JUGADORES, Y EL DOBLE DE CARGA ──────────────────────────────────────────────────────────
-// La rampa por defecto llega a 64 y dobla; para ir DIRECTO a una poblacion, `LOAD_MIN_N`. Y «el
-// doble de carga» son dos ejes distintos, que cargan sitios distintos y por eso son dos mandos:
+// ── 1000 PLAYERS, AND TWICE THE LOAD ─────────────────────────────────────────────────────────────
+// The default ramp reaches 64 and doubles; to go STRAIGHT to a population, `LOAD_MIN_N`. And "twice
+// the load" is two different axes, which load different places, so they are two knobs:
 //
-//   LOAD_MIN_N=1000 ... 1000                 # 1000 jugadores a 20 Hz
-//   LOAD_HZ=40 LOAD_MIN_N=1000 ... 1000      # el doble de RITMO: dobla lo que ENTRA
-//   LOAD_MIN_N=2000 ... 2000                 # el doble de GENTE: cuadruplica lo que SALE
+//   LOAD_MIN_N=1000 ... 1000                 # 1000 players at 20 Hz
+//   LOAD_HZ=40 LOAD_MIN_N=1000 ... 1000      # twice the RATE: doubles what comes IN
+//   LOAD_MIN_N=2000 ... 2000                 # twice the PEOPLE: quadruples what goes OUT
 //
-// ⚠️ A 1000 NO SALE NADA SI NO SE PONEN DOS COSAS MAS, y las dos tienen su propio mando porque las
-// dos son paredes medidas, no manias:
-//   · `LOAD_SPREAD_CHUNKS` — amontonados, 1000 jugadores son 10^6 datagramas por tick (la difusion
-//     es N²). No es lento: no existe. `tests/load_model.cpp` dice que hacen falta ~87 chunks.
-//   · `LOAD_DRAIN_MAX` — la zona vacia su socket hasta `ZONE_UDP_DRAIN_MAX` datagramas POR TICK
-//     (256 por defecto), o sea 2 560/s para la zona entera: 128 jugadores a 20 Hz. Con el defecto,
-//     1000 clientes mandan 8 veces lo que se puede drenar y la cola solo crece.
+// ⚠️ AT 1000 NOTHING COMES OF IT WITHOUT TWO MORE SETTINGS, and each has its own knob because each
+// is a measured wall, not a preference:
+//   · `LOAD_SPREAD_CHUNKS` — in a crowd, 1000 players are 10^6 datagrams per tick (the broadcast is
+//     N²). It is not slow: it does not exist. `tests/load_model.cpp` says ~70 chunks are needed.
+//   · `LOAD_DRAIN_MAX` — the zone empties its socket up to `ZONE_UDP_DRAIN_MAX` datagrams PER TICK
+//     (256 by default), i.e. 2560/s for the whole zone: 128 players at 20 Hz. With the default, 1000
+//     clients send eight times what can be drained and the queue only grows.
 //
 //   LOAD_SPREAD_CHUNKS=100 LOAD_DRAIN_MAX=4096 LOAD_INTEREST_M=500 \
 //     LOAD_MIN_N=1000 ./build/load_zone ./build/zone_node ./build/stub_rules.so 1000 10
 //
-// ⚠️ Y HAY QUE SUBIR EL LIMITE DE DESCRIPTORES: 1000 clientes son 1000 sockets y el defecto de casi
-// todo Linux es 1024 contando los que ya hay abiertos. Esto lo sube solo (setrlimit) y DICE hasta
-// donde ha podido; si no llega, recorta la poblacion y lo canta en vez de fallar a medias.
+// ⚠️ AND THE DESCRIPTOR LIMIT HAS TO GO UP: 1000 clients are 1000 sockets and the default on almost
+// every Linux is 1024, counting the ones already open. This raises it itself (setrlimit) and SAYS how
+// far it got; if it cannot get there it trims the population and says so, instead of half failing.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
@@ -188,44 +188,50 @@ int main(int argc, char** argv)
     int       maxClients = (argc > 3) ? std::atoi(argv[3]) : 64;
     const int stepSecs   = (argc > 4) ? std::atoi(argv[4]) : 4;
     auto envInt = [](const char* k, int d) { const char* v = std::getenv(k); return v ? std::atoi(v) : d; };
-    const double hzCliente = (double)envInt("LOAD_HZ", 20);        // el ritmo de CADA jugador
-    const int    minN      = envInt("LOAD_MIN_N", 1);              // donde empieza la rampa
-    const int    interestM = envInt("LOAD_INTEREST_M", 0);         // radio de interes de la zona
-    const int    drainMax  = envInt("LOAD_DRAIN_MAX", 0);          // 0 = el defecto del nodo (256)
-    // ⚠️ EL REPARTO TIENE QUE CABER EN LA REGION DE LA ZONA, y no cabia. Los clientes se colocan en
-    // los chunks 50..50+spread−1 y la zona declaraba 0..100 fijo: con `LOAD_SPREAD_CHUNKS=300`, dos
-    // tercios de los jugadores caian FUERA y el nodo se pasaba el tick intentando traspasarlos a un
-    // vecino que no existe — 1643 «out of bounds» en una corrida de 10 s. La fila seguia diciendo
-    // «2000 servidos» y su bucle era un 35 % mas alto que el de la difusion, que es lo que se creia
-    // estar midiendo. Un banco que mide otra cosa y no lo dice es peor que no tenerlo.
+    const double clientHz  = (double)envInt("LOAD_HZ", 20);        // the rate of EACH player
+    const int    minN      = envInt("LOAD_MIN_N", 1);              // where the ramp starts
+    const int    interestM = envInt("LOAD_INTEREST_M", 0);         // the zone's interest radius
+    const int    drainMax  = envInt("LOAD_DRAIN_MAX", 0);          // 0 = the node's default (256)
+    // ⚠️ THE SPREAD HAS TO FIT INSIDE THE ZONE'S REGION, and it did not. Clients are placed in chunks
+    // 50..50+spread−1 and the zone declared a fixed 0..100: with `LOAD_SPREAD_CHUNKS=300`, two thirds
+    // of the players fell OUTSIDE and the node spent its tick trying to hand them off to a neighbour
+    // that does not exist — 1643 "out of bounds" in a 10 s run. The row still said "2000 served" and
+    // its loop was 35 % higher than the broadcast's, which is what it was believed to be measuring. A
+    // harness that measures something else and does not say so is worse than no harness.
     const int    spread    = envInt("LOAD_SPREAD_CHUNKS", 0);
     const bool   verdict   = std::getenv("LOAD_VERDICT") != nullptr;
 
-    // ── Descriptores ────────────────────────────────────────────────────────────────────────────
-    // Un cliente = un socket. El limite blando tipico es 1024 CONTANDO lo que ya hay abierto, asi
-    // que a 1000 clientes se agota a mitad de la rampa: los `bind` empiezan a fallar y el banco mide
-    // una poblacion que no es la que dice. Se sube al limite duro (no hace falta root) y, si aun asi
-    // no llega, se RECORTA la poblacion y se dice — medir 1000 con 900 sockets no es medir 1000.
+    // ── File descriptors ────────────────────────────────────────────────────────────────────────
+    // One client = one socket. The usual soft limit is 1024 COUNTING what is already open, so at 1000
+    // clients it runs out mid-ramp: the `bind` calls start failing and the harness measures a
+    // population that is not the one it reports. It is raised to the hard limit (no root needed) and,
+    // if that is still not enough, the population is TRIMMED and said out loud — measuring 1000 with
+    // 900 sockets is not measuring 1000.
     {
         struct rlimit rl{};
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-            const rlim_t querido = (rlim_t)maxClients + 128;       // + los del propio banco y el nodo
-            if (rl.rlim_cur < querido) {
-                rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY) ? querido
-                                                             : std::min<rlim_t>(querido, rl.rlim_max);
+            const rlim_t wanted = (rlim_t)maxClients + 128;        // + the harness's own and the node's
+            if (rl.rlim_cur < wanted) {
+                rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY) ? wanted
+                                                             : std::min<rlim_t>(wanted, rl.rlim_max);
                 setrlimit(RLIMIT_NOFILE, &rl);
                 getrlimit(RLIMIT_NOFILE, &rl);
             }
-            std::printf("  descriptores: limite %llu (hacen falta ~%d)\n",
+            std::printf("  descriptors: limit %llu (~%d needed)\n",
                         (unsigned long long)rl.rlim_cur, maxClients + 128);
-            if (rl.rlim_cur < querido) {
-                const int cabe = (int)rl.rlim_cur - 128;
-                std::printf("  ⚠️  no llega: la poblacion se recorta de %d a %d "
-                            "(sube el limite duro con `ulimit -Hn`)\n", maxClients, cabe);
-                if (cabe < 1) return 1;
-                maxClients = cabe;
+            if (rl.rlim_cur < wanted) {
+                const int fits = (int)rl.rlim_cur - 128;
+                std::printf("  ⚠️  not enough: the population is trimmed from %d to %d "
+                            "(raise the hard limit with `ulimit -Hn`)\n", maxClients, fits);
+                if (fits < 1) return 1;
+                maxClients = fits;
             }
         }
+        // ⚠️ FLUSH BEFORE THE FORK. This is the first thing printed before `fork()`, and stdio's
+        // buffer is COPIED into the child: the child's `freopen` on stdout flushes the inherited copy
+        // on its way out, so the line came out twice. Harmless here and not harmless at all in a
+        // harness whose whole job is reporting what it saw.
+        std::fflush(stdout);
     }
 
     std::atomic<bool> h{false}, v{false}, so{false};
@@ -246,7 +252,7 @@ int main(int argc, char** argv)
         setenv("SOCIAL_HOST",        "127.0.0.1", 1);
         setenv("SOCIAL_TCP_PORT",    std::to_string(kSocPort).c_str(), 1);
         setenv("CHUNK_X_MIN", "0", 1);
-        // Hasta donde llega el reparto (los clientes empiezan en el chunk 50), con holgura.
+        // As far as the spread reaches (clients start at chunk 50), with slack.
         setenv("CHUNK_X_MAX", std::to_string(std::max(100, 50 + spread + 1)).c_str(), 1);
         setenv("CHUNK_Y_MIN", "0", 1); setenv("CHUNK_Y_MAX", "100", 1);
         setenv("CHUNK_Z_MIN", "0", 1); setenv("CHUNK_Z_MAX", "100", 1);
@@ -255,8 +261,9 @@ int main(int argc, char** argv)
         setenv("CHUNK_SIZE_Z", "1000.0", 1);
         setenv("ENTITY_LEASE_MS", "10000", 1);   // long: nobody must be purged mid-measurement
         setenv("GAME_MODULE_SO", stubPath, 1);
-        // Las dos paredes que a 1000 jugadores hay que mover a mano (ver la cabecera). Si no se
-        // piden, el nodo se queda con sus defectos y el banco mide el defecto, que tambien vale.
+        // The two walls that have to be moved by hand at 1000 players (see the header). If they are
+        // not asked for, the node keeps its defaults and the harness measures the default, which is
+        // also a result.
         if (interestM > 0) setenv("INTEREST_RADIUS_M", std::to_string(interestM).c_str(), 1);
         if (drainMax  > 0) setenv("ZONE_UDP_DRAIN_MAX", std::to_string(drainMax).c_str(), 1);
         char tmpl[] = "/tmp/dgs_load_XXXXXX";
@@ -284,8 +291,8 @@ int main(int argc, char** argv)
     std::vector<Client> clients;
     int firstBroken = -1;
 
-    // La rampa empieza donde diga `LOAD_MIN_N` (1 por defecto) y dobla, pero el ULTIMO escalon es
-    // exactamente `maxClients`: pidiendo 1000 hay que medir 1000, no 512 y luego nada.
+    // The ramp starts where `LOAD_MIN_N` says (1 by default) and doubles, but the LAST step is
+    // exactly `maxClients`: asking for 1000 must measure 1000, not 512 and then nothing.
     for (int n = (minN > 1 ? std::min(minN, maxClients) : 1); ; n = std::min(n * 2, maxClients))
     {
         // Grow the population; existing clients keep their identity so the zone is not rebuilt.
@@ -301,15 +308,15 @@ int main(int argc, char** argv)
             const int fd = c.sock->getSocketFD();
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
             // And a big receive buffer, so a drop is the zone's or the kernel's queue, never ours.
-            // ⚠️ PERO REPARTIDO ENTRE TODOS. Eran 8 MiB fijos por socket, lo cual esta muy bien con 64
-            // clientes (512 MiB de tope) y es una bomba con 1000: en esta maquina `rmem_max` son 4 MiB,
-            // asi que serian hasta 4 GiB de cola de kernel con 6 GiB libres — el banco moriria por OOM
-            // y el resultado seria «la zona no aguanta 1000», que es justo lo contrario de lo medido.
-            // Con un presupuesto total, a 1000 clientes tocan 256 KiB cada uno: un cliente recibe ~13
-            // entidades de 62 B por tick, o sea que 256 KiB son varios segundos de holgura.
-            const int kPresupuestoRx = 256 * 1024 * 1024;
+            // ⚠️ BUT SHARED OUT AMONG THEM ALL. It was a flat 8 MiB per socket, which is fine with 64
+            // clients (512 MiB of ceiling) and a bomb with 1000: on this machine `rmem_max` is 4 MiB,
+            // so it would be up to 4 GiB of kernel queue with 6 GiB free — the harness would die of
+            // OOM and the result would read "the zone cannot take 1000", the exact opposite of what
+            // was measured. With a total budget, 1000 clients get 256 KiB each: a client receives ~13
+            // entities of 62 B per tick, so 256 KiB is several seconds of slack.
+            const int kRxBudget = 256 * 1024 * 1024;
             const int rcvbuf = std::max(256 * 1024, std::min(8 * 1024 * 1024,
-                                        kPresupuestoRx / std::max(1, maxClients)));
+                                        kRxBudget / std::max(1, maxClients)));
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
             c.uuid = 5000 + (uint32_t)clients.size();
             // ⚠️ WHERE THE PLAYERS STAND DECIDES WHAT INTEREST MANAGEMENT CAN DO, so it is a knob and
@@ -356,8 +363,8 @@ int main(int argc, char** argv)
                                        std::chrono::steady_clock::now() - t0).count();
             if (elapsed >= (double)stepSecs) break;
 
-            // El ritmo de cada cliente: 20 Hz nominal, `LOAD_HZ` para el doble de carga.
-            if ((uint64_t)(elapsed * hzCliente) >= nextTick)
+            // Each client's rate: 20 Hz nominal, `LOAD_HZ` for twice the load.
+            if ((uint64_t)(elapsed * clientHz) >= nextTick)
             {
                 ++nextTick;
                 const float tag = (float)nowMs();
@@ -410,7 +417,7 @@ int main(int argc, char** argv)
         for (const auto& c : clients) { rxBytes += c.recvBytes; rxCount += c.recvCount; selfTotal += c.selfCount; }
 
         const double sentPerSec = (double)sent / secs;
-        const double wantPerSec = hzCliente * (double)n;
+        const double wantPerSec = clientHz * (double)n;
         const double measMBs    = (double)rxBytes / secs / 1e6;
         const double perCliMBs  = measMBs / (double)n;
         // Ticks per second as each client experiences them: its own entity echoed back, once per
@@ -436,21 +443,21 @@ int main(int argc, char** argv)
                                   : "   <- THE HARNESS is behind: row invalid");
         std::fflush(stdout);
 
-        // Las cifras de CADA escalon, al canal de metricas: asi una corrida de esto sube al resumen
-        // del job (o a donde se recoja) sin que nadie tenga que leer la tabla a ojo. La clave lleva
-        // la poblacion, que es lo que distingue una fila de otra.
+        // EVERY step's figures, to the metric channel: that way a run of this reaches the job's
+        // summary (or wherever it is collected) without anybody reading the table by eye. The key
+        // carries the population, which is what tells one row from another.
         {
             char key[80];
-            auto pub = [&](const char* que, double v, const char* unidad) {
-                std::snprintf(key, sizeof key, "%s_n%d", que, n);
-                dgsMetric(key, v, unidad);
+            auto pub = [&](const char* what, double v, const char* unit) {
+                std::snprintf(key, sizeof key, "%s_n%d", what, n);
+                dgsMetric(key, v, unit);
             };
-            pub("servidos", (double)served, "entidades");
+            pub("served", (double)served, "entities");
             pub("snapshots", snapsPerSec, "Hz");
-            pub("egreso", measMBs, "MB/s");
-            pub("latencia_p95", p95, "ms");
-            pub("bucle", (double)g_loopUs.load() / 1000.0, "ms");
-            pub("banco_envio", sentPerSec, "dg/s");
+            pub("egress", measMBs, "MB/s");
+            pub("latency_p95", p95, "ms");
+            pub("loop", (double)g_loopUs.load() / 1000.0, "ms");
+            pub("harness_send", sentPerSec, "dg/s");
         }
 
         (void)txBefore;
@@ -464,30 +471,30 @@ int main(int argc, char** argv)
         std::printf("  the zone kept up to N = %d (nothing broke inside the range tested)\n", maxClients);
     std::printf("  the node's log is in /tmp/dgs_load_zone.log\n");
 
-    // ── EL VEREDICTO (LOAD_VERDICT=1), para cuando esto corre como test ──────────────────────────
-    // ⚠️ NO FALLA PORQUE LA ZONA VAYA TARDE. A 1000 jugadores se SABE que va tarde —el modelo lo
-    // dice y la tabla medida tambien—, asi que exigir el tick nominal seria un test que nace roto y
-    // que se acabaria comentando. Lo que si tiene que seguir siendo verdad a cualquier poblacion, y
-    // es lo que se vigila aqui: que el nodo SIGA VIVO y siga sirviendo a todo el mundo. Perder
-    // entidades, morirse o dejar de responder son regresiones; ir lento es una cifra.
+    // ── THE VERDICT (LOAD_VERDICT=1), for when this runs as a test ──────────────────────────────
+    // ⚠️ IT DOES NOT FAIL BECAUSE THE ZONE IS LATE. At 1000 players it is KNOWN to be late — the model
+    // says so and the measured table says so — and demanding the nominal tick would be a test born
+    // broken, the kind that ends up commented out. What must stay true at any population, and is what
+    // is watched here: that the node STAYS ALIVE and keeps serving everybody. Losing entities, dying
+    // or going unresponsive are regressions; being slow is a figure.
     const int servedFinal = g_activeEntities.load();
     int nodeStatus = 0;
     const bool nodeAlive = (waitpid(pid, &nodeStatus, WNOHANG) == 0);
-    bool malo = false;
+    bool bad = false;
     if (verdict) {
-        std::printf("\n  veredicto: el nodo %s · sirviendo %d de %d\n",
-                    nodeAlive ? "sigue vivo" : "SE HA MUERTO", servedFinal, maxClients);
-        if (!nodeAlive)                  { std::printf("  [FAIL] el zone_node no sobrevivio a la carga\n"); malo = true; }
-        else if (servedFinal < maxClients) { std::printf("  [FAIL] la zona dejo de servir a %d entidades\n",
-                                                         maxClients - servedFinal); malo = true; }
-        else                               std::printf("  [ok]   la zona aguanta %d jugadores sin perder a nadie\n",
+        std::printf("\n  verdict: the node %s · serving %d of %d\n",
+                    nodeAlive ? "is still alive" : "HAS DIED", servedFinal, maxClients);
+        if (!nodeAlive)                  { std::printf("  [FAIL] the zone_node did not survive the load\n"); bad = true; }
+        else if (servedFinal < maxClients) { std::printf("  [FAIL] the zone stopped serving %d entities\n",
+                                                         maxClients - servedFinal); bad = true; }
+        else                               std::printf("  [ok]   the zone holds %d players without losing one\n",
                                                        maxClients);
-        std::printf("\n== load_zone: %d OK · %d FAILED ==\n", malo ? 0 : 1, malo ? 1 : 0);
+        std::printf("\n== load_zone: %d OK · %d FAILED ==\n", bad ? 0 : 1, bad ? 1 : 0);
     }
 
     kill(pid, SIGTERM);
     waitpid(pid, nullptr, 0);
     g_done = true;
     th.join(); tv.join(); ts.join();
-    return malo ? 1 : 0;
+    return bad ? 1 : 0;
 }

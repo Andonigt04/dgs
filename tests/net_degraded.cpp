@@ -415,10 +415,10 @@ int main(int argc, char** argv)
         if (g_proxySendFailures.load() > 0)
             std::printf("         (the proxy failed to forward %d of %d datagrams)\n",
                         g_proxySendFailures.load(), sent);
-        // Los FALSOS POSITIVOS por caso, publicados uno a uno. Es la cifra de la que vive este test:
-        // cuantas veces el validador expulsa a un jugador limpio porque la red le llego rota. La
-        // clave sale del nombre del caso, que trae espacios y un '%' ("20 % loss") y aqui tiene que
-        // ser una sola palabra.
+        // The FALSE POSITIVES per case, published one by one. It is the figure this test lives on:
+        // how often the validator throws out a clean player because the network reached them broken.
+        // The key comes from the case's name, which carries spaces and a '%' ("20 % loss") and has to
+        // be a single word here.
         {
             auto publish = [&](const char* what, long long value, const char* unit) {
                 char key[96];
@@ -428,9 +428,9 @@ int main(int argc, char** argv)
                           (*p >= '0' && *p <= '9') || *p == '_')) *p = '_';
                 dgsMetricI(key, value, unit);
             };
-            publish("falsos_positivos", falsePos, "");
-            publish("datagramas_perdidos", dropped, "");
-            publish("datagramas_enviados", sent, "");
+            publish("false_positives", falsePos, "");
+            publish("dropped_datagrams", dropped, "");
+            publish("sent_datagrams", sent, "");
         }
         if (!controlOk) ++g_casesWithNoTraffic;
 

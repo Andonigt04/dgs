@@ -1,33 +1,33 @@
 #pragma once
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// EL CANAL DE METRICAS DE LOS TESTS: una linea por numero medido, con una forma que lee una maquina.
+// THE TESTS' METRIC CHANNEL: one line per measured number, in a shape a machine can read.
 //
-//      METRIC <clave> <valor> [<unidad>]
+//      METRIC <key> <value> [<unit>]
 //
-// Los tests de este repo ya median cosas y ya las imprimian —"loopback RTT: 0.214 ms", "zona: 3
-// pings, rtt ultimo 1.02 ms", "the proxy failed to forward 12 of 400 datagrams"—, cada una con su
-// propia frase. Eso se lee en la consola de quien lo lanza a mano y NO se lee en ningun otro sitio:
-// en GitHub Actions queda enterrado en el log del job, que hay que abrir, desplegar y buscar. Una
-// cifra que empeora entre dos commits no la ve nadie. `tools/ci_test_summary.py` recoge estas lineas
-// del XML de CTest y las sube al resumen del run, que es la pagina que sale al entrar.
+// The tests in this repo already measured things and already printed them — "loopback RTT: 0.214 ms",
+// "zona: 3 pings, rtt ultimo 1.02 ms", "the proxy failed to forward 12 of 400 datagrams" — each one
+// in its own sentence. That reads fine on the console of whoever launched it and nowhere else: in
+// GitHub Actions it is buried in the job's log, which has to be opened, expanded and searched. A
+// figure that gets worse between two commits is seen by nobody. `tools/ci_test_summary.py` collects
+// these lines out of CTest's XML and puts them on the run's summary page, which is what you land on.
 //
-// ⚠️ NO SUSTITUYE A LA FRASE del test, se pone AL LADO. La frase lleva el contexto ("tres pings a
-// 100 ms, la zona devuelve el eco sellado") y es lo que hace entendible un fallo; la linea METRIC no
-// lleva contexto ninguno, solo el numero.
+// ⚠️ IT DOES NOT REPLACE THE TEST'S SENTENCE, it goes NEXT TO it. The sentence carries the context
+// ("three pings 100 ms apart, the zone echoes the sealed pong") and is what makes a failure legible;
+// the METRIC line carries no context at all, only the number.
 //
-// ⚠️ Y NO SUSTITUYE A UN `check`: una metrica no decide nada. El veredicto lo sigue dando el check,
-// que es quien tiene el umbral ("RTT < 50 ms en loopback"). Publicar el numero es para poder MIRAR
-// como se mueve; hacerlo fallar es otra decision y se toma en el check, no aqui. Un umbral escondido
-// en un panel es un test que no se puede leer.
+// ⚠️ AND IT DOES NOT REPLACE A `check`: a metric decides nothing. The verdict still belongs to the
+// check, which is the thing that holds the threshold ("RTT < 50 ms on loopback"). Publishing the
+// number is so it can be WATCHED; making it fail is a different decision and it is taken in the
+// check, not here. A threshold hidden in a dashboard is a test you cannot read.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include <cstdio>
 
-/// Un numero medido. La clave, sin espacios (`rtt_loopback`); la unidad es texto y puede faltar.
+/// A measured number. The key with no spaces (`rtt_loopback`); the unit is free text and may be absent.
 inline void dgsMetric(const char* key, double value, const char* unit = "") {
     std::printf("METRIC %s %.4g%s%s\n", key, value, (unit && *unit) ? " " : "", unit ? unit : "");
 }
 
-/// Igual, para cuentas exactas (bytes, datagramas, violaciones): un entero no debe salir en 1e+06.
+/// The same, for exact counts (bytes, datagrams, violations): an integer must not come out as 1e+06.
 inline void dgsMetricI(const char* key, long long value, const char* unit = "") {
     std::printf("METRIC %s %lld%s%s\n", key, value, (unit && *unit) ? " " : "", unit ? unit : "");
 }

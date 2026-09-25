@@ -104,30 +104,30 @@ jobs:
           DGS_REQUIRE_MONGO: "1"
           MONGO_HOST: "127.0.0.1"
           MONGO_PORT: "27017"
-        # ⚠️ `--output-junit` NO BASTA POR SI SOLO: CTest mete la salida de cada test en el XML pero la
-        # RECORTA a 1024 bytes, y recorta por el FINAL — que es justo donde un test imprime su resumen
-        # ("== zone_e2e: 12 OK · 0 FAILED ==") y sus lineas METRIC. Medido: `udp_crypto` llegaba al
-        # recolector con "[This part of the test output was removed...]" y sin una sola cifra. Los dos
-        # limites de abajo son lo que hace que el resumen del job diga algo.
+        # ⚠️ `--output-junit` IS NOT ENOUGH ON ITS OWN: CTest puts each test's output in the XML but
+        # CLIPS it at 1024 bytes, and clips from the END — which is exactly where a test prints its
+        # summary ("== zone_e2e: 12 OK · 0 FAILED ==") and its METRIC lines. Measured: `udp_crypto`
+        # reached the collector with "[This part of the test output was removed...]" and not one
+        # figure. The two limits below are what make the job's summary say anything.
         run: |
           ctest --test-dir build --output-on-failure \
             --output-junit ctest.xml \
             --test-output-size-passed 1000000 \
             --test-output-size-failed 1000000
 
-      # LAS CIFRAS, EN LA PAGINA DEL RUN. Comprobaciones por test, tiempos, las que fallan con su
-      # texto, y las metricas que los tests publican (`tests/metric.h`). `always()` porque el caso en
-      # que mas falta hace es justo aquel en que el paso de arriba ha fallado: asi se ve QUE check
-      # cayo sin abrir el log. No decide nada — el veredicto ya lo dio `ctest` con su codigo de salida.
-      - name: Resumen de los tests
+      # THE FIGURES, ON THE RUN'S PAGE. Checks per test, times, the ones that failed with their text,
+      # and the metrics the tests publish (`tests/metric.h`). `always()` because the case where it is
+      # needed most is precisely the one where the step above failed: that way you see WHICH check
+      # fell without opening the log. It decides nothing — `ctest` already gave the verdict.
+      - name: Test summary
         if: always()
         run: |
           python3 tools/ci_test_summary.py build/ctest.xml \
             --title "Tests · Release" >> "$GITHUB_STEP_SUMMARY"
 
-      # El XML crudo, por si alguien quiere comparar dos runs o graficar una metrica en el tiempo:
-      # el resumen se lee, el artefacto se procesa.
-      - name: Guardar los resultados
+      # The raw XML, in case anybody wants to compare two runs or plot a metric over time: the
+      # summary is read, the artifact is processed.
+      - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -153,8 +153,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          # `python3` lo usa el resumen de los tests (`tools/ci_test_summary.py`). Va declarado y no
-          # dado por hecho, por lo mismo que en el job de arriba: la imagen del runner lo trae hoy.
+          # `python3` is used by the test summary (`tools/ci_test_summary.py`). Declared rather than
+          # assumed, for the same reason as in the job above: the runner image ships it today.
           sudo apt-get install -y cmake build-essential libssl-dev pkg-config python3
 
       - name: Configure with ThreadSanitizer
@@ -213,15 +213,15 @@ jobs:
             --test-output-size-passed 1000000 \
             --test-output-size-failed 1000000
 
-      # Los mismos tests instrumentados: los tiempos NO son comparables con los del job de arriba (TSan
-      # los multiplica), y por eso el resumen va aparte y con su titulo en vez de sumarse a aquel.
-      - name: Resumen de los tests (TSan)
+      # The same tests, instrumented: the times are NOT comparable with the job above (TSan multiplies
+      # them), which is why this summary is separate and titled rather than folded into that one.
+      - name: Test summary (TSan)
         if: always()
         run: |
           python3 tools/ci_test_summary.py build-tsan/ctest.xml \
             --title "Tests · ThreadSanitizer" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Guardar los resultados (TSan)
+      - name: Upload test results (TSan)
         if: always()
         uses: actions/upload-artifact@v4
         with:
