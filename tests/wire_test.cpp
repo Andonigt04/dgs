@@ -10,6 +10,7 @@
 // ================================================================================================
 #include "include/dgs/packet.h"
 #include "include/dgs/types.h"
+#include "tests/metric.h"
 
 #include <cstdio>
 #include <cstring>
@@ -74,6 +75,9 @@ static void entityWireSizeHonoursDataSize()
     std::printf("    entity on the wire: %zu B with no payload, the struct is %zu B (%.1fx)\n",
                 bareBytes, sizeof(DGS::EntityTransfer),
                 (double)sizeof(DGS::EntityTransfer) / (double)bareBytes);
+    // Lo que de verdad cuesta una entidad en la red: 10 Hz por jugador por vecino se multiplica
+    // rapido, y este numero es el que hay que ver moverse cuando alguien toca el empaquetado.
+    dgsMetricI("entidad_sin_payload", (long long)bareBytes, "B");
     CHECK(bareBytes < sizeof(DGS::EntityTransfer) / 10,
           "an entity with no payload costs less than a tenth of the raw struct");
 

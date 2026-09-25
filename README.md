@@ -199,6 +199,40 @@ Every test is registered with CTest and its exit status rules — none of them i
 They start the real nodes as child processes, drive them over the real protocol and assert on what the
 nodes publish to the outside, never on their internals.
 
+### The numbers, on the run's front page
+
+The tests measure things — checks passed, seconds, loopback RTT, bytes on the wire, false positives
+under a degraded network — and all of it used to live in the job's log: open the run, expand the step,
+find the line, compare it by eye with another day's. Nobody does that, so a figure that got worse
+between two commits was seen by no one.
+
+CI now writes a **job summary**: a table of every test with its verdict, time and check counts, the
+text of any check that failed (no log to open), and the metrics the tests publish. The raw
+`ctest.xml` is uploaded as an artifact for anyone who wants to compare two runs.
+
+```bash
+ctest --test-dir build --output-junit ctest.xml \
+      --test-output-size-passed 1000000 --test-output-size-failed 1000000
+python3 tools/ci_test_summary.py build/ctest.xml --title "Tests"
+```
+
+⚠️ **The two size limits are not optional.** CTest puts each test's output in the XML but clips it at
+1024 bytes, from the end — exactly where a test prints its `== name: N OK · M FAILED ==` line and its
+metrics. Without them `udp_crypto` arrived at the collector with `[This part of the test output was
+removed…]` and not one figure.
+
+A test publishes a number with `tests/metric.h`:
+
+```cpp
+dgsMetric("rtt_head_loopback", rttMs, "ms");   // METRIC rtt_head_loopback 0.115 ms
+```
+
+It sits **next to** the sentence the test already prints, and it decides nothing: the verdict stays
+with the `check` that holds the threshold. A number that is published but cannot fail is a number you
+can look at. The collector has a `--selftest` and runs as a test of its own (`ci_summary`) — a CI
+parser with no test is the classic place where the panel says "all green" because the parser broke and
+returned an empty list.
+
 Two of them are worth calling out:
 
 `robust_test` loads the rules module **twice** and demands that two instances with the same state emit
@@ -303,6 +337,44 @@ An entity with no payload is now **62 bytes instead of 4160, 67×**, measured en
 of a real zone by `tests/viewer_e2e.cpp`. At N=64 that is 2.6 MB/s out of a zone instead of 175, and
 0.3 Mbit/s down per client instead of 21 — the difference between "needs a datacentre link" and "works
 on a domestic line".
+
+### 1000 players, and twice the load
+
+Measured, not projected (25-09, 16 cores, loopback). Players spread with a 500 m interest radius,
+`ZONE_UDP_DRAIN_MAX` raised to 4096, harness sending every datagram it aimed for, so the rows are the
+zone's and not the harness's. All three served **every** player without losing one:
+
+| | served | snap/s | loop | egress | lat p95 |
+|---|---|---|---|---|---|
+| 1000 @ 20 Hz · 100 chunks | 1000/1000 | 8.9 | 68.8 ms | 5.53 MB/s | 95 ms |
+| 1000 @ 40 Hz · 100 chunks (twice the **rate**) | 1000/1000 | 8.9 | 70.7 ms | 5.52 MB/s | 36 ms |
+| 2000 @ 20 Hz · 300 chunks (twice the **people**) | 2000/2000 | 6.9 | 107.6 ms | 5.86 MB/s | 142 ms |
+
+**Doubling the client rate costs the broadcast nothing** (68.8 → 70.7 ms): the zone broadcasts at its
+own tick, not the client's. Doubling the *population* is what hurts, and it hurts as N² — 2000 needs
+three times the spread to stay near budget and still ends over it.
+
+⚠️ **The wall you hit first is neither bytes nor N².** `zone_node` drains at most
+`ZONE_UDP_DRAIN_MAX` datagrams **per tick** (256 by default) — 2560/s for the whole zone, which is
+**128 players at 20 Hz, or 64 at 40 Hz**, whatever the spread or the interest radius. With the
+default, 1000 clients send eight times what the zone can take out of the socket and the rest queues
+in the kernel. It is suspicious that this ceiling lands exactly where the old capacity table started
+falling behind, but that has not been separated from the N² cost — the runs above raise the cap, so
+they do not answer it.
+
+```bash
+cmake -S . -B build -DDGS_LOAD_TESTS=ON
+ctest --test-dir build -L carga            # the three rows above, ~30 s
+# or by hand, any population:
+LOAD_MIN_N=1000 LOAD_HZ=20 LOAD_SPREAD_CHUNKS=100 LOAD_INTEREST_M=500 LOAD_DRAIN_MAX=4096 \
+  ./build/load_zone ./build/zone_node ./build/stub_rules.so 1000 10
+```
+
+They are **not** in CI: they take minutes, want a thousand file descriptors, and on a two-core runner
+they would measure the runner. `tests/load_model.cpp` is the part that does run on every push — it
+projects from these measurements and is calibrated against all eight of them (loop within 12 %, egress
+within 10 % at the measured tick), so a change that makes the wire fatter or the syscalls dearer shows
+up there instead of in a load test nobody runs.
 
 **The remaining wall is syscalls, not bytes.** Loop time barely moved (31.6 → 28.0 ms at N=64) while
 the bytes fell 67×, and it is almost exactly proportional to the number of DATAGRAMS: 6.8 µs each at

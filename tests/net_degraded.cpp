@@ -33,6 +33,7 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "tests/metric.h"
 
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -414,6 +415,23 @@ int main(int argc, char** argv)
         if (g_proxySendFailures.load() > 0)
             std::printf("         (the proxy failed to forward %d of %d datagrams)\n",
                         g_proxySendFailures.load(), sent);
+        // Los FALSOS POSITIVOS por caso, publicados uno a uno. Es la cifra de la que vive este test:
+        // cuantas veces el validador expulsa a un jugador limpio porque la red le llego rota. La
+        // clave sale del nombre del caso, que trae espacios y un '%' ("20 % loss") y aqui tiene que
+        // ser una sola palabra.
+        {
+            auto publish = [&](const char* what, long long value, const char* unit) {
+                char key[96];
+                std::snprintf(key, sizeof key, "%s_%s", what, c.name);
+                for (char* p = key; *p; ++p)
+                    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || *p == '_')) *p = '_';
+                dgsMetricI(key, value, unit);
+            };
+            publish("falsos_positivos", falsePos, "");
+            publish("datagramas_perdidos", dropped, "");
+            publish("datagramas_enviados", sent, "");
+        }
         if (!controlOk) ++g_casesWithNoTraffic;
 
         if (std::strcmp(c.name, "20 % REORDERING") == 0) {

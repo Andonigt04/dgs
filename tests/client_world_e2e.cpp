@@ -26,6 +26,7 @@
 #include "include/dgs/client.h"
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "tests/metric.h"
 
 #include <httplib.h>
 
@@ -270,6 +271,14 @@ int main(int argc, char** argv)
         std::printf("    zona: %u pings, %u muestras, rtt ultimo %.2f ms (min %.2f avg %.2f max %.2f), perdidos %u · tx %llu rx %llu bytes\n",
                     st.pingsSent, st.zoneRttSamples, st.zoneRttMs, st.zoneRttMinMs, st.zoneRttAvgMs, st.zoneRttMaxMs, st.pingsLost,
                     (unsigned long long)st.txBytes, (unsigned long long)st.rxBytes);
+        // Lo que el panel de depuracion del juego enseña al jugador, medido aqui contra una zona de
+        // verdad: si el RTT de loopback o los bytes por segundo del cable se mueven, es que ha
+        // cambiado el plano UDP, no la red de nadie.
+        dgsMetric("rtt_zona_avg", st.zoneRttAvgMs, "ms");
+        dgsMetric("rtt_zona_max", st.zoneRttMaxMs, "ms");
+        dgsMetricI("pings_zona_perdidos", (long long)st.pingsLost);
+        dgsMetricI("cable_tx", (long long)st.txBytes, "B");
+        dgsMetricI("cable_rx", (long long)st.rxBytes, "B");
         check(st.zoneRttSamples == 3 && st.zoneRttMs >= 0.0f && st.zoneRttMaxMs < 50.0f,
               "F · tres pings a la zona, tres pongs, RTT < 50 ms en loopback");
         check(st.pingsLost == 0, "F · ninguno perdido");

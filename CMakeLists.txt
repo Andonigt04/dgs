@@ -154,6 +154,11 @@ add_executable(socket_framing_test tests/socket_framing_test.cpp ${COMMON_SRCS})
 target_link_libraries(socket_framing_test Threads::Threads)
 
 add_executable(wire_test tests/wire_test.cpp ${COMMON_SRCS})
+# 1000 jugadores, y el doble de carga por los dos ejes. No levanta clientes: PROYECTA a partir de las
+# cifras medidas con `tools/load_zone`, y se calibra contra ellas antes de proyectar nada. Puro CPU,
+# sin sockets ni nodos, asi que corre en cada push y tambien bajo TSan. El banco de verdad —1000
+# sockets contra un `zone_node`— es `tools/load_zone` y se lanza a mano (ver LOAD_* en el README).
+add_executable(load_model_test tests/load_model.cpp ${COMMON_SRCS})
 add_executable(robust_test tests/robust_test.cpp ${COMMON_SRCS})
 target_link_libraries(robust_test ${CMAKE_DL_LIBS})   # dlopen of the rules module (determinism)
 add_executable(spawn_parity_test tests/spawn_parity_test.cpp)   # §3.8 (P8): backend parity
@@ -300,6 +305,19 @@ enable_testing()
 add_test(NAME cli COMMAND cli_test $<TARGET_FILE:dgs>)
 set_tests_properties(cli PROPERTIES TIMEOUT 60)
 
+# El recolector que sube las cifras de los tests al resumen del job (`tools/ci_test_summary.py`) se
+# prueba a si mismo, y corre aqui como un test mas. Un script de CI sin test es el sitio clasico
+# donde el panel dice "todo verde" porque el que parsea se ha roto y devuelve una lista vacia: su
+# `--selftest` incluye esa contraprueba (un XML sin tests NO se canta como exito).
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME ci_summary
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci_test_summary.py --selftest)
+    set_tests_properties(ci_summary PROPERTIES TIMEOUT 60)
+else()
+    message(STATUS "Python3 no encontrado: el test `ci_summary` no se registra (el resumen de CI si lo usa)")
+endif()
+
 add_test(NAME udp_crypto COMMAND udp_crypto_test)
 set_tests_properties(udp_crypto PROPERTIES TIMEOUT 60)
 
@@ -310,6 +328,36 @@ add_test(NAME auth_e2e COMMAND auth_e2e_test $<TARGET_FILE:head_server_node>)
 set_tests_properties(auth_e2e PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 add_test(NAME socket_framing COMMAND socket_framing_test)
 add_test(NAME wire        COMMAND wire_test)
+add_test(NAME load_model  COMMAND load_model_test)
+
+# ── CARGA DE VERDAD: 1000 jugadores, y el doble por los dos ejes ─────────────────────────────────
+# Estos SI levantan la zona y 1000 (o 2000) sockets UDP. Fuera del `ctest` por defecto a proposito:
+# duran minutos, piden descriptores y memoria, y en una maquina compartida —un runner de CI de dos
+# nucleos -- lo que miden es el runner y no la zona. El binario se construye SIEMPRE (un objetivo que
+# nadie compila se pudre en silencio); lo que se activa con la opcion es REGISTRARLOS.
+#
+#   cmake -S . -B build -DDGS_LOAD_TESTS=ON && ctest --test-dir build -L carga
+#
+# ⚠️ LOS DOS AJUSTES DEL ENTORNO NO SON DECORACION, y cada uno es una pared medida:
+#   · LOAD_SPREAD_CHUNKS — amontonados, 1000 jugadores son 10^6 datagramas por tick (la difusion es
+#     N²). `tests/load_model` dice que hacen falta ~70 chunks para 1000 y ~277 para 2000.
+#   · LOAD_DRAIN_MAX — la zona drena 256 datagramas por tick por defecto = 2 560/s = 128 jugadores a
+#     20 Hz. Sin subirlo, 1000 clientes llenan la cola y la fila no mide la difusion sino el tope.
+# El veredicto NO exige el tick nominal (a 1000 se sabe que va tarde): exige que el nodo siga vivo y
+# siga sirviendo a todo el mundo. Ir lento es una cifra; perder entidades es una regresion.
+option(DGS_LOAD_TESTS "Registrar los bancos de carga (1000/2000 jugadores, minutos por test)" OFF)
+if (DGS_LOAD_TESTS)
+    function(dgs_add_load_test nombre poblacion hz chunks segundos limite)
+        add_test(NAME ${nombre} COMMAND load_zone
+                 $<TARGET_FILE:zone_node> $<TARGET_FILE:stub_rules> ${poblacion} ${segundos})
+        set_tests_properties(${nombre} PROPERTIES
+            LABELS "carga" RUN_SERIAL TRUE TIMEOUT ${limite}
+            ENVIRONMENT "LOAD_VERDICT=1;LOAD_MIN_N=${poblacion};LOAD_HZ=${hz};LOAD_SPREAD_CHUNKS=${chunks};LOAD_INTEREST_M=500;LOAD_DRAIN_MAX=4096")
+    endfunction()
+    dgs_add_load_test(carga_1000_20hz 1000 20 100 10 300)
+    dgs_add_load_test(carga_1000_40hz 1000 40 100 10 300)   # el doble de RITMO
+    dgs_add_load_test(carga_2000_20hz 2000 20 300 10 420)   # el doble de GENTE
+endif()
 add_test(NAME robust      COMMAND robust_test)
 add_test(NAME thread_pool COMMAND thread_pool_test)
 add_test(NAME logger      COMMAND logger_test)

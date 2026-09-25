@@ -18,6 +18,7 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 #include "include/dgs/network.h"
 #include "include/dgs/packet.h"
+#include "tests/metric.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -133,6 +134,9 @@ int main(int argc, char** argv)
         check(echo.chunkX == 150 && echo.chunkY == 50, "the echo preserves the chunk (150,50)");
         const double rttMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::printf("  loopback RTT: %.3f ms\n", rttMs);
+        // El unico ida y vuelta REAL contra el head que corre en CI. En loopback no dice nada del
+        // internet de nadie, pero si el numero se va de golpe es que algo se ha metido en el camino.
+        dgsMetric("rtt_head_loopback", rttMs, "ms");
         // This is not a performance test: it is a safety net against "it answers, but glacially".
         check(rttMs < 1000.0, "the loopback RTT is below 1 s");
     }

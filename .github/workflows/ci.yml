@@ -80,6 +80,7 @@ jobs:
         run: |
           cmake --build build -j$(nproc) --target \
             ping_pong_test logger_test thread_pool_test wire_test socket_framing_test auth_e2e_test cli_test tls_test udp_crypto_test robust_test \
+            load_model_test \
             spawn_parity_test validator_e2e_test zone_e2e_test \
             reconnect_e2e_test action_e2e_test ghost_e2e_test \
             social_e2e_test persistence_e2e_test net_degraded_test \
@@ -103,7 +104,38 @@ jobs:
           DGS_REQUIRE_MONGO: "1"
           MONGO_HOST: "127.0.0.1"
           MONGO_PORT: "27017"
-        run: ctest --test-dir build --output-on-failure
+        # ⚠️ `--output-junit` NO BASTA POR SI SOLO: CTest mete la salida de cada test en el XML pero la
+        # RECORTA a 1024 bytes, y recorta por el FINAL — que es justo donde un test imprime su resumen
+        # ("== zone_e2e: 12 OK · 0 FAILED ==") y sus lineas METRIC. Medido: `udp_crypto` llegaba al
+        # recolector con "[This part of the test output was removed...]" y sin una sola cifra. Los dos
+        # limites de abajo son lo que hace que el resumen del job diga algo.
+        run: |
+          ctest --test-dir build --output-on-failure \
+            --output-junit ctest.xml \
+            --test-output-size-passed 1000000 \
+            --test-output-size-failed 1000000
+
+      # LAS CIFRAS, EN LA PAGINA DEL RUN. Comprobaciones por test, tiempos, las que fallan con su
+      # texto, y las metricas que los tests publican (`tests/metric.h`). `always()` porque el caso en
+      # que mas falta hace es justo aquel en que el paso de arriba ha fallado: asi se ve QUE check
+      # cayo sin abrir el log. No decide nada — el veredicto ya lo dio `ctest` con su codigo de salida.
+      - name: Resumen de los tests
+        if: always()
+        run: |
+          python3 tools/ci_test_summary.py build/ctest.xml \
+            --title "Tests · Release" >> "$GITHUB_STEP_SUMMARY"
+
+      # El XML crudo, por si alguien quiere comparar dos runs o graficar una metrica en el tiempo:
+      # el resumen se lee, el artefacto se procesa.
+      - name: Guardar los resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-release
+          path: |
+            build/ctest.xml
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
 
   # The same tests, under ThreadSanitizer. It is a separate job rather than part of the main one
   # because TSan shifts the timings enough that a failure here does not mean the same thing as there —
@@ -121,7 +153,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libssl-dev pkg-config
+          # `python3` lo usa el resumen de los tests (`tools/ci_test_summary.py`). Va declarado y no
+          # dado por hecho, por lo mismo que en el job de arriba: la imagen del runner lo trae hoy.
+          sudo apt-get install -y cmake build-essential libssl-dev pkg-config python3
 
       - name: Configure with ThreadSanitizer
         run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DDGS_TSAN=ON
@@ -141,6 +175,7 @@ jobs:
             head_server_node zone_node social_node validador_node dgs stub_rules \
             ping_pong_test logger_test thread_pool_test wire_test socket_framing_test \
             auth_e2e_test cli_test tls_test udp_crypto_test robust_test \
+            load_model_test \
             spawn_parity_test validator_e2e_test zone_e2e_test orchestrator_test \
             reconnect_e2e_test action_e2e_test ghost_e2e_test viewer_e2e_test interest_e2e_test \
             social_e2e_test net_degraded_test \
@@ -171,7 +206,30 @@ jobs:
         # the CI container — the two warnings are that same `recvLoop` double lock, and the test itself
         # comes back **8 OK · 0 FAILED**, with the handoff completing (transfers 2, acked 2,
         # promotions 2). It is excluded because of the instrumentation, not because it is unhappy.
-        run: ctest --test-dir build-tsan --output-on-failure -E '^client_(e2e|handoff_e2e|world_e2e)$'
+        run: |
+          ctest --test-dir build-tsan --output-on-failure \
+            -E '^client_(e2e|handoff_e2e|world_e2e)$' \
+            --output-junit ctest.xml \
+            --test-output-size-passed 1000000 \
+            --test-output-size-failed 1000000
+
+      # Los mismos tests instrumentados: los tiempos NO son comparables con los del job de arriba (TSan
+      # los multiplica), y por eso el resumen va aparte y con su titulo en vez de sumarse a aquel.
+      - name: Resumen de los tests (TSan)
+        if: always()
+        run: |
+          python3 tools/ci_test_summary.py build-tsan/ctest.xml \
+            --title "Tests · ThreadSanitizer" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar los resultados (TSan)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-tsan
+          path: |
+            build-tsan/ctest.xml
+            build-tsan/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
 
   docker-build:
     runs-on: ubuntu-24.04
